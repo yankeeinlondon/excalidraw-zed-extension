@@ -4,7 +4,28 @@ A Zed editor extension that previews `.excalidraw` files in a native WebView win
 
 Supports `.excalidraw` (JSON), `.excalidraw.svg`, and `.excalidraw.png`.
 
+> **Status — submitted to the official registry.** This extension has been submitted
+> to the [Zed extension registry](https://github.com/zed-industries/extensions/pull/6468).
+> Once that PR is merged, you'll be able to install it directly from Zed's **Extensions**
+> panel (search for *Excalidraw Preview*). Until then, install it locally from source
+> using the steps below.
+>
+> Source repository: <https://github.com/yankeeinlondon/excalidraw-zed-extension>
+
 ## Installation
+
+> **TL;DR (local install from a git clone):**
+>
+> ```bash
+> git clone https://github.com/yankeeinlondon/excalidraw-zed-extension.git
+> cd excalidraw-zed-extension
+> rustup target add wasm32-wasip1   # one-time
+> just                              # build UI + release binary
+> just symlink                      # one-time: put the binary on your PATH
+> ```
+>
+> Then in Zed: command palette → **"zed: install dev extension"** → select the
+> `./extension` directory. See the detailed steps below.
 
 ### Prerequisites
 
@@ -14,9 +35,13 @@ Supports `.excalidraw` (JSON), `.excalidraw.svg`, and `.excalidraw.png`.
 - **Linux**: `sudo apt install libwebkit2gtk-4.1-dev`
 - **Windows**: WebView2 (built-in on Win11)
 
-### Build
+### Build from source
 
 ```bash
+# clone the repository
+git clone https://github.com/yankeeinlondon/excalidraw-zed-extension.git
+cd excalidraw-zed-extension
+
 # one-time: install WASM target
 rustup target add wasm32-wasip1
 
@@ -27,9 +52,13 @@ just
 just symlink
 ```
 
-### Install Extension
+### Install the extension locally
 
-In Zed: command palette → **"zed: install dev extension"** → select the `./extension` directory.
+In Zed: command palette → **"zed: install dev extension"** → select the `./extension`
+directory (inside the cloned repo).
+
+This installs the extension straight from your local clone — no registry needed. To pick
+up new changes later, `git pull`, re-run `just`, then re-run **"zed: install dev extension"**.
 
 ## Usage
 
