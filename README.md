@@ -1,68 +1,79 @@
 # Excalidraw Preview for Zed
 
-A Zed editor extension that previews `.excalidraw` files in a native WebView window. Live-reloads on file save. No browser tabs. Pure offline, near-zero-latency diagram preview.
+> Source Repository: <https://github.com/yankeeinlondon/excalidraw-zed-extension>
 
-Supports `.excalidraw` (JSON), `.excalidraw.svg`, and `.excalidraw.png`.
+![architecture](./docs/architecture.excalidraw.svg)
 
-> **Status — submitted to the official registry.** This extension has been submitted
-> to the [Zed extension registry](https://github.com/zed-industries/extensions/pull/6468).
-> Once that PR is merged, you'll be able to install it directly from Zed's **Extensions**
-> panel (search for *Excalidraw Preview*). Until then, install it locally from source
-> using the steps below.
+
+A Zed editor extension that previews [Excalidraw]() files in a native WebView window:
+
+- Live reloads on file save
+- No browser tabs
+- Pure offline
+- Near zero latency diagram preview
+- Supports `.excalidraw` (JSON), `.excalidraw.svg`, and `.excalidraw.png` file formats
+
+
+> `Extension Status`: **submitted to the official registry** 
 >
-> Source repository: <https://github.com/yankeeinlondon/excalidraw-zed-extension>
+> This extension has been submitted to the [Zed extension registry](https://github.com/zed-industries/extensions/pull/6468). Once that PR is merged, you'll be able to install it directly from Zed's **Extensions** panel (search for *Excalidraw Preview*). Until then, install it locally from source using the steps below.
+
 
 ## Installation
 
 ### Install from Zed (once published)
 
-> ⏳ **Pending** — available after [registry PR #6468](https://github.com/zed-industries/extensions/pull/6468) is merged.
+> ⏳ available after [registry PR #6468](https://github.com/zed-industries/extensions/pull/6468) is merged.
 
 Open the command palette → **`zed: extensions`** → search for **Excalidraw Preview** → **Install**.
 
-That's the whole install once it's in the registry — no Rust, Node, or build step required;
-the companion binary is downloaded automatically on first use. Until the PR lands, use the
-local install below.
+That's the whole install once it's in the registry — no Rust, Node, or build step required; the companion binary is downloaded automatically on first use. Until the PR lands, use the local install below.
 
-### Install locally from source
+### Install Locally
 
-> **TL;DR (local install from a git clone):**
->
-> ```bash
-> git clone https://github.com/yankeeinlondon/excalidraw-zed-extension.git
-> cd excalidraw-zed-extension
-> rustup target add wasm32-wasip1   # one-time
-> just                              # build UI + release binary
-> just symlink                      # one-time: put the binary on your PATH
-> ```
->
-> Then in Zed: command palette → **"zed: install dev extension"** → select the
-> `./extension` directory. See the detailed steps below.
+```bash
+# clone repo
+git clone https://github.com/yankeeinlondon/excalidraw-zed-extension.git
+# move into repo
+cd excalidraw-zed-extension
+# use the `just` install recipe 
+just install-locally
+```
+
+You do need to have `just` installed (available through most OS level package managers) but once `just` installed just run `just install-locally` and the recipe will:
+
+- check all prerequisities
+- adds a WASM target for Rust
+- builds the UI and release binary
+- symlinks the binary onto your PATH
+
+Once this recipe has complete the only thing left to do is open the _command palette_ in Zed and search for "zed: install dev extension". You'll then navigate and select the `./extension` directory of the locally cloned repo.
 
 ### Prerequisites
 
 - **Rust** (via `rustup`) + **Cargo**
 - **Node.js** (for building the webview)
+- **[`just`](https://github.com/casey/just)** — the command runner that drives the build (`cargo install just`, `brew install just`, or see its README)
 - **macOS**: WebKit (built-in)
 - **Linux**: `sudo apt install libwebkit2gtk-4.1-dev`
 - **Windows**: WebView2 (built-in on Win11)
 
-### Build from source
+### Build from source (manual steps)
+
+`just install-locally` (above) runs all of these for you. Use the granular recipes if you
+want to run a single step:
 
 ```bash
 # clone the repository
 git clone https://github.com/yankeeinlondon/excalidraw-zed-extension.git
 cd excalidraw-zed-extension
 
-# one-time: install WASM target
-rustup target add wasm32-wasip1
-
-# build UI + release binary
-just
-
-# one-time: symlink binary to PATH
-just symlink
+rustup target add wasm32-wasip1   # one-time: install WASM target
+just ui build                     # build UI + release binary
+just symlink                      # one-time: symlink binary onto PATH
 ```
+
+Run `just` on its own to list every available recipe.
 
 ### Install the extension locally
 
@@ -70,7 +81,8 @@ In Zed: command palette → **"zed: install dev extension"** → select the `./e
 directory (inside the cloned repo).
 
 This installs the extension straight from your local clone — no registry needed. To pick
-up new changes later, `git pull`, re-run `just`, then re-run **"zed: install dev extension"**.
+up new changes later, `git pull`, re-run `just install-locally`, then re-run
+**"zed: install dev extension"**.
 
 ## Usage
 

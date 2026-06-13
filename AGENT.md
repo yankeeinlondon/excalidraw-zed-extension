@@ -377,13 +377,14 @@ just release
 
 | Recipe | Description |
 |---|---|
-| `just` | Default: build UI + release binary (`ui build`) |
+| `just` | Default: list all available recipes |
 | `just build` | Release binary only (no UI rebuild) |
 | `just build-debug` | Debug binary |
 | `just build-ext` | Zed extension WASM (`wasm32-wasip1`) |
 | `just ui` | Vite build only (`npm install` + `vite build`: `webview-src/` → `assets/`) |
 | `just release` | UI + binary + extension WASM |
-| `just test` | `cargo nextest run` + `cargo test --doc` + webview vitest |
+| `just install-locally` | One-shot local install: prereq checks + `ui` + `build` + `symlink`, with progress feedback |
+| `just test` | `cargo nextest run` + webview `typecheck` (`tsc --noEmit`) + vitest |
 | `just symlink` | One-time: symlink `~/.local/bin/excalidraw-preview` → `target/release` |
 | `just dev` | Debug build + Vite dev server + WebView window in parallel |
 | `just dev-ui` | Vite dev server only |
