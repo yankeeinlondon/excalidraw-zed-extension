@@ -221,3 +221,54 @@ fn export_rejects_path_traversal_in_name() {
     assert!(export_dir.path().join("escape.png").exists());
     assert!(!dir.path().join("escape.png").exists());
 }
+
+#[test]
+fn post_data_writes_scene_to_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+
+    let preview = Preview::spawn(&file, &[]);
+    let updated = BLANK_SCENE.replace(r#""elements":[]"#, r#""elements":[{"id":"x"}]"#);
+
+    let resp = reqwest::blocking::Client::new()
+        .post(preview.url("/data"))
+        .header("Content-Type", "application/json")
+        .body(updated.clone())
+        .timeout(Duration::from_secs(3))
+        .send()
+        .expect("POST /data failed");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), updated);
+}
+
+#[test]
+fn second_instance_for_same_file_exits_and_first_keeps_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+
+    let preview = Preview::spawn(&file, &[]);
+    let first_port = preview.port;
+
+    // Second invocation (foreground) must detect the live instance and exit 0
+    // without taking over the lock file.
+    let status = std::process::Command::new(binary())
+        .arg(&file)
+        .arg("--foreground")
+        .arg("--headless")
+        .status()
+        .expect("second spawn failed");
+    assert!(status.success());
+
+    let canonical = std::fs::canonicalize(&file).unwrap();
+    let lock_port: u16 = std::fs::read_to_string(lock_path_for(&canonical))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(lock_port, first_port, "second instance must not steal the lock");
+
+    let (status, _) = http_get(&preview.url("/ping"));
+    assert_eq!(status, 200, "first instance must still be alive");
+}
