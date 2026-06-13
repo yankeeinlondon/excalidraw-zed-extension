@@ -15,16 +15,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            target-dir: target/release
             binary: excalidraw-preview
           - os: macos-latest
             target: x86_64-apple-darwin
-            target-dir: target/release
             binary: excalidraw-preview
           - os: macos-latest
             target: aarch64-apple-darwin
-            target-dir: target/release
             binary: excalidraw-preview
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: excalidraw-preview.exe
 
     steps:
       - name: Checkout code
@@ -34,7 +34,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libssl3-dev libglib2.0-dev libatk1.0-dev libgtk-3-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libglib2.0-dev libatk1.0-dev libgtk-3-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -42,13 +42,20 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }} -p excalidraw-preview-binary
+
+      - name: Rename to release asset convention
+        shell: bash
         run: |
-          cargo build --release --manifest-path preview-binary/Cargo.toml
+          ASSET="excalidraw-preview-${{ matrix.target }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then ASSET="$ASSET.exe"; fi
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$ASSET"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
 
       - name: Upload binary
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/${{ matrix.binary }}
+          files: ${{ env.ASSET }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
