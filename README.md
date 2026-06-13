@@ -14,6 +14,18 @@ Supports `.excalidraw` (JSON), `.excalidraw.svg`, and `.excalidraw.png`.
 
 ## Installation
 
+### Install from Zed (once published)
+
+> ⏳ **Pending** — available after [registry PR #6468](https://github.com/zed-industries/extensions/pull/6468) is merged.
+
+Open the command palette → **`zed: extensions`** → search for **Excalidraw Preview** → **Install**.
+
+That's the whole install once it's in the registry — no Rust, Node, or build step required;
+the companion binary is downloaded automatically on first use. Until the PR lands, use the
+local install below.
+
+### Install locally from source
+
 > **TL;DR (local install from a git clone):**
 >
 > ```bash
