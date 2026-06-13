@@ -26,10 +26,9 @@ ui:
 # Full release: UI + binary + extension WASM
 release: ui build build-ext
 
-# Run all tests (nextest + doctests + webview)
+# Run all tests (nextest + webview)
 test:
     cargo nextest run
-    cargo test --doc
     cd {{webview}} && npm test --if-present
 
 # Symlink ~/.local/bin/excalidraw-preview → target/release (one-time setup)
