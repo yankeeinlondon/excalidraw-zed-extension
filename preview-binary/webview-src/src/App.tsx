@@ -8,6 +8,11 @@ import {
   hashElementsVersion,
 } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css";
+import type {
+  ExcalidrawInitialDataState,
+  ExcalidrawImperativeAPI,
+} from "@excalidraw/excalidraw/types";
+import type { ExcalidrawElement } from "@excalidraw/excalidraw/element/types";
 import { postExport, type ExportKind } from "./export";
 
 interface AppProps {
@@ -90,11 +95,11 @@ export default function App({
   const reloadScene = useCallback((newData: ExcalidrawInitialDataState) => {
     const api = apiRef.current;
     if (!api) return;
-    if (api.getAppState().editingElement) return;
-    api.updateScene({
-      elements: newData.elements,
-      files: newData.files ?? {},
-    });
+    if (api.getAppState().editingTextElement) return;
+    // Files (embedded images) are registered separately from the scene graph;
+    // add them before updateScene so elements referencing them resolve.
+    if (newData.files) api.addFiles(Object.values(newData.files));
+    api.updateScene({ elements: newData.elements });
   }, []);
 
   useEffect(() => {

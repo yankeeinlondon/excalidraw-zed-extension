@@ -1,4 +1,5 @@
 import ReactDOM from "react-dom/client";
+import type { ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
 import App from "./App";
 
 interface Config {
