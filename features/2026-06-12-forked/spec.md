@@ -57,6 +57,7 @@ Broken or missing:
 ### 1.2 Release pipeline
 
 - Keep the existing `release.yml` matrix (macOS arm64 + x64, Linux x64, Windows x64); verify it runs green on this fork.
+- Add a test CI workflow (currently none exists): on push/PR, install nextest from prebuilt binary and run `cargo nextest run --profile ci` plus the webview vitest suite. The `ci` nextest profile emits JUnit XML.
 - Release assets must match the naming convention `lib.rs` expects: `excalidraw-preview-{arch}-{os}[.exe]` (e.g. `excalidraw-preview-aarch64-apple-darwin`).
 - First release under new ownership is tagged `v0.2.0`; `BINARY_VERSION` in `lib.rs`, `version` in `extension.toml`, and `version` in `extension/Cargo.toml` must all be `0.2.0`.
 
@@ -70,8 +71,15 @@ Broken or missing:
 
 - Replace `Makefile` with a `justfile` carrying over all targets with the same semantics: `build` (default: UI + release binary), `build-debug`, `ui`, `release`, `symlink`, `dev`, `dev-ui`, `dev-window`, `clean`.
 - Delete the Makefile; update `AGENT.md`, `README.md`, and CI references from `make` to `just`.
+- New `test` recipe: `cargo nextest run` followed by `cargo test --doc` (nextest doesn't run doctests).
 
-### 1.5 Documentation
+### 1.5 Test runner: nextest
+
+- Add `.config/nextest.toml` with `default` and `ci` profiles (`inherits = "default"`). Rationale: the §5 integration tests spawn child processes, bind ports, and write lock files — nextest's process-per-test isolation, `leak-timeout` (catches orphaned preview processes, one of the bug categories this spec fixes), and `slow-timeout` directly target their failure modes.
+- `ci` profile: bounded retries (≤3) for timing-sensitive tests, `fail-fast = false`, JUnit output, `slow-timeout` with termination so hung SSE/watcher tests can't wedge CI.
+- Local `default` profile: no retries (flakes stay visible during development).
+
+### 1.6 Documentation
 
 - README gains a "Creating a new drawing" section: right-click in the project panel → New File → name it `whiteboard.excalidraw` → blank canvas preview opens (the §3.1 bootstrap flow). Include a copy-paste `tasks.json` snippet wiring Zed's `task: spawn` to `excalidraw-preview --new` for users who want a palette-adjacent entry point.
 - README documents the known Zed extension-API limitations that shape this design: extensions cannot add command-palette actions, context-menu items, or custom editor panes (tracked upstream in zed-industries/zed#8441 and #18043). If Zed ships extension-registered actions, a `new excalidraw drawing` palette action becomes the primary creation entry point — it would be a thin wrapper over the `--new` flag, which is built in §3.3.
