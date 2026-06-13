@@ -176,3 +176,48 @@ fn daemonize_parent_exits_and_child_serves() {
     std::thread::sleep(Duration::from_millis(300));
     assert!(!lock.exists(), "lock file not cleaned up after /shutdown");
 }
+
+#[test]
+fn export_dir_writes_posted_bytes_without_dialog() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export_dir_arg = format!("--export-dir={}", export_dir.path().display());
+    let preview = Preview::spawn(&file, &[&export_dir_arg]);
+
+    let resp = reqwest::blocking::Client::new()
+        .post(preview.url("/export?name=out.png"))
+        .header("Content-Type", "image/png")
+        .body(vec![0x89u8, 0x50, 0x4E, 0x47])
+        .timeout(Duration::from_secs(3))
+        .send()
+        .expect("export request failed");
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let written = export_dir.path().join("out.png");
+    assert_eq!(std::fs::read(&written).unwrap(), vec![0x89u8, 0x50, 0x4E, 0x47]);
+}
+
+#[test]
+fn export_rejects_path_traversal_in_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+    let export_dir = tempfile::tempdir().unwrap();
+
+    let export_dir_arg = format!("--export-dir={}", export_dir.path().display());
+    let preview = Preview::spawn(&file, &[&export_dir_arg]);
+
+    let resp = reqwest::blocking::Client::new()
+        .post(preview.url("/export?name=..%2Fescape.png"))
+        .body(vec![1u8])
+        .timeout(Duration::from_secs(3))
+        .send()
+        .expect("export request failed");
+    assert_eq!(resp.status().as_u16(), 200);
+    // Only the file name survives; the write lands inside export_dir.
+    assert!(export_dir.path().join("escape.png").exists());
+    assert!(!dir.path().join("escape.png").exists());
+}

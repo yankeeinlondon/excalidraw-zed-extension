@@ -17,6 +17,16 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 use tracing::info;
 
+/// A request from the HTTP layer to show a native save dialog and write export bytes.
+/// Processed on the platform UI thread (tao event loop / GTK main context).
+struct ExportRequest {
+    bytes: Vec<u8>,
+    suggested_name: String,
+    default_dir: PathBuf,
+    /// `Some(path)` once written, `None` if the user cancelled the dialog.
+    reply: tokio::sync::oneshot::Sender<Option<PathBuf>>,
+}
+
 #[derive(Clone)]
 struct AppState {
     file_path: PathBuf,
@@ -27,6 +37,10 @@ struct AppState {
     broadcast_tx: broadcast::Sender<()>,
     /// Sends `true` to signal the webview window to focus.
     focus_tx: Arc<watch::Sender<bool>>,
+    /// Sends export requests to the UI thread for the native save dialog.
+    export_tx: std::sync::mpsc::Sender<ExportRequest>,
+    /// When set (--export-dir), exports bypass the dialog and write here.
+    export_dir: Option<PathBuf>,
 }
 
 #[derive(RustEmbed)]
@@ -63,6 +77,9 @@ fn daemonize(file: &str, args: &CliArgs) -> Result<()> {
     }
     if args.headless {
         cmd.arg("--headless");
+    }
+    if let Some(dir) = &args.export_dir {
+        cmd.arg("--export-dir").arg(dir);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -104,7 +121,8 @@ fn main() -> Result<()> {
         eprintln!("[dev] Opening WebView at {dev_url}");
         eprintln!("[dev] Make sure `npm run dev` is running in preview-binary/webview-src/");
         let (_focus_tx, focus_rx) = watch::channel(false);
-        if let Err(e) = run_webview_url(dev_url, focus_rx) {
+        let (_export_tx, export_rx) = std::sync::mpsc::channel();
+        if let Err(e) = run_webview_url(dev_url, focus_rx, export_rx) {
             eprintln!("WebView error: {e}");
         }
         return Ok(());
@@ -167,6 +185,7 @@ fn main() -> Result<()> {
     let (broadcast_tx, _) = broadcast::channel::<()>(16);
     let (focus_tx, focus_rx) = watch::channel(false);
     let focus_tx = Arc::new(focus_tx);
+    let (export_tx, export_rx) = std::sync::mpsc::channel::<ExportRequest>();
 
     let port = args.port.unwrap_or_else(find_available_port);
 
@@ -178,6 +197,8 @@ fn main() -> Result<()> {
         auto_save: args.auto_save,
         broadcast_tx: broadcast_tx.clone(),
         focus_tx: focus_tx.clone(),
+        export_tx,
+        export_dir: args.export_dir.clone(),
     });
 
     std::fs::write(&lock_path, port.to_string())?;
@@ -194,6 +215,7 @@ fn main() -> Result<()> {
         .route("/focus", get(handle_focus))
         .route("/shutdown", get(handle_shutdown))
         .route("/ping", get(ping))
+        .route("/export", axum::routing::post(handle_export))
         .route("/assets/{*path}", get(serve_assets))
         .with_state(state.clone());
 
@@ -252,7 +274,7 @@ fn main() -> Result<()> {
         }
     }
 
-    if let Err(e) = run_webview(port, focus_rx) {
+    if let Err(e) = run_webview(port, focus_rx, export_rx) {
         eprintln!(
             "WebView error: {}. Server running at http://127.0.0.1:{}",
             e, port
@@ -476,6 +498,73 @@ async fn ping() -> impl IntoResponse {
     "OK"
 }
 
+#[derive(serde::Deserialize)]
+struct ExportParams {
+    name: String,
+}
+
+/// Receives exported bytes from the WebView and writes them to disk — either directly
+/// into `--export-dir`, or to a user-chosen location via a native save dialog marshaled
+/// to the UI thread.
+async fn handle_export(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<ExportParams>,
+    body: axum::body::Bytes,
+) -> Response {
+    // Strip any directory components — only a bare file name is accepted.
+    let name = Path::new(&params.name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "export.bin".to_string());
+
+    if let Some(dir) = &state.export_dir {
+        let target = dir.join(&name);
+        return match std::fs::write(&target, &body) {
+            Ok(_) => (
+                axum::http::StatusCode::OK,
+                target.to_string_lossy().to_string(),
+            )
+                .into_response(),
+            Err(e) => {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        };
+    }
+
+    let default_dir = state
+        .file_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let request = ExportRequest {
+        bytes: body.to_vec(),
+        suggested_name: name,
+        default_dir,
+        reply: reply_tx,
+    };
+    if state.export_tx.send(request).is_err() {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "export channel closed (no window?)",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Some(path)) => (
+            axum::http::StatusCode::OK,
+            path.to_string_lossy().to_string(),
+        )
+            .into_response(),
+        Ok(None) => axum::http::StatusCode::NO_CONTENT.into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "export dialog failed",
+        )
+            .into_response(),
+    }
+}
+
 async fn serve_assets(axum::extract::Path(path): axum::extract::Path<String>) -> impl IntoResponse {
     let path = path.strip_prefix("/").unwrap_or(&path);
     match Assets::get(path) {
@@ -496,9 +585,24 @@ async fn serve_assets(axum::extract::Path(path): axum::extract::Path<String>) ->
 
 // ── WebView ──────────────────────────────────────────────────────────────────
 
+/// Shows the native save dialog for `req` and writes the bytes on confirm.
+/// MUST be called on the platform UI thread.
+fn handle_export_request(req: ExportRequest) {
+    let picked = rfd::FileDialog::new()
+        .set_directory(&req.default_dir)
+        .set_file_name(&req.suggested_name)
+        .save_file();
+    let result = picked.and_then(|p| std::fs::write(&p, &req.bytes).ok().map(|_| p));
+    let _ = req.reply.send(result);
+}
+
 /// Opens the WebView at the given URL. Blocks until the window is closed.
-fn run_webview(port: u16, focus_rx: watch::Receiver<bool>) -> Result<(), Box<dyn std::error::Error>> {
-    run_webview_url(&format!("http://127.0.0.1:{}", port), focus_rx)
+fn run_webview(
+    port: u16,
+    focus_rx: watch::Receiver<bool>,
+    export_rx: std::sync::mpsc::Receiver<ExportRequest>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_webview_url(&format!("http://127.0.0.1:{}", port), focus_rx, export_rx)
 }
 
 /// Opens the WebView at an arbitrary URL. Used both for the normal server and
@@ -506,7 +610,8 @@ fn run_webview(port: u16, focus_rx: watch::Receiver<bool>) -> Result<(), Box<dyn
 #[cfg(target_os = "linux")]
 fn run_webview_url(
     url: &str,
-    _focus_rx: watch::Receiver<bool>,
+    focus_rx: watch::Receiver<bool>,
+    export_rx: std::sync::mpsc::Receiver<ExportRequest>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use gtk::glib::Propagation;
     use gtk::prelude::*;
@@ -525,6 +630,19 @@ fn run_webview_url(
 
     window.show_all();
 
+    let window_for_tick = window.clone();
+    let mut focus_rx = focus_rx;
+    gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        while let Ok(req) = export_rx.try_recv() {
+            handle_export_request(req);
+        }
+        if focus_rx.has_changed().unwrap_or(false) {
+            let _ = focus_rx.borrow_and_update();
+            window_for_tick.present();
+        }
+        gtk::glib::ControlFlow::Continue
+    });
+
     window.connect_delete_event(move |_, _| {
         gtk::main_quit();
         Propagation::Proceed
@@ -542,6 +660,7 @@ fn run_webview_url(
 fn run_webview_url(
     url: &str,
     mut focus_rx: watch::Receiver<bool>,
+    export_rx: std::sync::mpsc::Receiver<ExportRequest>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tao::{
         event_loop::{ControlFlow, EventLoop},
@@ -562,7 +681,11 @@ fn run_webview_url(
         .map_err(|e| format!("Failed to create WebView: {}", e))?;
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        // Wake at least every 100 ms so export/focus requests are handled promptly
+        // even when no OS events arrive (ControlFlow::Wait would starve them).
+        *control_flow = ControlFlow::WaitUntil(
+            std::time::Instant::now() + std::time::Duration::from_millis(100),
+        );
 
         if let tao::event::Event::WindowEvent {
             event: tao::event::WindowEvent::CloseRequested,
@@ -570,6 +693,10 @@ fn run_webview_url(
         } = event
         {
             *control_flow = ControlFlow::Exit;
+        }
+
+        while let Ok(req) = export_rx.try_recv() {
+            handle_export_request(req);
         }
 
         if focus_rx.has_changed().unwrap_or(false) {
@@ -623,6 +750,10 @@ struct CliArgs {
     /// Run the server without opening a WebView window (tests / headless environments).
     #[arg(long)]
     headless: bool,
+    /// Write exports directly into this directory instead of showing a save dialog.
+    /// Intended for tests and headless use.
+    #[arg(long, value_name = "DIR")]
+    export_dir: Option<PathBuf>,
 }
 
 // ── LSP server ───────────────────────────────────────────────────────────────
@@ -837,6 +968,7 @@ mod tests {
     fn make_state(file: &std::path::Path, content_type: &str) -> Arc<AppState> {
         let (broadcast_tx, _) = broadcast::channel(16);
         let (focus_tx, _) = watch::channel(false);
+        let (export_tx, _) = std::sync::mpsc::channel();
         Arc::new(AppState {
             file_path: file.to_path_buf(),
             lock_path: std::env::temp_dir().join("excalidraw-test.lock"),
@@ -849,6 +981,8 @@ mod tests {
             auto_save: false,
             broadcast_tx,
             focus_tx: Arc::new(focus_tx),
+            export_tx,
+            export_dir: None,
         })
     }
 
@@ -1043,6 +1177,7 @@ mod tests {
         let (broadcast_tx, _) = broadcast::channel(16);
         let (focus_tx, _focus_rx) = watch::channel(false);
         let focus_tx = Arc::new(focus_tx);
+        let (export_tx, _) = std::sync::mpsc::channel();
 
         let state = Arc::new(AppState {
             file_path: tmp.path().to_path_buf(),
@@ -1052,6 +1187,8 @@ mod tests {
             auto_save: false,
             broadcast_tx,
             focus_tx,
+            export_tx,
+            export_dir: None,
         });
 
         let app = Router::new()
