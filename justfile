@@ -1,7 +1,7 @@
 binary  := "excalidraw-preview"
 release := "target/release/" + binary
 debug   := "target/debug/" + binary
-webview := "preview-binary/webview-src"
+webview := justfile_directory() / "preview-binary/webview-src"
 dev_file := env_var_or_default("DEV_FILE", "preview-binary/test.excalidraw")
 
 # Default: build UI + release binary
