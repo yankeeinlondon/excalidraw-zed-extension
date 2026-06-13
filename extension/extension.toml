@@ -2,9 +2,9 @@ id = "excalidraw-preview"
 name = "Excalidraw Preview"
 version = "0.1.0"
 schema_version = 1
-authors = ["Arindam Pradhan"]
+authors = ["Ken Snyder <ken@ken.net>"]
 description = "Preview .excalidraw files in a native window"
-repository = "https://github.com/arindampradhan/excalidraw-zed-extension"
+repository = "https://github.com/yankeeinlondon/excalidraw-zed-extension"
 
 [language_servers.excalidraw-preview]
 name = "Excalidraw Preview"

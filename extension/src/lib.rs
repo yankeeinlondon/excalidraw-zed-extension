@@ -127,7 +127,7 @@ impl ExcalidrawPreviewExtension {
         let asset_name = format!("{BINARY_NAME}-{arch_str}-{os_str}{ext}");
 
         let download_url = format!(
-            "https://github.com/arindampradhan/excalidraw-zed-extension/releases/download/v{BINARY_VERSION}/{asset_name}"
+            "https://github.com/yankeeinlondon/excalidraw-zed-extension/releases/download/v{BINARY_VERSION}/{asset_name}"
         );
 
         // Zed stores downloaded files under the extension's own work directory.
