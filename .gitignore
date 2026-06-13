@@ -21,3 +21,4 @@ preview-binary/Cargo.lock
 # OS
 .DS_Store
 Thumbs.db
+.claudine/tmp/
