@@ -1,4 +1,4 @@
 name = "Excalidraw"
 grammar = "json"
-path_suffixes = ["excalidraw"]
+path_suffixes = ["excalidraw", "excalidraw.svg", "excalidraw.png"]
 language_servers = ["excalidraw-preview"]
