@@ -4,8 +4,12 @@ debug   := "target/debug/" + binary
 webview := justfile_directory() / "preview-binary/webview-src"
 dev_file := env_var_or_default("DEV_FILE", "preview-binary/test.excalidraw")
 
-# Default: build UI + release binary
-default: ui build
+default:
+    @echo
+    @echo "excalidraw-preview"
+    @echo "------------------"
+    @just --list | grep -v 'default'
+    @echo
 
 # Build the release binary (embeds current assets/)
 build:
@@ -19,6 +23,9 @@ build-debug:
 build-ext:
     cargo build -p excalidraw-preview --release --target wasm32-wasip1
 
+commit:
+    claudine compose @.claudine/prompts/commit.md -y
+
 # Build the webview (npm install + vite build → assets/)
 ui:
     cd {{webview}} && npm install && npm run build
@@ -26,10 +33,14 @@ ui:
 # Full release: UI + binary + extension WASM
 release: ui build build-ext
 
-# Run all tests (nextest + webview)
+# Add a new feature
+feature name:
+    @echo
+
+# Run all tests (nextest + webview typecheck + vitest)
 test:
     cargo nextest run
-    cd {{webview}} && npm test --if-present
+    cd {{webview}} && npm run typecheck && npm test --if-present
 
 # Symlink ~/.local/bin/excalidraw-preview → target/release (one-time setup)
 symlink:
@@ -56,3 +67,10 @@ dev: build-debug
 # Clean build artifacts (keeps assets/ so the extension still works)
 clean:
     cargo clean
+
+# chooses a spec or design file to identify the feature
+_choose_feature_or_fix feat="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    file="$(fd -g '*{spec,design}*\.md' --exclude '_completed' | {{ if feat == "" { "cat" } else { "rg " + feat } }} |  fzf --height=15 --border --border-label 'Choose a spec or design file')"
+    echo "${file}"
