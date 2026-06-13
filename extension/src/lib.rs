@@ -1,9 +1,7 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use zed_extension_api::{
     self as zed,
-    http_client::{self, HttpMethod, HttpRequestBuilder},
     process::Command as ProcessCommand,
     Architecture, Command, Extension, LanguageServerId, Os, Range, Result, SlashCommand,
     SlashCommandOutput, SlashCommandOutputSection, Worktree,
@@ -14,19 +12,12 @@ const BINARY_VERSION: &str = "0.1.0";
 const BINARY_NAME: &str = "excalidraw-preview";
 
 struct ExcalidrawPreviewExtension {
-    process_map: RwLock<HashMap<PathBuf, ProcessInfo>>,
     /// Cached path to the downloaded binary, so we don't re-download on every call.
     cached_binary_path: RwLock<Option<String>>,
 }
 
-struct ProcessInfo {
-    #[allow(dead_code)]
-    pid: u32,
-    port: u16,
-}
-
 impl ExcalidrawPreviewExtension {
-    fn is_valid_extension(path: &PathBuf) -> bool {
+    fn is_valid_extension(path: &Path) -> bool {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -34,26 +25,6 @@ impl ExcalidrawPreviewExtension {
         name.ends_with(".excalidraw")
             || name.ends_with(".excalidraw.svg")
             || name.ends_with(".excalidraw.png")
-    }
-
-    fn port_for_path(path: &PathBuf) -> u16 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        path.hash(&mut h);
-        (20000 + h.finish() % 10000) as u16
-    }
-
-    fn send_focus_request(port: u16) -> bool {
-        let url = format!("http://127.0.0.1:{}/focus", port);
-        match HttpRequestBuilder::new()
-            .method(HttpMethod::Get)
-            .url(&url)
-            .build()
-        {
-            Ok(request) => http_client::fetch(&request).is_ok(),
-            Err(_) => false,
-        }
     }
 
     fn find_excalidraw_file(worktree: &Worktree) -> Option<PathBuf> {
@@ -150,7 +121,6 @@ impl ExcalidrawPreviewExtension {
 impl Extension for ExcalidrawPreviewExtension {
     fn new() -> Self {
         ExcalidrawPreviewExtension {
-            process_map: RwLock::new(HashMap::new()),
             cached_binary_path: RwLock::new(None),
         }
     }
@@ -168,7 +138,7 @@ impl Extension for ExcalidrawPreviewExtension {
                 env: Default::default(),
             })
         } else {
-            Err(format!("unknown language server: {language_server_id}").into())
+            Err(format!("unknown language server: {language_server_id}"))
         }
     }
 
@@ -209,64 +179,31 @@ impl Extension for ExcalidrawPreviewExtension {
                 }
 
                 let file_path_str = file_path.to_string_lossy().to_string();
-                let port = Self::port_for_path(&file_path);
 
-                // If a window is already open for this file, focus it and return early.
-                {
-                    let map = self.process_map.read().unwrap();
-                    if let Some(info) = map.get(&file_path) {
-                        if Self::send_focus_request(info.port) {
-                            return Ok(SlashCommandOutput {
-                                sections: vec![SlashCommandOutputSection {
-                                    range: Range { start: 0, end: 1 },
-                                    label: "Preview focused".into(),
-                                }],
-                                text: "Existing preview window focused".into(),
-                            });
-                        }
-                    }
+                // The binary self-daemonizes (re-spawns detached, parent exits instantly),
+                // and self-deduplicates via its lock file: if a live instance is already
+                // serving this file it focuses that window and exits. So we always just run it.
+                let mut cmd = ProcessCommand::new(&binary).arg(&file_path_str);
+                if auto_save {
+                    cmd = cmd.arg("--auto-save");
                 }
-
-                self.process_map.write().unwrap().remove(&file_path);
-
-                // Background the binary via the shell so output() returns immediately.
-                let auto_save_flag = if auto_save { " --auto-save" } else { "" };
-                let shell_cmd = format!(
-                    "nohup {} {} --port {}{} >/dev/null 2>&1 &",
-                    shlex_quote(&binary),
-                    shlex_quote(&file_path_str),
-                    port,
-                    auto_save_flag,
-                );
-
-                match ProcessCommand::new("sh").arg("-c").arg(&shell_cmd).output() {
-                    Ok(_) => {
-                        self.process_map
-                            .write()
-                            .unwrap()
-                            .insert(file_path.clone(), ProcessInfo { pid: 0, port });
-                        Ok(SlashCommandOutput {
-                            sections: vec![SlashCommandOutputSection {
-                                range: Range { start: 0, end: 1 },
-                                label: "Preview opened".into(),
-                            }],
-                            text: format!("Opened preview for {}", file_path.display()),
-                        })
-                    }
-                    Err(e) => Err(format!("Failed to start preview: {e}").into()),
+                match cmd.output() {
+                    Ok(_) => Ok(SlashCommandOutput {
+                        sections: vec![SlashCommandOutputSection {
+                            range: Range { start: 0, end: 1 },
+                            label: "Preview opened".into(),
+                        }],
+                        text: format!("Opened preview for {}", file_path.display()),
+                    }),
+                    Err(e) => Err(format!("Failed to start preview: {e}")),
                 }
             }
-            _ => Err(format!("Unknown command: {}", command.name).into()),
+            _ => Err(format!("Unknown command: {}", command.name)),
         }
     }
 }
 
 zed_extension_api::register_extension!(ExcalidrawPreviewExtension);
-
-/// Wraps a string in single quotes, escaping any existing single quotes.
-fn shlex_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -321,43 +258,5 @@ mod tests {
         assert!(ExcalidrawPreviewExtension::is_valid_extension(
             &PathBuf::from("/home/user/diagrams/arch.excalidraw")
         ));
-    }
-
-    #[test]
-    fn test_port_for_path_is_deterministic() {
-        let p = PathBuf::from("/tmp/test.excalidraw");
-        assert_eq!(
-            ExcalidrawPreviewExtension::port_for_path(&p),
-            ExcalidrawPreviewExtension::port_for_path(&p)
-        );
-    }
-
-    #[test]
-    fn test_port_for_path_is_in_valid_range() {
-        let p = PathBuf::from("/tmp/test.excalidraw");
-        let port = ExcalidrawPreviewExtension::port_for_path(&p);
-        assert!(port >= 20000 && port < 30000, "port {port} out of range");
-    }
-
-    #[test]
-    fn test_port_for_path_differs_for_different_files() {
-        let a = ExcalidrawPreviewExtension::port_for_path(&PathBuf::from("/tmp/a.excalidraw"));
-        let b = ExcalidrawPreviewExtension::port_for_path(&PathBuf::from("/tmp/b.excalidraw"));
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_shlex_quote_plain() {
-        assert_eq!(shlex_quote("/usr/bin/foo"), "'/usr/bin/foo'");
-    }
-
-    #[test]
-    fn test_shlex_quote_with_single_quote() {
-        assert_eq!(shlex_quote("it's"), "'it'\\''s'");
-    }
-
-    #[test]
-    fn test_shlex_quote_with_spaces() {
-        assert_eq!(shlex_quote("/path/to my/file"), "'/path/to my/file'");
     }
 }
