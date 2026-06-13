@@ -33,6 +33,67 @@ ui:
 # Full release: UI + binary + extension WASM
 release: ui build build-ext
 
+# One-shot local install: check prereqs, build UI + binary, symlink onto PATH
+install-locally:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    bold=$(tput bold    2>/dev/null || true)
+    reset=$(tput sgr0   2>/dev/null || true)
+    green=$(tput setaf 2 2>/dev/null || true)
+    red=$(tput setaf 1   2>/dev/null || true)
+    yellow=$(tput setaf 3 2>/dev/null || true)
+    blue=$(tput setaf 4  2>/dev/null || true)
+
+    step() { echo; echo "${bold}${blue}▶ $1${reset}"; }
+    ok()   { echo "  ${green}✓${reset} $1"; }
+    warn() { echo "  ${yellow}!${reset} $1"; }
+    die()  { echo "  ${red}✗ $1${reset}" >&2; exit 1; }
+
+    echo
+    echo "${bold}Installing Excalidraw Preview locally${reset}"
+
+    step "Checking prerequisites"
+    command -v cargo  >/dev/null || die "cargo not found — install Rust via https://rustup.rs"
+    command -v rustup >/dev/null || die "rustup not found — install Rust via https://rustup.rs"
+    command -v node   >/dev/null || die "node not found — install Node.js from https://nodejs.org"
+    command -v npm    >/dev/null || die "npm not found — install Node.js from https://nodejs.org"
+    ok "cargo $(cargo --version | awk '{print $2}')"
+    ok "node $(node --version)"
+
+    step "Ensuring the wasm32-wasip1 target is installed (needed by Zed to build the extension)"
+    if rustup target list --installed | grep -qx 'wasm32-wasip1'; then
+        ok "wasm32-wasip1 already installed"
+    else
+        rustup target add wasm32-wasip1
+        ok "wasm32-wasip1 installed"
+    fi
+
+    step "Building the webview UI (npm install + vite build)"
+    just ui
+    ok "UI built → preview-binary/assets/"
+
+    step "Building the release binary"
+    just build
+    ok "binary built → {{release}}"
+
+    step "Linking the binary onto your PATH"
+    just symlink
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ok "~/.local/bin is on your PATH" ;;
+        *) warn "~/.local/bin is not on your PATH — add this to your shell profile and restart your shell:"
+           echo "      export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+    esac
+
+    echo
+    echo "${bold}${green}✓ Local install complete.${reset}"
+    echo
+    echo "  One step left, inside Zed:"
+    echo "    command palette → ${bold}\"zed: install dev extension\"${reset} → select the ${bold}./extension${reset} directory"
+    echo
+    echo "  Then open a .excalidraw file and run ${bold}/preview-excalidraw${reset}."
+    echo
+
 # Add a new feature
 feature name:
     @echo
