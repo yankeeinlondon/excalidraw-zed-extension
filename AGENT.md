@@ -34,13 +34,15 @@ excalidraw-zed-extension/
 │   ├── Cargo.toml
 │   ├── src/
 │   │   └── main.rs                 ← CLI entry, all routes, file watcher, WebView (monolith)
+│   ├── tests/                      ← Rust integration tests (spawn binary, hit routes)
 │   ├── webview-src/                ← React + Vite source (npm project)
 │   │   ├── package.json            ← @excalidraw/excalidraw ^0.18, react ^18, vite
 │   │   ├── vite.config.ts          ← prod: assets only; dev: mock API plugin for any file
 │   │   ├── index.html
 │   │   └── src/
 │   │       ├── main.tsx            ← fetch /config + /data → loadFromBlob → render, SSE
-│   │       └── App.tsx             ← <Excalidraw> editor, Ctrl+S / auto-save, SSE reload
+│   │       ├── App.tsx             ← <Excalidraw> editor, Ctrl+S / auto-save, SSE reload
+│   │       └── export.ts           ← client-side export helpers → POST /export
 │   └── assets/                     ← Vite build output; committed; embedded at compile time
 │       ├── index.html              ← served at GET /
 │       └── assets/
@@ -56,6 +58,10 @@ excalidraw-zed-extension/
 │       └── zed-extension/
 │           └── SKILL.md            ← Zed extension scaffolding skill
 │
+├── .config/
+│   └── nextest.toml                ← nextest profiles (default + ci)
+│
+├── justfile                        ← build/dev/test recipes (replaces Makefile)
 └── Cargo.toml                      ← workspace root
 ```
 
@@ -110,6 +116,14 @@ requires_argument = false
 **Key constraint:** WASM extensions cannot open sockets or use `std::process`.
 Use `zed_extension_api::process::Command` and `zed::http_client_get` only.
 
+### Language registration (`extension/languages/excalidraw/config.toml`)
+
+Registers the "Excalidraw" language (grammar `json`, language server `excalidraw-preview`)
+with `path_suffixes = ["excalidraw", "excalidraw.svg", "excalidraw.png"]`. Zed matches path
+*endings*, so all three Excalidraw variants get the language server (and its `didOpen`
+auto-preview) while plain `.svg`/`.png` files are unaffected. Trade-off: `.excalidraw.svg`
+opens in Zed's text buffer with the JSON grammar rather than XML.
+
 ---
 
 ## Component 2 — Companion Binary (`preview-binary/`)
@@ -122,10 +136,20 @@ Use `zed_extension_api::process::Command` and `zed::http_client_get` only.
 
 ```
 excalidraw-preview <file-path> [--port <port>] [--auto-save] [--debug]
+excalidraw-preview --new <path> [--auto-save] [--debug]
 excalidraw-preview --lsp
 excalidraw-preview --dev
 excalidraw-preview --dev-server <url>
 ```
+
+Additional flags:
+
+| Flag | Description |
+|---|---|
+| `--new <path>` | Create `<path>` as a new blank drawing (format from extension) and open the preview. Fails if the file already exists. Conflicts with the positional file arg. |
+| `--foreground` | Internal: run in the foreground without self-detaching. Set automatically on re-spawn (hidden). |
+| `--headless` | Run the HTTP server without opening a WebView window (tests / headless environments). |
+| `--export-dir <dir>` | Write exports directly into `<dir>` instead of showing a native save dialog. Intended for tests and headless use. |
 
 ### Startup sequence
 
@@ -150,6 +174,9 @@ excalidraw-preview --dev-server <url>
 | `GET /config` | JSON: `{ contentType, name, theme, autoSave }` |
 | `GET /data` | Read file from disk, return bytes with correct `Content-Type` |
 | `POST /data` | Write request body back to disk (save from WebView) |
+| `GET /library` | Read the shared library file; return its `.excalidrawlib` JSON |
+| `POST /library` | Persist library items to the shared library file |
+| `POST /export` | Receive exported bytes; write via native save dialog (or `--export-dir`) |
 | `GET /events` | SSE stream; emit `data: reload` on file change |
 | `GET /focus` | Signal WebView window to call `window.set_focus()` |
 | `GET /ping` | 200 OK liveness probe |
@@ -167,6 +194,8 @@ struct AppState {
     auto_save: bool,        // forwarded to /config → frontend
     broadcast_tx: broadcast::Sender<()>,
     focus_tx: Arc<watch::Sender<bool>>,
+    export_tx: std::sync::mpsc::Sender<ExportRequest>, // POST /export → UI-thread dialog
+    export_dir: Option<PathBuf>,                        // --export-dir: bypass dialog
 }
 ```
 
@@ -323,13 +352,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```bash
 # 0. One-time: install WASM target + symlink binary to PATH
 rustup target add wasm32-wasip1
-make symlink   # ~/.local/bin/excalidraw-preview → target/release (run once)
+just symlink   # ~/.local/bin/excalidraw-preview → target/release (run once)
 
 # 1. Normal build (UI + release binary)
-make
+just
 
 # 2. Full release (UI + binary + extension WASM)
-make release
+just release
 
 # 3. Run binary directly for testing
 ./target/release/excalidraw-preview ./path/to/file.excalidraw --debug
@@ -338,33 +367,35 @@ make release
 # In Zed: open the command palette → "zed: install dev extension" → select the ./extension directory
 ```
 
-### Makefile targets
+### justfile recipes
 
-| Target | Description |
+| Recipe | Description |
 |---|---|
-| `make` | Build UI + release binary |
-| `make build` | Release binary only (no UI rebuild) |
-| `make build-debug` | Debug binary |
-| `make ui` | Vite build only (`webview-src/` → `assets/`) |
-| `make release` | UI + binary + extension WASM |
-| `make symlink` | One-time: symlink `~/.local/bin/excalidraw-preview` → `target/release` |
-| `make dev` | Debug build + Vite dev server + WebView window in parallel |
-| `make dev-ui` | Vite dev server only |
-| `make dev-window` | WebView pointed at Vite dev server |
-| `make clean` | `cargo clean` (keeps `assets/`) |
+| `just` | Default: build UI + release binary (`ui build`) |
+| `just build` | Release binary only (no UI rebuild) |
+| `just build-debug` | Debug binary |
+| `just build-ext` | Zed extension WASM (`wasm32-wasip1`) |
+| `just ui` | Vite build only (`npm install` + `vite build`: `webview-src/` → `assets/`) |
+| `just release` | UI + binary + extension WASM |
+| `just test` | `cargo nextest run` + `cargo test --doc` + webview vitest |
+| `just symlink` | One-time: symlink `~/.local/bin/excalidraw-preview` → `target/release` |
+| `just dev` | Debug build + Vite dev server + WebView window in parallel |
+| `just dev-ui` | Vite dev server only |
+| `just dev-window` | WebView pointed at the Vite dev server (run `just dev-ui` first) |
+| `just clean` | `cargo clean` (keeps `assets/`) |
 
 ### Dev workflow
 
 ```bash
 # Start dev server + WebView (default file or DEV_FILE env var)
-make dev DEV_FILE=docs/examples/system-architecture.excalidraw
+just dev DEV_FILE=docs/examples/system-architecture.excalidraw
 
 # Or open any file in the browser without restarting:
 # http://localhost:5173?file=/absolute/path/to/diagram.excalidraw
 ```
 
 Vite HMR updates the WebView on every `App.tsx` save — no Rust rebuild needed during UI development.
-After UI changes are done: `make ui && make build` to bake them into the release binary.
+After UI changes are done: `just ui && just build` to bake them into the release binary.
 
 ---
 

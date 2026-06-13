@@ -120,7 +120,7 @@ Blank-scene generation lives in exactly one place: the Rust binary. A blank scen
 { "type": "excalidraw", "version": 2, "source": "excalidraw-zed-preview", "elements": [], "appState": { "gridSize": null, "viewBackgroundColor": "#ffffff" }, "files": {} }
 ```
 
-For `.excalidraw.svg` / `.excalidraw.png` targets, the binary writes the equivalent blank scene exported in that format (with embedded scene data).
+For `.excalidraw.svg` / `.excalidraw.png` targets the file is created/left empty and the webview bootstraps it on first load (empty bytes → blank scene → immediate save in the declared format) — only Excalidraw's JS exporter can render those formats.
 
 Three entry points, all in scope:
 
