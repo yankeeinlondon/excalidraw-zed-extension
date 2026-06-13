@@ -68,6 +68,7 @@ export default function App({
   const resolvedTheme = useOsTheme(theme as "auto" | "light" | "dark");
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const libraryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Tracks the element hash of the last-saved state so auto-save only fires
   // on real element changes, not on viewport pan / zoom / selection.
   const prevVersionRef = useRef<number>(-1);
@@ -214,6 +215,20 @@ export default function App({
     [name],
   );
 
+  /** Persists library panel changes to the shared library file (debounced 600 ms). */
+  const handleLibraryChange = useCallback((items: readonly unknown[]) => {
+    if (libraryTimer.current) clearTimeout(libraryTimer.current);
+    libraryTimer.current = setTimeout(() => {
+      fetch("/library", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "excalidrawlib", version: 2, libraryItems: items }),
+      }).catch(() => {
+        // server gone — nothing actionable from the webview
+      });
+    }, 600);
+  }, []);
+
   return (
     <div style={{ height: "100%" }}>
       <Excalidraw
@@ -225,6 +240,7 @@ export default function App({
         theme={resolvedTheme}
         name={name}
         onChange={handleChange}
+        onLibraryChange={handleLibraryChange}
       >
         <MainMenu>
           <MainMenu.Item onSelect={doSave} shortcut="Ctrl+S">

@@ -61,6 +61,18 @@ async function main() {
     if (!dataRes.ok) throw new Error(`Failed to fetch data: ${dataRes.status}`);
     const bytes = await dataRes.arrayBuffer();
 
+    // Shared shape library — failure is non-fatal (e.g. dev-mode mock has no /library).
+    let libraryItems: unknown[] = [];
+    try {
+      const libRes = await fetch(apiUrl("/library"));
+      if (libRes.ok) {
+        const lib = (await libRes.json()) as { libraryItems?: unknown[] };
+        libraryItems = lib.libraryItems ?? [];
+      }
+    } catch {
+      // library persistence unavailable; start with an empty panel
+    }
+
     const { loadFromBlob } = await import("@excalidraw/excalidraw");
 
     let initialData: ExcalidrawInitialDataState | null = null;
@@ -102,7 +114,7 @@ async function main() {
 
     ReactDOM.createRoot(root).render(
       <App
-        initialData={initialData}
+        initialData={{ ...initialData, libraryItems: libraryItems as ExcalidrawInitialDataState["libraryItems"] }}
         theme={config.theme}
         name={config.name}
         contentType={config.contentType}

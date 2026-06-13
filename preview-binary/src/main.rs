@@ -211,6 +211,7 @@ fn main() -> Result<()> {
         .route("/", get(serve_index))
         .route("/config", get(serve_config))
         .route("/data", get(serve_data).post(receive_data))
+        .route("/library", get(serve_library).post(receive_library))
         .route("/events", get(serve_events))
         .route("/focus", get(handle_focus))
         .route("/shutdown", get(handle_shutdown))
@@ -496,6 +497,48 @@ async fn handle_shutdown(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 async fn ping() -> impl IntoResponse {
     "OK"
+}
+
+/// Default (empty) shape library, served when no library has been saved yet.
+const EMPTY_LIBRARY: &str = r#"{"type":"excalidrawlib","version":2,"libraryItems":[]}"#;
+
+/// Path of the shared shape library: one file for all diagrams and sessions.
+/// `EXCALIDRAW_ZED_CONFIG_DIR` overrides the platform config dir (used by tests).
+fn library_path() -> Option<PathBuf> {
+    let base = std::env::var("EXCALIDRAW_ZED_CONFIG_DIR")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(dirs::config_dir)?;
+    Some(base.join("excalidraw-zed").join("library.excalidrawlib"))
+}
+
+async fn serve_library() -> impl IntoResponse {
+    let content = library_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_else(|| EMPTY_LIBRARY.to_string());
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        content,
+    )
+}
+
+async fn receive_library(body: axum::body::Bytes) -> Response {
+    let Some(path) = library_path() else {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "no config directory available",
+        )
+            .into_response();
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+    match std::fs::write(&path, &body) {
+        Ok(_) => axum::http::StatusCode::OK.into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1302,5 +1345,28 @@ mod tests {
         create_new_drawing(path.to_str().unwrap()).unwrap();
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_library_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("EXCALIDRAW_ZED_CONFIG_DIR", dir.path());
+
+        // Empty default before anything is saved.
+        let resp = serve_library().await.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["type"], "excalidrawlib");
+        assert!(parsed["libraryItems"].as_array().unwrap().is_empty());
+
+        // POST then GET round-trips the payload.
+        let payload = r#"{"type":"excalidrawlib","version":2,"libraryItems":[{"id":"a"}]}"#;
+        let resp = receive_library(axum::body::Bytes::from(payload)).await.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let resp = serve_library().await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), payload);
     }
 }
