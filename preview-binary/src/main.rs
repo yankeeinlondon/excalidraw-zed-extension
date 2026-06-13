@@ -110,10 +110,18 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let file = args
-        .file
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("Usage: excalidraw-preview <file> [--port <port>] [--debug]\n       excalidraw-preview --lsp"))?;
+    let file = if let Some(new_path) = &args.new {
+        // Create in the parent process so errors surface to the caller, then proceed
+        // (and daemonize) on the now-existing file. --new is never forwarded.
+        create_new_drawing(new_path)?;
+        new_path.clone()
+    } else {
+        args.file.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Usage: excalidraw-preview <file> [--port <port>] [--debug]\n       excalidraw-preview --new <path>\n       excalidraw-preview --lsp"
+            )
+        })?
+    };
 
     let file_path = PathBuf::from(&file);
     if !file_path.exists() {
@@ -305,6 +313,41 @@ fn bootstrap_if_empty(path: &Path) -> Result<bool> {
     }
     std::fs::write(path, BLANK_SCENE_JSON)?;
     Ok(true)
+}
+
+/// Creates a new blank drawing at `path_str`.
+///
+/// `.excalidraw` files get the blank JSON scene; `.excalidraw.svg` / `.excalidraw.png`
+/// are created empty and bootstrapped client-side by the webview on first load.
+///
+/// ## Errors
+/// Fails if the path has an unsupported extension or the file already exists.
+fn create_new_drawing(path_str: &str) -> Result<()> {
+    let path = Path::new(path_str);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let valid = name.ends_with(".excalidraw")
+        || name.ends_with(".excalidraw.svg")
+        || name.ends_with(".excalidraw.png");
+    if !valid {
+        anyhow::bail!("--new requires a .excalidraw, .excalidraw.svg, or .excalidraw.png path");
+    }
+    if path.exists() {
+        anyhow::bail!("Refusing to overwrite existing file: {}", path.display());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    if detect_content_type(path) == "application/json" {
+        std::fs::write(path, BLANK_SCENE_JSON)?;
+    } else {
+        std::fs::write(path, b"")?;
+    }
+    Ok(())
 }
 
 /// Returns the path of the per-file lock file stored in the system temp directory.
@@ -547,6 +590,10 @@ struct CliArgs {
     /// Path to the .excalidraw, .excalidraw.svg, or .excalidraw.png file to preview.
     /// Not required when running as an LSP server (--lsp).
     file: Option<String>,
+    /// Create <PATH> as a new blank drawing and open the preview.
+    /// Fails if the file already exists.
+    #[arg(long, value_name = "PATH", conflicts_with = "file")]
+    new: Option<String>,
     /// Bind the HTTP server to this port (default: auto-selected).
     #[arg(long)]
     port: Option<u16>,
@@ -1083,6 +1130,40 @@ mod tests {
         let path = dir.path().join("new.excalidraw.svg");
         std::fs::write(&path, "").unwrap();
         assert!(!bootstrap_if_empty(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_create_new_drawing_writes_blank_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.excalidraw");
+        create_new_drawing(path.to_str().unwrap()).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["type"], "excalidraw");
+    }
+
+    #[test]
+    fn test_create_new_drawing_refuses_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exists.excalidraw");
+        std::fs::write(&path, "x").unwrap();
+        let err = create_new_drawing(path.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("Refusing to overwrite"));
+    }
+
+    #[test]
+    fn test_create_new_drawing_rejects_wrong_extension() {
+        let err = create_new_drawing("/tmp/nope.txt").unwrap_err();
+        assert!(err.to_string().contains(".excalidraw"));
+    }
+
+    #[test]
+    fn test_create_new_drawing_svg_creates_empty_file_for_client_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.excalidraw.svg");
+        create_new_drawing(path.to_str().unwrap()).unwrap();
+        assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap().len(), 0);
     }
 }
