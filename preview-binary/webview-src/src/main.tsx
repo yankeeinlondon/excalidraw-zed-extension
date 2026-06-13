@@ -64,16 +64,25 @@ async function main() {
     const { loadFromBlob } = await import("@excalidraw/excalidraw");
 
     let initialData: ExcalidrawInitialDataState | null = null;
-    for (const type of reorderFallbacks(config.contentType)) {
-      try {
-        initialData = await loadFromBlob(
-          new Blob([bytes], { type }),
-          null,
-          null,
-        );
-        break;
-      } catch {
-        // try next format
+    // Empty file (new .excalidraw.svg/.excalidraw.png drawing): start with a blank
+    // scene and let App write the proper format to disk on its bootstrap save.
+    const isEmptyFile = bytes.byteLength === 0 ||
+      new TextDecoder().decode(bytes).trim().length === 0;
+
+    if (isEmptyFile) {
+      initialData = { elements: [], appState: {}, files: {} };
+    } else {
+      for (const type of reorderFallbacks(config.contentType)) {
+        try {
+          initialData = await loadFromBlob(
+            new Blob([bytes], { type }),
+            null,
+            null,
+          );
+          break;
+        } catch {
+          // try next format
+        }
       }
     }
 
@@ -98,6 +107,7 @@ async function main() {
         name={config.name}
         contentType={config.contentType}
         autoSave={config.autoSave}
+        bootstrapSave={isEmptyFile}
         onApiReady={() => {}}
         onSaved={(until) => {
           ignoreSseUntil = until;

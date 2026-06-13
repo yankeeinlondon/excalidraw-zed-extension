@@ -132,6 +132,11 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "diagram".to_string());
 
     let canonical_path = std::fs::canonicalize(&file_path)?;
+
+    if bootstrap_if_empty(&canonical_path)? {
+        info!("Bootstrapped empty file with a blank scene");
+    }
+
     let lock_path = get_lock_path(&canonical_path);
 
     // Build a multi-thread runtime; main thread is reserved for the WebView event loop.
@@ -272,6 +277,34 @@ fn detect_content_type(path: &Path) -> String {
     } else {
         "application/json".to_string()
     }
+}
+
+/// A minimal valid Excalidraw scene, written into empty `.excalidraw` files.
+const BLANK_SCENE_JSON: &str = r##"{
+  "type": "excalidraw",
+  "version": 2,
+  "source": "excalidraw-zed-preview",
+  "elements": [],
+  "appState": { "gridSize": null, "viewBackgroundColor": "#ffffff" },
+  "files": {}
+}"##;
+
+/// Bootstraps an empty (0-byte or whitespace-only) `.excalidraw` file with a blank scene.
+///
+/// SVG/PNG variants are left untouched: only Excalidraw's JS exporter can render those
+/// formats, so the webview bootstraps them client-side on first load (empty bytes →
+/// empty scene → immediate save in the declared format).
+///
+/// ## Returns
+/// `true` if the file was bootstrapped.
+fn bootstrap_if_empty(path: &Path) -> Result<bool> {
+    let content = std::fs::read(path)?;
+    let is_blank = content.iter().all(|b| b.is_ascii_whitespace());
+    if !is_blank || detect_content_type(path) != "application/json" {
+        return Ok(false);
+    }
+    std::fs::write(path, BLANK_SCENE_JSON)?;
+    Ok(true)
 }
 
 /// Returns the path of the per-file lock file stored in the system temp directory.
@@ -1012,5 +1045,44 @@ mod tests {
             .unwrap();
         // Either 200 (assets present) or 404 (no assets in test build) is acceptable.
         assert!(response.status() == StatusCode::OK || response.status() == StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_bootstrap_writes_blank_scene_into_empty_json_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.excalidraw");
+        std::fs::write(&path, "").unwrap();
+        assert!(bootstrap_if_empty(&path).unwrap());
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["type"], "excalidraw");
+        assert_eq!(parsed["version"], 2);
+        assert!(parsed["elements"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_bootstrap_treats_whitespace_only_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.excalidraw");
+        std::fs::write(&path, "  \n\t ").unwrap();
+        assert!(bootstrap_if_empty(&path).unwrap());
+    }
+
+    #[test]
+    fn test_bootstrap_ignores_non_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.excalidraw");
+        std::fs::write(&path, r#"{"type":"excalidraw"}"#).unwrap();
+        assert!(!bootstrap_if_empty(&path).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"type":"excalidraw"}"#);
+    }
+
+    #[test]
+    fn test_bootstrap_leaves_empty_svg_for_client_side_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.excalidraw.svg");
+        std::fs::write(&path, "").unwrap();
+        assert!(!bootstrap_if_empty(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
     }
 }

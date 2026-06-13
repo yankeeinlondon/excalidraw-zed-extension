@@ -16,6 +16,8 @@ interface AppProps {
   contentType: string;
   /** When true, saves to disk after every element change (debounced 600 ms). */
   autoSave: boolean;
+  /** When true (empty file on disk), write the blank scene in the declared format once on mount. */
+  bootstrapSave: boolean;
   onApiReady: (api: ExcalidrawImperativeAPI) => void;
   /** Called after a successful save so the SSE listener can suppress the echo. */
   onSaved: (suppressUntil: number) => void;
@@ -57,6 +59,7 @@ export default function App({
   name,
   contentType,
   autoSave,
+  bootstrapSave,
   onApiReady,
   onSaved,
   onReloadReady,
@@ -146,6 +149,15 @@ export default function App({
       // Silently ignore network errors (preview server may have shut down).
     }
   }, [contentType, onSaved]);
+
+  // New empty file: persist a valid blank scene in the declared format (JSON files are
+  // already bootstrapped server-side; this covers .excalidraw.svg / .excalidraw.png).
+  useEffect(() => {
+    if (bootstrapSave) {
+      void doSave();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /** Ctrl+S / Cmd+S — always triggers an immediate save. */
   useEffect(() => {
