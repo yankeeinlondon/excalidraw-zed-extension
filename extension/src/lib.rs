@@ -8,7 +8,7 @@ use zed_extension_api::{
 };
 
 /// Must match the GitHub Release tag (v{VERSION}).
-const BINARY_VERSION: &str = "0.1.0";
+const BINARY_VERSION: &str = "0.3.0";
 const BINARY_NAME: &str = "excalidraw-preview";
 
 struct ExcalidrawPreviewExtension {
