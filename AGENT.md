@@ -296,17 +296,19 @@ zed_extension_api = "0.1"
 
 ```toml
 [dependencies]
-wry        = "0.43"
-tao        = "0.30"
-axum       = { version = "0.8", features = ["tokio"] }
+wry        = "0.55"
+tao        = "0.35"
+axum       = { version = "0.8", features = ["tokio", "macros"] }
 tokio      = { version = "1", features = ["full"] }
-notify     = "6"
+notify     = "8"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap       = { version = "4", features = ["derive"] }
 anyhow     = "1"
-sha2       = "0.10"          # for lock file path hashing
+sha2       = "0.11"          # for lock file path hashing
 rust-embed = "8"             # for embedding assets/ directory
+reqwest    = { version = "0.13", features = ["json", "blocking"] }
+rfd        = "0.17"          # native save dialog
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```
@@ -316,16 +318,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```json
 {
   "dependencies": {
-    "@excalidraw/excalidraw": "^0.18.0",
-    "react": "^18",
-    "react-dom": "^18"
+    "@excalidraw/excalidraw": "^0.18.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "latest",
-    "@types/react": "^18",
-    "@types/react-dom": "^18",
-    "typescript": "^5",
-    "vite": "^6"
+    "@vitejs/plugin-react": "^6.0.2",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16",
+    "vitest": "^4.1.8"
+  },
+  "overrides": {
+    "vite": "^8.0.16"
   },
   "scripts": {
     "build": "vite build",
