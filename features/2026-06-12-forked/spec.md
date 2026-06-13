@@ -71,6 +71,11 @@ Broken or missing:
 - Replace `Makefile` with a `justfile` carrying over all targets with the same semantics: `build` (default: UI + release binary), `build-debug`, `ui`, `release`, `symlink`, `dev`, `dev-ui`, `dev-window`, `clean`.
 - Delete the Makefile; update `AGENT.md`, `README.md`, and CI references from `make` to `just`.
 
+### 1.5 Documentation
+
+- README gains a "Creating a new drawing" section: right-click in the project panel → New File → name it `whiteboard.excalidraw` → blank canvas preview opens (the §3.1 bootstrap flow). Include a copy-paste `tasks.json` snippet wiring Zed's `task: spawn` to `excalidraw-preview --new` for users who want a palette-adjacent entry point.
+- README documents the known Zed extension-API limitations that shape this design: extensions cannot add command-palette actions, context-menu items, or custom editor panes (tracked upstream in zed-industries/zed#8441 and #18043). If Zed ships extension-registered actions, a `new excalidraw drawing` palette action becomes the primary creation entry point — it would be a thin wrapper over the `--new` flag, which is built in §3.3.
+
 ---
 
 ## 2. Export Fix
@@ -148,7 +153,14 @@ Three entry points, all in scope:
 - Server: `GET /library` / `POST /library` routes backed by a single shared file at `{dirs::config_dir()}/excalidraw-zed/library.excalidrawlib` (so `~/.config/excalidraw-zed/…` on Linux, `~/Library/Application Support/excalidraw-zed/…` on macOS), so the library follows the user across diagrams and sessions.
 - Known limitation (documented in README): the "Browse libraries" button's excalidraw.com round-trip does not work inside the WebView.
 
-### 4.4 Image insert/paste — verification only
+### 4.4 Click-to-preview for `.excalidraw.svg` / `.excalidraw.png`
+
+- Today only plain `.excalidraw` files are registered to the "Excalidraw" language, so only they auto-open a preview on click; the SVG/PNG variants fall through to Zed's normal SVG/image handling.
+- Fix: extend `extension/languages/excalidraw/config.toml` to `path_suffixes = ["excalidraw", "excalidraw.svg", "excalidraw.png"]`. Zed matches path endings, so plain `.svg`/`.png` files are unaffected.
+- **Must be verified empirically for PNG:** it is unknown whether Zed's built-in image viewer takes precedence over the language registration for `.excalidraw.png`. If the image viewer wins (no `didOpen` → no auto-preview), document the slash command as the entry point for PNGs and note it as a known limitation.
+- Side effect (accepted): `.excalidraw.svg` opens in Zed's text buffer with the JSON grammar rather than XML — a fair trade since exported SVGs are rarely hand-edited.
+
+### 4.5 Image insert/paste — verification only
 
 - Spec'd as test cases, not feature work: insert image via toolbar file picker; paste image from clipboard; confirm base64 data lands in the scene's `files` object and survives save → reload. Fix only if verification fails.
 
@@ -161,6 +173,7 @@ Three entry points, all in scope:
 - **Integration script:** spawn the binary against a temp `.excalidraw` file → assert `/ping` 200, `/config` content type, `/data` round-trip, SSE fires within 150 ms of file mutation, `POST /export` writes bytes under `--export-dir`.
 - **Manual checklist (per platform — macOS now, Linux now, Windows best-effort/deferred):**
   - Open each of the three formats; edit; Ctrl+S persists to disk; external edit in Zed live-reloads without resetting viewport.
+  - Click each of the three formats in the project panel → preview auto-opens (PNG outcome recorded per §4.4; document fallback if the image viewer wins). Plain `.svg`/`.png` files do NOT trigger the Excalidraw language.
   - Export PNG (1x, 2x), SVG, and scene JSON via the new menu; files land where chosen.
   - New drawing via: empty-file save-as, `/new-excalidraw`, and `--new`.
   - Add a library item; restart preview; item is still present.
@@ -177,6 +190,7 @@ Three entry points, all in scope:
 6. Library items persist across preview restarts and are shared between different diagram files.
 7. `just` replaces `make` for every documented workflow; CI is green; `v0.2.0` release assets exist for all four targets.
 8. Extension is submitted to the Zed extension registry.
+9. Clicking a `.excalidraw` or `.excalidraw.svg` file auto-opens the preview; `.excalidraw.png` does too if the language registration beats the image viewer (else documented limitation). Ordinary `.svg`/`.png` files are unaffected.
 
 ## Milestones
 
