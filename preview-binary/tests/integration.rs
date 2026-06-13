@@ -16,7 +16,11 @@ fn binary() -> &'static str {
 fn lock_path_for(canonical: &Path) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(canonical.to_string_lossy().as_bytes());
-    let hash = format!("{:x}", hasher.finalize());
+    let hash: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
     let tmpdir = std::env::var("TMPDIR")
         .or_else(|_| std::env::var("TEMP"))
         .unwrap_or_else(|_| "/tmp".to_string());

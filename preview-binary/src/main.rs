@@ -377,7 +377,11 @@ fn create_new_drawing(path_str: &str) -> Result<()> {
 fn get_lock_path(canonical_path: &Path) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(canonical_path.to_string_lossy().as_bytes());
-    let hash = format!("{:x}", hasher.finalize());
+    let hash: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
 
     let tmpdir = std::env::var("TMPDIR")
         .or_else(|_| std::env::var("TEMP"))
@@ -666,9 +670,9 @@ fn run_webview_url(
     window.set_title("Excalidraw Preview");
     window.set_default_size(1200, 800);
 
-    let _webview = wry::WebViewBuilder::new_gtk(&window)
+    let _webview = wry::WebViewBuilder::new()
         .with_url(url)
-        .build()
+        .build_gtk(&window)
         .map_err(|e| format!("Failed to create WebView: {}", e))?;
 
     window.show_all();
@@ -718,9 +722,9 @@ fn run_webview_url(
         .build(&event_loop)
         .map_err(|e| format!("Failed to create window: {}", e))?;
 
-    let _webview = WebViewBuilder::new(&window)
+    let _webview = WebViewBuilder::new()
         .with_url(url)
-        .build()
+        .build(&window)
         .map_err(|e| format!("Failed to create WebView: {}", e))?;
 
     event_loop.run(move |event, _, control_flow| {
