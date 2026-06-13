@@ -198,6 +198,44 @@ impl Extension for ExcalidrawPreviewExtension {
                     Err(e) => Err(format!("Failed to start preview: {e}")),
                 }
             }
+            "new-excalidraw" => {
+                let worktree = worktree.ok_or("No worktree available")?;
+                let binary = self.get_binary_path(worktree)?;
+                let root = PathBuf::from(worktree.root_path());
+
+                let file_path = if let Some(name) = args.iter().find(|a| !a.starts_with("--")) {
+                    let mut name = name.to_string();
+                    if !name.ends_with(".excalidraw") {
+                        name.push_str(".excalidraw");
+                    }
+                    root.join(name)
+                } else {
+                    (1..1000)
+                        .map(|n| root.join(format!("untitled-{n}.excalidraw")))
+                        .find(|p| !p.exists())
+                        .ok_or("Could not find a free untitled-N.excalidraw name")?
+                };
+
+                if file_path.exists() {
+                    return Err(format!("{} already exists", file_path.display()));
+                }
+
+                let file_path_str = file_path.to_string_lossy().to_string();
+                match ProcessCommand::new(&binary)
+                    .arg("--new")
+                    .arg(&file_path_str)
+                    .output()
+                {
+                    Ok(_) => Ok(SlashCommandOutput {
+                        sections: vec![SlashCommandOutputSection {
+                            range: Range { start: 0, end: 1 },
+                            label: "Drawing created".into(),
+                        }],
+                        text: format!("Created and opened {}", file_path.display()),
+                    }),
+                    Err(e) => Err(format!("Failed to create drawing: {e}")),
+                }
+            }
             _ => Err(format!("Unknown command: {}", command.name)),
         }
     }
