@@ -38,4 +38,4 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: cd preview-binary/webview-src && npm ci && npm test --if-present
+      - run: cd preview-binary/webview-src && npm ci && npm run typecheck && npm test --if-present
