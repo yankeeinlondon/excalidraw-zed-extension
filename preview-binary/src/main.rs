@@ -42,6 +42,46 @@ struct ConfigResponse {
     auto_save: bool,
 }
 
+/// Re-spawns the current executable fully detached from the parent and returns immediately.
+///
+/// The child re-runs with `--foreground` appended so it skips this branch. This lets
+/// callers (the Zed extension, terminals, the LSP) spawn the binary without shell
+/// tricks like `nohup … &`, and works on Windows where `sh` does not exist.
+fn daemonize(file: &str, args: &CliArgs) -> Result<()> {
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg(file).arg("--foreground");
+    if let Some(port) = args.port {
+        cmd.arg("--port").arg(port.to_string());
+    }
+    if args.auto_save {
+        cmd.arg("--auto-save");
+    }
+    if args.debug {
+        cmd.arg("--debug");
+    }
+    if args.headless {
+        cmd.arg("--headless");
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    cmd.spawn()?;
+    Ok(())
+}
+
 /// Entry point. Keeps the main thread free for the native event loop (required on macOS).
 fn main() -> Result<()> {
     let args = CliArgs::parse();
@@ -58,11 +98,13 @@ fn main() -> Result<()> {
 
     // --dev / --dev-server: open the WebView on the Vite dev server instead of the
     // embedded assets.  Run `npm run dev` in webview-src first.
-    if let Some(dev_url) = args.dev_server.or_else(|| args.dev.then(|| "http://localhost:5173".to_string())) {
+    let dev_url = args.dev_server.as_deref()
+        .or_else(|| args.dev.then_some("http://localhost:5173"));
+    if let Some(dev_url) = dev_url {
         eprintln!("[dev] Opening WebView at {dev_url}");
         eprintln!("[dev] Make sure `npm run dev` is running in preview-binary/webview-src/");
         let (_focus_tx, focus_rx) = watch::channel(false);
-        if let Err(e) = run_webview_url(&dev_url, focus_rx) {
+        if let Err(e) = run_webview_url(dev_url, focus_rx) {
             eprintln!("WebView error: {e}");
         }
         return Ok(());
@@ -70,11 +112,17 @@ fn main() -> Result<()> {
 
     let file = args
         .file
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("Usage: excalidraw-preview <file> [--port <port>] [--debug]\n       excalidraw-preview --lsp"))?;
 
     let file_path = PathBuf::from(&file);
     if !file_path.exists() {
         anyhow::bail!("File not found: {}", file_path.display());
+    }
+
+    // Detach from the parent so callers (Zed extension, terminals) return immediately.
+    if !args.foreground {
+        return daemonize(&file, &args);
     }
 
     let content_type = detect_content_type(&file_path);
@@ -184,6 +232,13 @@ fn main() -> Result<()> {
     });
 
     // Run the WebView event loop on the main thread (required on macOS / some Linux WMs).
+    if args.headless {
+        info!("Headless mode: serving without a window until /shutdown or kill");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+
     if let Err(e) = run_webview(port, focus_rx) {
         eprintln!(
             "WebView error: {}. Server running at http://127.0.0.1:{}",
@@ -349,7 +404,7 @@ async fn serve_assets(axum::extract::Path(path): axum::extract::Path<String>) ->
     let path = path.strip_prefix("/").unwrap_or(&path);
     match Assets::get(path) {
         Some(content) => {
-            let mime = mime_guess::from_path(&path)
+            let mime = mime_guess::from_path(path)
                 .first_or_octet_stream()
                 .to_string();
             (
@@ -407,6 +462,7 @@ fn run_webview_url(
 /// Opens the WebView at an arbitrary URL. Used both for the normal server and
 /// for `--dev` / `--dev-server` mode (pointing at the Vite dev server).
 #[cfg(not(target_os = "linux"))]
+#[allow(unreachable_code)]
 fn run_webview_url(
     url: &str,
     mut focus_rx: watch::Receiver<bool>,
@@ -481,6 +537,12 @@ struct CliArgs {
     /// Default: off — use Ctrl+S to save manually.
     #[arg(long)]
     auto_save: bool,
+    /// Internal: run in the foreground (do not detach). Set automatically on re-spawn.
+    #[arg(long, hide = true)]
+    foreground: bool,
+    /// Run the server without opening a WebView window (tests / headless environments).
+    #[arg(long)]
+    headless: bool,
 }
 
 // ── LSP server ───────────────────────────────────────────────────────────────
