@@ -8,6 +8,7 @@ import {
   hashElementsVersion,
 } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css";
+import { postExport, type ExportKind } from "./export";
 
 interface AppProps {
   initialData: ExcalidrawInitialDataState;
@@ -192,6 +193,27 @@ export default function App({
     [autoSave, doSave],
   );
 
+  /** Exports via the Rust server's native save dialog; shows the outcome in a toast. */
+  const handleExport = useCallback(
+    async (kind: ExportKind) => {
+      const api = apiRef.current;
+      if (!api) return;
+      try {
+        const savedPath = await postExport(api, name, kind);
+        if (savedPath) {
+          api.setToast({ message: `Exported to ${savedPath}`, duration: 3000 });
+        }
+        // null = user cancelled the dialog — stay silent.
+      } catch (e) {
+        api.setToast({
+          message: `Export failed: ${e instanceof Error ? e.message : String(e)}`,
+          duration: 5000,
+        });
+      }
+    },
+    [name],
+  );
+
   return (
     <div style={{ height: "100%" }}>
       <Excalidraw
@@ -210,8 +232,12 @@ export default function App({
           </MainMenu.Item>
           <MainMenu.Separator />
           <MainMenu.DefaultItems.LoadScene />
-          <MainMenu.DefaultItems.SaveAsImage />
-          <MainMenu.DefaultItems.Export />
+          <MainMenu.Item onSelect={() => void handleExport("png")}>Export PNG</MainMenu.Item>
+          <MainMenu.Item onSelect={() => void handleExport("png2x")}>Export PNG (2x)</MainMenu.Item>
+          <MainMenu.Item onSelect={() => void handleExport("svg")}>Export SVG</MainMenu.Item>
+          <MainMenu.Item onSelect={() => void handleExport("scene")}>
+            Export scene (.excalidraw)
+          </MainMenu.Item>
           <MainMenu.Separator />
           <MainMenu.DefaultItems.ClearCanvas />
           <MainMenu.DefaultItems.ChangeCanvasBackground />
