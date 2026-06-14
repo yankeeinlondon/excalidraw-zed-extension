@@ -21,6 +21,15 @@ export default defineConfig(({ command }) => {
     build: {
       outDir: "../assets",
       emptyOutDir: true,
+      // The Excalidraw editor is a single ~1.3 MB chunk, and its on-demand
+      // mermaid-diagram support (cytoscape + katex) is a separate ~1.8 MB lazy
+      // chunk. This bundle is embedded in the preview binary and served over
+      // loopback from local disk, so there is no network/CDN cost to code-split
+      // for — splitting further would just add local requests for no benefit.
+      // Raise the warning ceiling above those real footprints (default 500 kB),
+      // keeping enough headroom that a genuine size regression (e.g. an accidental
+      // dep blowing the bundle up) still warns.
+      chunkSizeWarningLimit: 2000,
     },
   };
 });
