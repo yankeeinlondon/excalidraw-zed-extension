@@ -85,6 +85,19 @@ fn http_get(url: &str) -> (u16, String) {
     (status, body)
 }
 
+/// POST a JSON body and return the status code.
+fn http_post_json(url: &str, body: &str) -> u16 {
+    reqwest::blocking::Client::new()
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .timeout(Duration::from_secs(3))
+        .send()
+        .expect("POST request failed")
+        .status()
+        .as_u16()
+}
+
 #[test]
 fn headless_server_serves_ping_config_and_data() {
     let dir = tempfile::tempdir().unwrap();
@@ -247,6 +260,38 @@ fn post_data_writes_scene_to_disk() {
 }
 
 #[test]
+fn concurrent_previews_bind_distinct_ports_and_serve() {
+    // Regression for the port time-of-check/time-of-use race: start several
+    // previews for different files at once and assert each binds its own port
+    // and serves. With the old "probe then bind" scheme these raced for the same
+    // free port and all but one failed with "Address already in use".
+    let dir = tempfile::tempdir().unwrap();
+    let mut previews = Vec::new();
+    for i in 0..5 {
+        let file = dir.path().join(format!("concurrent-{i}.excalidraw"));
+        std::fs::write(&file, BLANK_SCENE).unwrap();
+        previews.push(Preview::spawn(&file, &[]));
+    }
+
+    // All ports must be distinct.
+    let mut ports: Vec<u16> = previews.iter().map(|p| p.port).collect();
+    ports.sort_unstable();
+    let unique = {
+        let mut p = ports.clone();
+        p.dedup();
+        p.len()
+    };
+    assert_eq!(unique, ports.len(), "previews must bind distinct ports: {ports:?}");
+
+    // And every instance must actually be serving.
+    for preview in &previews {
+        let (status, body) = http_get(&preview.url("/ping"));
+        assert_eq!(status, 200, "preview on port {} not serving", preview.port);
+        assert_eq!(body, "OK");
+    }
+}
+
+#[test]
 fn second_instance_for_same_file_exits_and_first_keeps_serving() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("test.excalidraw");
@@ -275,4 +320,214 @@ fn second_instance_for_same_file_exits_and_first_keeps_serving() {
 
     let (status, _) = http_get(&preview.url("/ping"));
     assert_eq!(status, 200, "first instance must still be alive");
+}
+
+#[test]
+fn post_dirty_accepts_valid_payload_and_rejects_malformed() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+
+    let preview = Preview::spawn(&file, &[]);
+
+    // Well-formed payload → 200.
+    let status = http_post_json(
+        &preview.url("/dirty"),
+        r#"{"dirty":true,"pendingSave":false,"lastSavedAt":null}"#,
+    );
+    assert_eq!(status, 200, "valid /dirty payload should be accepted");
+
+    // A clean-state transition → 200.
+    let status = http_post_json(
+        &preview.url("/dirty"),
+        r#"{"dirty":false,"pendingSave":false,"lastSavedAt":1717000000000}"#,
+    );
+    assert_eq!(status, 200, "clean /dirty payload should be accepted");
+
+    // Malformed body → 4xx (axum's Json rejection).
+    let status = http_post_json(&preview.url("/dirty"), r#"{"dirty":"nope"}"#);
+    assert!((400..500).contains(&status), "malformed /dirty body should be a 4xx, got {status}");
+}
+
+#[test]
+fn post_native_action_result_accepts_valid_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+
+    let preview = Preview::spawn(&file, &[]);
+
+    // Unknown request id is a no-op but still acknowledged with 200.
+    let status = http_post_json(
+        &preview.url("/native-action-result"),
+        r#"{"id":"no-such-request","action":"save","ok":true,"error":null}"#,
+    );
+    assert_eq!(status, 200, "valid /native-action-result payload should be accepted");
+
+    // Malformed body → 4xx.
+    let status = http_post_json(&preview.url("/native-action-result"), r#"{"id":"x"}"#);
+    assert!(
+        (400..500).contains(&status),
+        "malformed /native-action-result body should be a 4xx, got {status}"
+    );
+}
+
+/// Drives the `--lsp` server over stdin/stdout: sends an `initialize` request and
+/// asserts the advertised `textDocumentSync` capability is the object form with
+/// `save: true` (the Phase 2 reopen-on-save change).
+#[test]
+fn lsp_initialize_advertises_save_capability() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut child = std::process::Command::new(binary())
+        .arg("--lsp")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn --lsp");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    write!(stdin, "Content-Length: {}\r\n\r\n{}", req.len(), req).unwrap();
+    stdin.flush().unwrap();
+
+    // Read the Content-Length framed response header(s).
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("LSP server closed stdout early");
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(val) = trimmed.strip_prefix("Content-Length: ") {
+            content_length = val.trim().parse().unwrap();
+        }
+    }
+    assert!(content_length > 0, "no Content-Length in LSP response");
+
+    let mut body = vec![0u8; content_length];
+    std::io::Read::read_exact(&mut stdout, &mut body).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let sync = &json["result"]["capabilities"]["textDocumentSync"];
+    assert!(sync.is_object(), "textDocumentSync should be the object form, got: {sync}");
+    assert_eq!(sync["openClose"], serde_json::Value::Bool(true));
+    assert_eq!(sync["save"], serde_json::Value::Bool(true));
+
+    // Tell the server to exit, then reap it.
+    let exit = r#"{"jsonrpc":"2.0","method":"exit"}"#;
+    let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", exit.len(), exit);
+    let _ = stdin.flush();
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// Writes one Content-Length–framed LSP message to the server's stdin.
+fn lsp_write(stdin: &mut impl std::io::Write, msg: &str) {
+    write!(stdin, "Content-Length: {}\r\n\r\n{}", msg.len(), msg).unwrap();
+    stdin.flush().unwrap();
+}
+
+/// Reads one Content-Length–framed LSP message body from the server's stdout.
+fn lsp_read(stdout: &mut impl std::io::BufRead) -> serde_json::Value {
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("LSP server closed stdout early");
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(val) = trimmed.strip_prefix("Content-Length: ") {
+            content_length = val.trim().parse().unwrap();
+        }
+    }
+    assert!(content_length > 0, "no Content-Length in LSP response");
+    let mut body = vec![0u8; content_length];
+    std::io::Read::read_exact(stdout, &mut body).unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// Drives the `--lsp` server through `textDocument/didSave`: a save with no live
+/// preview must spawn one (item 9 reopen-on-save), and a second save while that
+/// preview is live must NOT spawn a duplicate — the same lock port stays serving.
+///
+/// `EXCALIDRAW_PREVIEW_HEADLESS=true` is set on the LSP process so the previews
+/// it spawns inherit it and come up windowless.
+#[test]
+fn lsp_did_save_spawns_preview_then_reuses_live_instance() {
+    use std::io::{BufReader, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("save-target.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+    let canonical = std::fs::canonicalize(&file).unwrap();
+    let lock = lock_path_for(&canonical);
+    let _ = std::fs::remove_file(&lock);
+
+    let mut child = std::process::Command::new(binary())
+        .arg("--lsp")
+        .env("EXCALIDRAW_PREVIEW_HEADLESS", "true")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn --lsp");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Handshake so we know the loop is running before we send notifications.
+    lsp_write(&mut stdin, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    let _ = lsp_read(&mut stdout);
+
+    let uri = format!("file://{}", canonical.display());
+    let did_save = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didSave","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
+    );
+
+    // First save: no live preview → the server must spawn one. Wait for its lock.
+    lsp_write(&mut stdin, &did_save);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let port = loop {
+        if let Ok(s) = std::fs::read_to_string(&lock) {
+            if let Ok(p) = s.trim().parse::<u16>() {
+                break p;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "didSave never spawned a preview (no lock file at {})",
+            lock.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let (status, body) = http_get(&format!("http://127.0.0.1:{port}/ping"));
+    assert_eq!(status, 200, "spawned preview not serving");
+    assert_eq!(body, "OK");
+
+    // Second save while the preview is live: must be a no-op (no duplicate), so
+    // the lock port is unchanged and the same instance keeps serving.
+    lsp_write(&mut stdin, &did_save);
+    std::thread::sleep(Duration::from_millis(500));
+    let lock_port: u16 = std::fs::read_to_string(&lock).unwrap().trim().parse().unwrap();
+    assert_eq!(lock_port, port, "second didSave must not respawn on a new port");
+    let (status, _) = http_get(&format!("http://127.0.0.1:{port}/ping"));
+    assert_eq!(status, 200, "live preview must still be serving after the second didSave");
+
+    // Tear down the detached preview, then the LSP server.
+    let _ = http_get(&format!("http://127.0.0.1:{port}/shutdown"));
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = std::fs::remove_file(&lock);
+
+    let exit = r#"{"jsonrpc":"2.0","method":"exit"}"#;
+    let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", exit.len(), exit);
+    let _ = stdin.flush();
+    drop(stdin);
+    let _ = child.wait();
 }
