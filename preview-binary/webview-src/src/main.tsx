@@ -1,4 +1,5 @@
 import ReactDOM from "react-dom/client";
+import { loadFromBlob } from "@excalidraw/excalidraw";
 import type { ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
 import App from "./App";
 
@@ -42,6 +43,56 @@ function apiUrl(path: string): string {
   return fileParam ? `${path}?file=${encodeURIComponent(fileParam)}` : path;
 }
 
+/**
+ * Read-only preview for an SVG/PNG that has no embedded Excalidraw scene.
+ * Renders the raw image centered in the window with a small banner, and live-
+ * reloads the image when the file changes on disk (via the same SSE stream).
+ */
+function renderReadonlyImage(
+  bytes: ArrayBuffer,
+  type: string,
+  theme: string,
+  dataUrl: string,
+  eventsUrl: string,
+): void {
+  const root = document.getElementById("root");
+  if (!root) return;
+
+  const dark = theme === "dark";
+  const wrap = document.createElement("div");
+  wrap.style.cssText = `position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;background:${dark ? "#121212" : "#ffffff"};`;
+
+  const img = document.createElement("img");
+  img.alt = "Excalidraw image preview (read-only)";
+  img.style.cssText = "max-width:100%;max-height:100%;object-fit:contain;display:block;";
+  let currentUrl = URL.createObjectURL(new Blob([bytes], { type }));
+  img.src = currentUrl;
+  wrap.appendChild(img);
+  root.appendChild(wrap);
+
+  const banner = document.createElement("div");
+  banner.textContent =
+    'Read-only preview — no embedded Excalidraw scene. Re-export with "Embed scene" enabled to edit.';
+  banner.style.cssText = `position:fixed;top:0;left:0;right:0;padding:6px 12px;font:13px/1.4 system-ui,-apple-system,sans-serif;background:${dark ? "#3a3413" : "#fff8c5"};color:${dark ? "#e8d98a" : "#4d3800"};border-bottom:1px solid ${dark ? "#5c5320" : "#e6d27a"};z-index:10;`;
+  document.body.appendChild(banner);
+
+  // Live-reload the image on external file changes.
+  const es = new EventSource(eventsUrl);
+  es.onmessage = debounce(async () => {
+    try {
+      const res = await fetch(dataUrl);
+      if (!res.ok) return;
+      const next = await res.arrayBuffer();
+      const nextUrl = URL.createObjectURL(new Blob([next], { type }));
+      img.src = nextUrl;
+      URL.revokeObjectURL(currentUrl);
+      currentUrl = nextUrl;
+    } catch {
+      // transient fetch failure; keep showing the last good image
+    }
+  }, 150);
+}
+
 async function main() {
   try {
     const configRes = await fetch(apiUrl("/config"));
@@ -74,8 +125,6 @@ async function main() {
       // library persistence unavailable; start with an empty panel
     }
 
-    const { loadFromBlob } = await import("@excalidraw/excalidraw");
-
     let initialData: ExcalidrawInitialDataState | null = null;
     // Empty file (new .excalidraw.svg/.excalidraw.png drawing): start with a blank
     // scene and let App write the proper format to disk on its bootstrap save.
@@ -100,6 +149,14 @@ async function main() {
     }
 
     if (!initialData) {
+      // No embedded Excalidraw scene (e.g. an SVG/PNG exported without "Embed
+      // scene"). Rather than erroring, fall back to a read-only static preview of
+      // the raw image so the user still sees something. Editing is unavailable
+      // because there is no scene to reconstruct.
+      if (config.contentType === "image/svg+xml" || config.contentType === "image/png") {
+        renderReadonlyImage(bytes, config.contentType, config.theme, apiUrl("/data"), apiUrl("/events"));
+        return;
+      }
       showError("Failed to load file: all format fallbacks failed");
       return;
     }

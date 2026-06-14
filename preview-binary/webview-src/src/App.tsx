@@ -286,14 +286,22 @@ export default function App({
 
         if (contentType === "image/svg+xml") {
           const nonDeleted = elements.filter((e) => !e.isDeleted);
-          const svg = await exportToSvg({ elements: nonDeleted, appState, files });
+          // exportEmbedScene: true writes the scene JSON into the file so it can
+          // be re-opened and edited. Without it, saving an .excalidraw.svg strips
+          // the scene and the file becomes an unloadable plain image.
+          const svg = await exportToSvg({
+            elements: nonDeleted,
+            appState: { ...appState, exportEmbedScene: true },
+            files,
+          });
           body = svg.outerHTML;
           contentTypeHeader = "image/svg+xml";
         } else if (contentType === "image/png") {
           const nonDeleted = elements.filter((e) => !e.isDeleted);
           const blob = await exportToBlob({
             elements: nonDeleted,
-            appState,
+            // Embed the scene so the .excalidraw.png round-trips back into the editor.
+            appState: { ...appState, exportEmbedScene: true },
             files,
             getDimensions(width: number, height: number) {
               const scale =
