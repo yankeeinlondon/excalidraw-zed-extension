@@ -108,6 +108,9 @@ struct CloseContext {
     auto_save: bool,
     /// Lock file removed before the process exits. `None` in dev mode.
     lock_path: Option<PathBuf>,
+    /// When true (`--smoke`), the event loop runs [`SmokeDriver`] against the real
+    /// WebView, prints a report, and exits instead of waiting for the user.
+    smoke: bool,
 }
 
 impl CloseContext {
@@ -118,6 +121,7 @@ impl CloseContext {
             pending_actions: Arc::new(Mutex::new(HashMap::new())),
             auto_save: false,
             lock_path: None,
+            smoke: false,
         }
     }
 
@@ -238,8 +242,10 @@ fn main() -> Result<()> {
         anyhow::bail!("File not found: {}", file_path.display());
     }
 
-    // Detach from the parent so callers (Zed extension, terminals) return immediately.
-    if !args.foreground {
+    // Detach from the parent so callers (Zed extension, terminals) return
+    // immediately. `--smoke` must stay attached so its report and exit code reach
+    // the caller, so it implies foreground.
+    if !args.foreground && !args.smoke {
         return daemonize(&file, &args);
     }
 
@@ -381,7 +387,8 @@ fn main() -> Result<()> {
     });
 
     // Run the WebView event loop on the main thread (required on macOS / some Linux WMs).
-    if args.headless {
+    // `--smoke` needs a real window to test, so it overrides `--headless`.
+    if args.headless && !args.smoke {
         info!("Headless mode: serving without a window until /shutdown or kill");
         loop {
             std::thread::sleep(std::time::Duration::from_secs(3600));
@@ -393,6 +400,7 @@ fn main() -> Result<()> {
         pending_actions: state.pending_actions.clone(),
         auto_save: args.auto_save,
         lock_path: Some(lock_path.clone()),
+        smoke: args.smoke,
     };
     if let Err(e) = run_webview(port, focus_rx, export_rx, library_open_rx, close_ctx) {
         eprintln!(
@@ -959,6 +967,22 @@ fn set_macos_app_icon() {
     unsafe { app.setApplicationIconImage(Some(&image)) };
 }
 
+/// Keeps `--smoke` runs from stealing the user's foreground app. `Accessory`
+/// policy means no Dock tile and the app never becomes active, so the (hidden)
+/// smoke window can't grab focus — which would make any concurrent work flaky.
+/// Used instead of [`set_macos_app_icon`] in smoke mode.
+#[cfg(target_os = "macos")]
+fn set_macos_background_activation() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+}
+
 /// The `MenuId`s of the native menu items, captured so the event loop can map a
 /// `muda::MenuEvent` back to the JS bridge call it should dispatch.
 #[cfg(not(target_os = "linux"))]
@@ -1396,6 +1420,261 @@ fn poll_query_flow(
     }
 }
 
+// ── --smoke: automated real-WebView self-test ─────────────────────────────────
+
+/// One automated check produced by [`SmokeDriver`].
+struct SmokeCheck {
+    /// Short identifier shown in the report.
+    name: &'static str,
+    /// Whether the check passed.
+    ok: bool,
+    /// Human-readable outcome (success summary or failure reason).
+    detail: String,
+}
+
+/// How long to let the React app mount and fetch its assets/fonts before the
+/// smoke driver starts probing the bridge.
+const SMOKE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long to wait for each native→JS bridge round-trip in smoke mode before
+/// declaring it lost (a missing bridge fails fast via the inline fallback POST;
+/// this only bounds a genuinely hung round-trip).
+const SMOKE_ROUNDTRIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Sequential stages the smoke driver advances through, one transition per tick.
+enum SmokeStage {
+    /// Waiting for the React app to mount and load its assets/fonts.
+    Settle { until: std::time::Instant },
+    /// Awaiting the save round-trip (`window.__excalidrawSave`) — the same bridge
+    /// global the native File-menu "Save" item and the `Cmd/Ctrl+S` accelerator
+    /// dispatch into.
+    Save {
+        rx: tokio::sync::oneshot::Receiver<NativeActionResult>,
+        deadline: std::time::Instant,
+        request_id: String,
+    },
+    /// Awaiting the close-interception dirty-state query
+    /// (`window.__excalidrawPrepareClose`), the first step of every native close.
+    Query {
+        rx: tokio::sync::oneshot::Receiver<NativeActionResult>,
+        deadline: std::time::Instant,
+        request_id: String,
+    },
+    /// Round-trips done; run the synchronous external-link classification checks.
+    Finish,
+}
+
+/// Drives `--smoke`: an automated self-test that runs against a *real* WebView so
+/// it exercises the OS-specific shell paths unit tests cannot — actual `wry`
+/// window creation, React mount + asset/font fetch, `evaluate_script` delivery to
+/// the mounted app, the `/native-action-result` IPC round-trip, and the close
+/// state machine. Advanced one step per event-loop tick (mirroring the close
+/// flow) so it never blocks the UI thread; on completion the event loop prints a
+/// report and exits with a non-zero code if any check failed.
+///
+/// What it deliberately does *not* prove (and so stays on the manual checklist):
+/// literal AppKit `Cmd+S` key delivery, `rfd` dialog button behavior, the actual
+/// system-browser launch, and Dock/taskbar tile rendering — none can be observed
+/// without a human or input injection.
+struct SmokeDriver {
+    stage: SmokeStage,
+    checks: Vec<SmokeCheck>,
+}
+
+/// Builds the JS that invokes a bridge global by `request_id`, falling back to a
+/// direct `/native-action-result` failure POST when the global is absent so a
+/// failed React mount / asset load fails the check immediately instead of waiting
+/// out the full timeout.
+fn smoke_bridge_script(global: &str, action: &str, call: &str, request_id: &str) -> String {
+    format!(
+        "(function(){{ if (window.{global}) {{ window.{global}({call}); }} else {{ \
+         fetch('/native-action-result', {{ method: 'POST', \
+         headers: {{ 'Content-Type': 'application/json' }}, \
+         body: JSON.stringify({{ id: '{request_id}', action: '{action}', ok: false, \
+         error: 'bridge global {global} missing (React app did not mount — asset/font load may have failed)' }}) }}); }} }})()"
+    )
+}
+
+impl SmokeDriver {
+    fn new() -> Self {
+        Self {
+            stage: SmokeStage::Settle {
+                until: std::time::Instant::now() + SMOKE_SETTLE,
+            },
+            checks: Vec::new(),
+        }
+    }
+
+    /// Registers a pending correlation entry and dispatches `script` into the
+    /// WebView, returning the receiver the next stage awaits.
+    fn dispatch(
+        webview: &wry::WebView,
+        pending: &PendingActions,
+        request_id: &str,
+        script: &str,
+    ) -> tokio::sync::oneshot::Receiver<NativeActionResult> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut p) = pending.lock() {
+            p.insert(request_id.to_string(), tx);
+        }
+        let _ = webview.evaluate_script(script);
+        rx
+    }
+
+    /// Advances the smoke run by one tick. Returns `Some(checks)` once complete.
+    fn tick(
+        &mut self,
+        webview: &wry::WebView,
+        pending: &PendingActions,
+    ) -> Option<Vec<SmokeCheck>> {
+        match &mut self.stage {
+            SmokeStage::Settle { until } => {
+                if std::time::Instant::now() >= *until {
+                    let request_id = "smoke-save".to_string();
+                    let script = smoke_bridge_script(
+                        "__excalidrawSave",
+                        "save",
+                        "{ reason: 'smoke', requestId: 'smoke-save' }",
+                        &request_id,
+                    );
+                    let rx = Self::dispatch(webview, pending, &request_id, &script);
+                    self.stage = SmokeStage::Save {
+                        rx,
+                        deadline: std::time::Instant::now() + SMOKE_ROUNDTRIP_TIMEOUT,
+                        request_id,
+                    };
+                }
+                None
+            }
+            SmokeStage::Save {
+                rx,
+                deadline,
+                request_id,
+            } => match poll_action_result(rx, *deadline, request_id, pending) {
+                ActionOutcome::Pending => None,
+                ActionOutcome::Resolved(result) if result.ok => {
+                    self.checks.push(SmokeCheck {
+                        name: "webview-mount + native save round-trip",
+                        ok: true,
+                        detail: "React app mounted and window.__excalidrawSave saved to disk via POST /data".to_string(),
+                    });
+                    self.begin_query(webview, pending);
+                    None
+                }
+                ActionOutcome::Resolved(result) => {
+                    self.checks.push(SmokeCheck {
+                        name: "webview-mount + native save round-trip",
+                        ok: false,
+                        detail: result
+                            .error
+                            .unwrap_or_else(|| "save reported failure".to_string()),
+                    });
+                    self.begin_query(webview, pending);
+                    None
+                }
+                ActionOutcome::Lost => {
+                    self.checks.push(SmokeCheck {
+                        name: "webview-mount + native save round-trip",
+                        ok: false,
+                        detail: "no /native-action-result within 5s — the React app likely never mounted (asset/font load failed?)".to_string(),
+                    });
+                    self.begin_query(webview, pending);
+                    None
+                }
+            },
+            SmokeStage::Query {
+                rx,
+                deadline,
+                request_id,
+            } => match poll_action_result(rx, *deadline, request_id, pending) {
+                ActionOutcome::Pending => None,
+                ActionOutcome::Resolved(result) => {
+                    self.checks.push(SmokeCheck {
+                        name: "close-interception dirty-state query",
+                        ok: true,
+                        detail: format!(
+                            "window.__excalidrawPrepareClose responded (scene reported {})",
+                            if result.ok { "clean — safe to close" } else { "dirty/blocked" }
+                        ),
+                    });
+                    self.stage = SmokeStage::Finish;
+                    self.finish()
+                }
+                ActionOutcome::Lost => {
+                    self.checks.push(SmokeCheck {
+                        name: "close-interception dirty-state query",
+                        ok: false,
+                        detail: "window.__excalidrawPrepareClose did not respond within 5s".to_string(),
+                    });
+                    self.stage = SmokeStage::Finish;
+                    self.finish()
+                }
+            },
+            SmokeStage::Finish => self.finish(),
+        }
+    }
+
+    /// Dispatches the close-interception dirty-state query and moves to `Query`.
+    fn begin_query(&mut self, webview: &wry::WebView, pending: &PendingActions) {
+        let request_id = "smoke-close".to_string();
+        let script = smoke_bridge_script(
+            "__excalidrawPrepareClose",
+            "prepareClose",
+            "{ requestId: 'smoke-close' }",
+            &request_id,
+        );
+        let rx = Self::dispatch(webview, pending, &request_id, &script);
+        self.stage = SmokeStage::Query {
+            rx,
+            deadline: std::time::Instant::now() + SMOKE_ROUNDTRIP_TIMEOUT,
+            request_id,
+        };
+    }
+
+    /// Runs the synchronous external-link classification checks (the logic that
+    /// drives `with_navigation_handler` / `with_new_window_req_handler`) and
+    /// returns the full check list. Does not call `open_external`, so no real
+    /// browser is launched — that observation stays on the manual checklist.
+    fn finish(&mut self) -> Option<Vec<SmokeCheck>> {
+        let external = "https://libraries.excalidraw.com/";
+        self.checks.push(SmokeCheck {
+            name: "external link routed out of editor",
+            ok: !is_internal_url(external),
+            detail: format!("{external} classified external ⇒ navigation handler blocks in-editor nav and opens the system browser"),
+        });
+        let loopback = "http://127.0.0.1:5173/";
+        self.checks.push(SmokeCheck {
+            name: "loopback navigation kept in editor",
+            ok: is_internal_url(loopback),
+            detail: format!("{loopback} classified internal ⇒ editor navigation allowed"),
+        });
+        Some(std::mem::take(&mut self.checks))
+    }
+}
+
+/// Prints the smoke report, removes the lock file, and exits the process with
+/// code 0 (all checks passed) or 1 (any failed). Called from inside the event
+/// loop because the tao event loop never returns to `main` on macOS/Windows.
+fn finish_smoke_and_exit(checks: Vec<SmokeCheck>, ctx: &CloseContext) -> ! {
+    let failed = checks.iter().filter(|c| !c.ok).count();
+    eprintln!("\n── excalidraw-preview --smoke report ──");
+    for check in &checks {
+        eprintln!(
+            "  {} {}\n      {}",
+            if check.ok { "PASS" } else { "FAIL" },
+            check.name,
+            check.detail
+        );
+    }
+    eprintln!(
+        "── {}/{} checks passed ──\n",
+        checks.len() - failed,
+        checks.len()
+    );
+    ctx.cleanup_lock();
+    std::process::exit(if failed == 0 { 0 } else { 1 });
+}
+
 /// Spawns the async 3-way "unsaved changes" dialog on the glib main context
 /// (Linux). `rfd::AsyncMessageDialog` avoids the re-entrant GTK main loop a
 /// *synchronous* dialog would trigger from inside the tick. On "Save" it installs
@@ -1465,6 +1744,15 @@ fn run_webview_url(
     window.set_title("Excalidraw Preview");
     window.set_default_size(1200, 800);
 
+    // --smoke runs as a background self-test: don't let the window grab focus when
+    // it maps, or an automated run would steal focus from the user (flaky results).
+    // WebKitGTK still needs the window realized (`show_all`) to load and run JS.
+    if close_ctx.smoke {
+        window.set_focus_on_map(false);
+        window.set_accept_focus(false);
+        window.set_skip_taskbar_hint(true);
+    }
+
     // Window / taskbar icon: load the embedded PNG straight into a Pixbuf.
     {
         let loader = gtk::gdk_pixbuf::PixbufLoader::new();
@@ -1509,7 +1797,16 @@ fn run_webview_url(
     let webview_tick = webview.clone();
     let close_counter_tick = close_counter.clone();
     let mut focus_rx = focus_rx;
+    // --smoke: an automated self-test driven one step per tick against this real
+    // WebView. `None` in normal runs.
+    let mut smoke_driver = close_ctx.smoke.then(SmokeDriver::new);
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        // --smoke: advance the self-test; print the report and exit when it ends.
+        if let Some(driver) = smoke_driver.as_mut() {
+            if let Some(checks) = driver.tick(&webview_tick, &close_ctx_tick.pending_actions) {
+                finish_smoke_and_exit(checks, &close_ctx_tick);
+            }
+        }
         while let Ok(req) = export_rx.try_recv() {
             handle_export_request(req);
         }
@@ -1620,6 +1917,11 @@ fn run_webview_url(
     let window = WindowBuilder::new()
         .with_title("Excalidraw Preview")
         .with_inner_size(tao::dpi::LogicalSize::new(1200.0, 800.0))
+        // --smoke runs headlessly as far as the user is concerned: keep the window
+        // hidden and unfocused so an automated run can't pop up over — or steal
+        // focus from — whatever the user is doing (which would make results flaky).
+        .with_visible(!close_ctx.smoke)
+        .with_focused(!close_ctx.smoke)
         .build(&event_loop)
         .map_err(|e| format!("Failed to create window: {}", e))?;
 
@@ -1630,8 +1932,14 @@ fn run_webview_url(
             window.set_window_icon(Some(icon));
         }
     }
+    // In smoke mode, stay an `Accessory` (background, no Dock tile) app so the
+    // window never becomes active and can't steal the user's foreground.
     #[cfg(target_os = "macos")]
-    set_macos_app_icon();
+    if close_ctx.smoke {
+        set_macos_background_activation();
+    } else {
+        set_macos_app_icon();
+    }
 
     let webview = WebViewBuilder::new()
         .with_url(url)
@@ -1664,6 +1972,10 @@ fn run_webview_url(
     // Unsaved-changes close flow state, owned by the event loop.
     let mut close_flow = CloseFlow::Idle;
     let mut close_counter: u64 = 0;
+
+    // --smoke: an automated self-test driven one step per tick against this real
+    // WebView. `None` in normal runs.
+    let mut smoke_driver = close_ctx.smoke.then(SmokeDriver::new);
 
     event_loop.run(move |event, _, control_flow| {
         // Keep the menu alive for the lifetime of the event loop.
@@ -1762,6 +2074,13 @@ fn run_webview_url(
             let _ = focus_rx.borrow_and_update();
             window.set_focus();
         }
+
+        // --smoke: advance the self-test; print the report and exit when it ends.
+        if let Some(driver) = smoke_driver.as_mut() {
+            if let Some(checks) = driver.tick(&webview, &close_ctx.pending_actions) {
+                finish_smoke_and_exit(checks, &close_ctx);
+            }
+        }
     });
 
     Ok(())
@@ -1816,6 +2135,12 @@ struct CliArgs {
     /// Intended for tests and headless use.
     #[arg(long, value_name = "DIR")]
     export_dir: Option<PathBuf>,
+    /// Run an automated self-test against a real WebView, then exit. Drives the
+    /// native→JS bridge (save, close-interception query) and external-link
+    /// classification, prints a PASS/FAIL report, and exits non-zero on any
+    /// failure. See `features/2026-06-13-rough-edges/manual-checklist.md`.
+    #[arg(long)]
+    smoke: bool,
 }
 
 // ── LSP server ───────────────────────────────────────────────────────────────
