@@ -10,10 +10,11 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{broadcast, watch};
 use tracing::info;
 
@@ -27,6 +28,48 @@ struct ExportRequest {
     reply: tokio::sync::oneshot::Sender<Option<PathBuf>>,
 }
 
+/// A request from the HTTP layer to show a native *open* dialog filtered to
+/// `.excalidrawlib` and return the chosen file's bytes. Processed on the
+/// platform UI thread, mirroring the `ExportRequest` flow.
+struct LibraryOpenRequest {
+    default_dir: PathBuf,
+    /// `Some(bytes)` once a file is read, `None` if the user cancelled the dialog.
+    reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+}
+
+/// Tracks the WebView's save state so native code (close-confirm, menu Save) can
+/// decide whether a save is needed. Mirrors what the frontend POSTs to `/dirty`.
+#[derive(Clone, Debug, Default)]
+struct DirtyState {
+    /// The scene has unsaved edits relative to the file on disk.
+    dirty: bool,
+    /// A debounced auto-save is queued but has not completed yet.
+    pending_save: bool,
+    /// Unix-epoch millis of the last successful save, if any.
+    last_saved_at: Option<u64>,
+}
+
+/// The resolved outcome of a native-triggered JS action (e.g. "save and close").
+/// Sent back over the correlation channel when `/native-action-result` arrives.
+///
+/// The fields are read by the close-after-save flow wired in a later phase; for
+/// now they are only populated, so silence the dead-code lint here.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct NativeActionResult {
+    /// The action name echoed back by the frontend (e.g. `"save"`).
+    action: String,
+    /// Whether the action succeeded.
+    ok: bool,
+    /// Failure detail, when `ok` is false.
+    error: Option<String>,
+}
+
+/// Correlation table: maps a request id issued by native code to the one-shot
+/// channel that a waiting flow (e.g. close-after-save) is blocked on. The
+/// `/native-action-result` handler removes and fulfils the matching entry.
+type PendingActions = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<NativeActionResult>>>>;
+
 #[derive(Clone)]
 struct AppState {
     file_path: PathBuf,
@@ -39,8 +82,54 @@ struct AppState {
     focus_tx: Arc<watch::Sender<bool>>,
     /// Sends export requests to the UI thread for the native save dialog.
     export_tx: std::sync::mpsc::Sender<ExportRequest>,
+    /// Sends library-open requests to the UI thread for the native `.excalidrawlib` open dialog.
+    library_open_tx: std::sync::mpsc::Sender<LibraryOpenRequest>,
     /// When set (--export-dir), exports bypass the dialog and write here.
     export_dir: Option<PathBuf>,
+    /// Shared WebView save state, updated by `POST /dirty`.
+    dirty: Arc<RwLock<DirtyState>>,
+    /// Pending native-action correlation table, resolved by `POST /native-action-result`.
+    pending_actions: PendingActions,
+}
+
+/// Everything the WebView event loop needs to run the unsaved-changes close
+/// flow: the shared dirty state, the correlation table for the save-and-close
+/// JS round-trip, whether auto-save is on, and the lock file to clean up on exit.
+///
+/// In `--dev` mode a default (not-dirty, no-lock) context is used, so the window
+/// always closes immediately.
+#[derive(Clone)]
+struct CloseContext {
+    /// Shared WebView dirty state (mirrors `POST /dirty`).
+    dirty: Arc<RwLock<DirtyState>>,
+    /// Correlation table resolved by `POST /native-action-result`.
+    pending_actions: PendingActions,
+    /// Whether auto-save is enabled (decides silent-save vs. confirm dialog).
+    auto_save: bool,
+    /// Lock file removed before the process exits. `None` in dev mode.
+    lock_path: Option<PathBuf>,
+}
+
+impl CloseContext {
+    /// A no-op context for `--dev`: never dirty, nothing to clean up.
+    fn dev() -> Self {
+        Self {
+            dirty: Arc::new(RwLock::new(DirtyState::default())),
+            pending_actions: Arc::new(Mutex::new(HashMap::new())),
+            auto_save: false,
+            lock_path: None,
+        }
+    }
+
+    /// Removes the lock file (if any) so it doesn't outlive the process. The tao
+    /// event loop calls this just before exiting because `EventLoop::run` never
+    /// returns to `main` on macOS/Windows; the GTK path returns normally and
+    /// `main` cleans up too, but calling here as well is idempotent.
+    fn cleanup_lock(&self) {
+        if let Some(path) = &self.lock_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 #[derive(RustEmbed)]
@@ -122,7 +211,10 @@ fn main() -> Result<()> {
         eprintln!("[dev] Make sure `npm run dev` is running in preview-binary/webview-src/");
         let (_focus_tx, focus_rx) = watch::channel(false);
         let (_export_tx, export_rx) = std::sync::mpsc::channel();
-        if let Err(e) = run_webview_url(dev_url, focus_rx, export_rx) {
+        let (_library_open_tx, library_open_rx) = std::sync::mpsc::channel();
+        if let Err(e) =
+            run_webview_url(dev_url, focus_rx, export_rx, library_open_rx, CloseContext::dev())
+        {
             eprintln!("WebView error: {e}");
         }
         return Ok(());
@@ -186,8 +278,20 @@ fn main() -> Result<()> {
     let (focus_tx, focus_rx) = watch::channel(false);
     let focus_tx = Arc::new(focus_tx);
     let (export_tx, export_rx) = std::sync::mpsc::channel::<ExportRequest>();
+    let (library_open_tx, library_open_rx) = std::sync::mpsc::channel::<LibraryOpenRequest>();
 
-    let port = args.port.unwrap_or_else(find_available_port);
+    // Bind first, then learn the actual port from the bound socket. Binding to
+    // port 0 lets the OS hand out a free ephemeral port atomically, eliminating
+    // the time-of-check/time-of-use race that a "probe then bind" scheme has when
+    // several previews start concurrently. With `--port`, an occupied port now
+    // fails cleanly here instead of silently after the lock file is written.
+    let requested_port = args.port.unwrap_or(0);
+    let addr = SocketAddr::from(([127, 0, 0, 1], requested_port));
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind(addr))
+        .map_err(|e| anyhow::anyhow!("failed to bind 127.0.0.1:{requested_port}: {e}"))?;
+    let port = listener.local_addr()?.port();
+    info!("Server listening on http://127.0.0.1:{}", port);
 
     let state = Arc::new(AppState {
         file_path: canonical_path.clone(),
@@ -198,14 +302,14 @@ fn main() -> Result<()> {
         broadcast_tx: broadcast_tx.clone(),
         focus_tx: focus_tx.clone(),
         export_tx,
+        library_open_tx,
         export_dir: args.export_dir.clone(),
+        dirty: Arc::new(RwLock::new(DirtyState::default())),
+        pending_actions: Arc::new(Mutex::new(HashMap::new())),
     });
 
+    // Only now that the port is bound and known do we publish it to the lock file.
     std::fs::write(&lock_path, port.to_string())?;
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = rt.block_on(tokio::net::TcpListener::bind(addr))?;
-    info!("Server listening on http://{}", addr);
 
     let app = Router::new()
         .route("/", get(serve_index))
@@ -217,6 +321,15 @@ fn main() -> Result<()> {
         .route("/shutdown", get(handle_shutdown))
         .route("/ping", get(ping))
         .route("/export", axum::routing::post(handle_export))
+        .route(
+            "/native-library-request",
+            axum::routing::post(receive_library_request),
+        )
+        .route("/dirty", axum::routing::post(receive_dirty))
+        .route(
+            "/native-action-result",
+            axum::routing::post(receive_native_action_result),
+        )
         .route("/assets/{*path}", get(serve_assets))
         .with_state(state.clone());
 
@@ -275,7 +388,13 @@ fn main() -> Result<()> {
         }
     }
 
-    if let Err(e) = run_webview(port, focus_rx, export_rx) {
+    let close_ctx = CloseContext {
+        dirty: state.dirty.clone(),
+        pending_actions: state.pending_actions.clone(),
+        auto_save: args.auto_save,
+        lock_path: Some(lock_path.clone()),
+    };
+    if let Err(e) = run_webview(port, focus_rx, export_rx, library_open_rx, close_ctx) {
         eprintln!(
             "WebView error: {}. Server running at http://127.0.0.1:{}",
             e, port
@@ -409,13 +528,6 @@ async fn check_existing_instance(lock_path: &PathBuf) -> Result<u16> {
         std::fs::remove_file(lock_path).ok();
         anyhow::bail!("Stale lock file")
     }
-}
-
-/// Finds the first available TCP port in [10000, 65000].
-fn find_available_port() -> u16 {
-    (10000..=65000)
-        .find(|&p| std::net::TcpListener::bind(format!("127.0.0.1:{}", p)).is_ok())
-        .unwrap_or(9876)
 }
 
 // ── Route handlers ──────────────────────────────────────────────────────────
@@ -612,6 +724,99 @@ async fn handle_export(
     }
 }
 
+/// Fronts the native `.excalidrawlib` open dialog for `window.__excalidrawImportLibrary`.
+///
+/// Marshals a `LibraryOpenRequest` to the UI thread, waits for the user's choice,
+/// and returns the chosen file's bytes as JSON (the frontend validates the shape).
+/// A cancelled dialog returns `204 No Content`; the frontend treats that as a
+/// silent no-op.
+async fn receive_library_request(State(state): State<Arc<AppState>>) -> Response {
+    let default_dir = state
+        .file_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let request = LibraryOpenRequest {
+        default_dir,
+        reply: reply_tx,
+    };
+    if state.library_open_tx.send(request).is_err() {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "library dialog channel closed (no window?)",
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Some(bytes)) => (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response(),
+        Ok(None) => axum::http::StatusCode::NO_CONTENT.into_response(),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "library dialog failed",
+        )
+            .into_response(),
+    }
+}
+
+/// Body of `POST /dirty`: the WebView's current save state.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DirtyPayload {
+    dirty: bool,
+    pending_save: bool,
+    last_saved_at: Option<u64>,
+}
+
+/// Body of `POST /native-action-result`: the outcome of a native-triggered JS action.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeActionResultPayload {
+    id: String,
+    action: String,
+    ok: bool,
+    error: Option<String>,
+}
+
+/// Updates the shared dirty state from a frontend report.
+async fn receive_dirty(
+    State(state): State<Arc<AppState>>,
+    axum::Json(payload): axum::Json<DirtyPayload>,
+) -> impl IntoResponse {
+    if let Ok(mut dirty) = state.dirty.write() {
+        dirty.dirty = payload.dirty;
+        dirty.pending_save = payload.pending_save;
+        if let Some(ts) = payload.last_saved_at {
+            dirty.last_saved_at = Some(ts);
+        }
+    }
+    axum::http::StatusCode::OK
+}
+
+/// Resolves a pending native action by its correlation id, unblocking any flow
+/// (e.g. close-after-save) waiting on the result. Unknown ids are a no-op so a
+/// late/duplicate report cannot error.
+async fn receive_native_action_result(
+    State(state): State<Arc<AppState>>,
+    axum::Json(payload): axum::Json<NativeActionResultPayload>,
+) -> impl IntoResponse {
+    if let Ok(mut pending) = state.pending_actions.lock() {
+        if let Some(tx) = pending.remove(&payload.id) {
+            let _ = tx.send(NativeActionResult {
+                action: payload.action,
+                ok: payload.ok,
+                error: payload.error,
+            });
+        }
+    }
+    axum::http::StatusCode::OK
+}
+
 async fn serve_assets(axum::extract::Path(path): axum::extract::Path<String>) -> impl IntoResponse {
     let path = path.strip_prefix("/").unwrap_or(&path);
     match Assets::get(path) {
@@ -632,14 +837,267 @@ async fn serve_assets(axum::extract::Path(path): axum::extract::Path<String>) ->
 
 // ── WebView ──────────────────────────────────────────────────────────────────
 
+/// Decides whether a navigation / new-window target should stay inside the WebView.
+///
+/// Loopback hosts (the embedded server and the Vite dev server) plus the non-HTTP
+/// schemes the editor relies on (`data:`, `blob:`, `about:`) are internal; every
+/// other `http`/`https` host (docs links, `libraries.excalidraw.com`, GitHub) is
+/// external and is opened in the system browser instead.
+fn is_internal_url(url: &str) -> bool {
+    if url.starts_with("data:") || url.starts_with("blob:") || url.starts_with("about:") {
+        return true;
+    }
+    if let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    {
+        let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
+        return host == "127.0.0.1" || host == "localhost" || host == "[::1]";
+    }
+    // Unknown schemes are not navigated inside the editor.
+    false
+}
+
+/// Opens `url` in the system browser, best-effort. Detached so it never blocks
+/// the UI thread, and never panics — failures are logged and swallowed.
+fn open_external(url: &str) {
+    if let Err(e) = open::that_detached(url) {
+        tracing::warn!("failed to open external url {url}: {e}");
+    }
+}
+
+/// `with_navigation_handler` callback shared by both WebView builders. Allows
+/// internal navigation; routes external `http(s)` links to the system browser
+/// and blocks the in-WebView navigation. Returns `true` to allow, `false` to block.
+fn allow_navigation(url: String) -> bool {
+    if is_internal_url(&url) {
+        return true;
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        open_external(&url);
+    }
+    false
+}
+
+/// The app/window icon, embedded at compile time (1024×1024 RGBA PNG).
+const APP_ICON_PNG: &[u8] = include_bytes!("../icon.png");
+
+/// Decodes the embedded icon PNG to raw RGBA8 bytes plus its dimensions.
+///
+/// Returns `None` if decoding fails — the window then keeps the platform default
+/// icon rather than erroring. Only used on the tao path (macOS / Windows); the
+/// GTK path loads the PNG straight into a `Pixbuf`.
+#[cfg(not(target_os = "linux"))]
+fn decode_icon_rgba() -> Option<(Vec<u8>, u32, u32)> {
+    let img = image::load_from_memory(APP_ICON_PNG).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    Some((img.into_raw(), w, h))
+}
+
+/// Sets the macOS Dock tile to the embedded icon and promotes the bare binary to
+/// a regular (Dock-owning) app. No-op if not on the main thread or if the PNG
+/// fails to decode. MUST be called on the main thread.
+#[cfg(target_os = "macos")]
+fn set_macos_app_icon() {
+    use objc2::{AnyThread, MainThreadMarker};
+    use objc2_app_kit::{
+        NSApplication, NSApplicationActivationPolicy, NSBitmapImageRep, NSDeviceRGBColorSpace,
+        NSImage,
+    };
+    use objc2_foundation::NSSize;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+
+    // Build the Dock image from raw RGBA8 pixels, NOT from the PNG bytes. Handing
+    // `NSImage::initWithData` a PNG is known to leave the Dock tile blank/generic
+    // for an un-bundled binary, so we decode to RGBA ourselves and back the image
+    // with an explicit `NSBitmapImageRep`.
+    let Some((rgba, w, h)) = decode_icon_rgba() else {
+        return;
+    };
+    let row_bytes = (w as isize) * 4;
+
+    // `planes = null` tells AppKit to allocate its own pixel storage; we then copy
+    // our RGBA into it so the image owns the bytes (our `rgba` Vec can drop).
+    let rep = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            w as isize,
+            h as isize,
+            8, // bits per sample
+            4, // samples per pixel (RGBA)
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            row_bytes,
+            32, // bits per pixel
+        )
+    };
+    let Some(rep) = rep else {
+        return;
+    };
+    // SAFETY: the rep was allocated with the dimensions above, so `bitmapData`
+    // points at `h * row_bytes` writable bytes — exactly `rgba.len()`.
+    unsafe {
+        let dst = rep.bitmapData();
+        if dst.is_null() {
+            return;
+        }
+        std::ptr::copy_nonoverlapping(rgba.as_ptr(), dst, rgba.len());
+    }
+
+    let image = NSImage::initWithSize(NSImage::alloc(), NSSize::new(w as f64, h as f64));
+    image.addRepresentation(&rep);
+
+    let app = NSApplication::sharedApplication(mtm);
+    // A bare (un-bundled) binary needs Regular policy to own a Dock tile.
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    // SAFETY: `image` is a valid NSImage and we are on the main thread.
+    unsafe { app.setApplicationIconImage(Some(&image)) };
+}
+
+/// The `MenuId`s of the native menu items, captured so the event loop can map a
+/// `muda::MenuEvent` back to the JS bridge call it should dispatch.
+#[cfg(not(target_os = "linux"))]
+struct MenuIds {
+    save: muda::MenuId,
+    export_png: muda::MenuId,
+    export_png2x: muda::MenuId,
+    export_svg: muda::MenuId,
+    export_scene: muda::MenuId,
+    import_library: muda::MenuId,
+    export_library: muda::MenuId,
+}
+
+/// Builds the native menu bar for the tao path (macOS / Windows).
+///
+/// File → Save (`Cmd+S`/`Ctrl+S`), Export PNG / PNG 2× / SVG / Scene;
+/// Library → Import / Export. Help links stay in the in-WebView menu (they are
+/// external links handled by the navigation handler). Returns the menu (kept
+/// alive for the event loop) and the item ids for event dispatch.
+#[cfg(not(target_os = "linux"))]
+fn build_menu() -> Result<(muda::Menu, MenuIds), Box<dyn std::error::Error>> {
+    use muda::{accelerator::Accelerator, Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+    let menu = Menu::new();
+
+    // macOS shows the first submenu as the application menu; it needs at least a
+    // Quit item for the standard window shortcuts to behave.
+    #[cfg(target_os = "macos")]
+    {
+        let app_menu = Submenu::new("Excalidraw Preview", true);
+        app_menu.append(&PredefinedMenuItem::quit(None))?;
+        menu.append(&app_menu)?;
+    }
+
+    // `Cmd+S` on macOS, `Ctrl+S` elsewhere. This is the fix for AppKit consuming
+    // `Cmd+S` before it reaches WKWebView — the accelerator now drives the save.
+    let save_accel = "CmdOrCtrl+S".parse::<Accelerator>().ok();
+    let save = MenuItem::new("Save", true, save_accel);
+    let export_png = MenuItem::new("Export PNG", true, None);
+    let export_png2x = MenuItem::new("Export PNG (2x)", true, None);
+    let export_svg = MenuItem::new("Export SVG", true, None);
+    let export_scene = MenuItem::new("Export Scene", true, None);
+
+    let file_menu = Submenu::new("File", true);
+    file_menu.append_items(&[
+        &save,
+        &PredefinedMenuItem::separator(),
+        &export_png,
+        &export_png2x,
+        &export_svg,
+        &export_scene,
+    ])?;
+    menu.append(&file_menu)?;
+
+    let import_library = MenuItem::new("Import Library…", true, None);
+    let export_library = MenuItem::new("Export Library…", true, None);
+    let library_menu = Submenu::new("Library", true);
+    library_menu.append_items(&[&import_library, &export_library])?;
+    menu.append(&library_menu)?;
+
+    let ids = MenuIds {
+        save: save.id().clone(),
+        export_png: export_png.id().clone(),
+        export_png2x: export_png2x.id().clone(),
+        export_svg: export_svg.id().clone(),
+        export_scene: export_scene.id().clone(),
+        import_library: import_library.id().clone(),
+        export_library: export_library.id().clone(),
+    };
+    Ok((menu, ids))
+}
+
+/// Maps a fired `MenuId` to the JS bridge expression that services it, or `None`
+/// if the id is not one of ours. The bridge globals are registered by the React
+/// app (see `native-bridge.ts`); the `&&` guard makes the call a no-op if the app
+/// has not mounted yet.
+#[cfg(not(target_os = "linux"))]
+fn menu_event_script(id: &muda::MenuId, ids: &MenuIds) -> Option<&'static str> {
+    if *id == ids.save {
+        Some("window.__excalidrawSave && window.__excalidrawSave({ reason: 'menu' })")
+    } else if *id == ids.export_png {
+        Some("window.__excalidrawExport && window.__excalidrawExport('png')")
+    } else if *id == ids.export_png2x {
+        Some("window.__excalidrawExport && window.__excalidrawExport('png2x')")
+    } else if *id == ids.export_svg {
+        Some("window.__excalidrawExport && window.__excalidrawExport('svg')")
+    } else if *id == ids.export_scene {
+        Some("window.__excalidrawExport && window.__excalidrawExport('scene')")
+    } else if *id == ids.import_library {
+        Some("window.__excalidrawImportLibrary && window.__excalidrawImportLibrary({})")
+    } else if *id == ids.export_library {
+        Some("window.__excalidrawExportLibrary && window.__excalidrawExportLibrary({})")
+    } else {
+        None
+    }
+}
+
+/// Maps a file extension to a human label and filter spec for the native dialog.
+/// Returns `None` for extensions we don't want to constrain the dialog to.
+fn dialog_filter_for(ext: &str) -> Option<(&'static str, [&str; 1])> {
+    match ext {
+        "excalidrawlib" => Some(("Excalidraw Library", ["excalidrawlib"])),
+        "excalidraw" => Some(("Excalidraw Scene", ["excalidraw"])),
+        "png" => Some(("PNG Image", ["png"])),
+        "svg" => Some(("SVG Image", ["svg"])),
+        _ => None,
+    }
+}
+
 /// Shows the native save dialog for `req` and writes the bytes on confirm.
 /// MUST be called on the platform UI thread.
 fn handle_export_request(req: ExportRequest) {
-    let picked = rfd::FileDialog::new()
+    let mut dialog = rfd::FileDialog::new()
         .set_directory(&req.default_dir)
-        .set_file_name(&req.suggested_name)
-        .save_file();
+        .set_file_name(&req.suggested_name);
+    // Constrain the save dialog (and suggest the right extension) for known
+    // formats — notably `.excalidrawlib` for library export.
+    if let Some(ext) = Path::new(&req.suggested_name)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        if let Some((label, exts)) = dialog_filter_for(ext) {
+            dialog = dialog.add_filter(label, &exts);
+        }
+    }
+    let picked = dialog.save_file();
     let result = picked.and_then(|p| std::fs::write(&p, &req.bytes).ok().map(|_| p));
+    let _ = req.reply.send(result);
+}
+
+/// Shows the native open dialog for a `.excalidrawlib` file and returns its
+/// bytes (or `None` on cancel) over the reply channel. MUST be called on the
+/// platform UI thread.
+fn handle_library_open_request(req: LibraryOpenRequest) {
+    let picked = rfd::FileDialog::new()
+        .add_filter("Excalidraw Library", &["excalidrawlib"])
+        .set_directory(&req.default_dir)
+        .pick_file();
+    let result = picked.and_then(|p| std::fs::read(&p).ok());
     let _ = req.reply.send(result);
 }
 
@@ -648,8 +1106,275 @@ fn run_webview(
     port: u16,
     focus_rx: watch::Receiver<bool>,
     export_rx: std::sync::mpsc::Receiver<ExportRequest>,
+    library_open_rx: std::sync::mpsc::Receiver<LibraryOpenRequest>,
+    close_ctx: CloseContext,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_webview_url(&format!("http://127.0.0.1:{}", port), focus_rx, export_rx)
+    run_webview_url(
+        &format!("http://127.0.0.1:{}", port),
+        focus_rx,
+        export_rx,
+        library_open_rx,
+        close_ctx,
+    )
+}
+
+/// State machine for an in-flight unsaved-changes close.
+///
+/// A close always starts by *querying* the WebView for its live dirty state
+/// (rather than trusting the last `POST /dirty`, which can lag a just-made edit
+/// — finding 2). When that query resolves the event loop decides what to do:
+/// close immediately (clean), or transition to `Waiting` on a
+/// `__excalidrawSave({ reason: 'close' })` round-trip (dirty + save chosen).
+enum CloseFlow {
+    Idle,
+    /// Awaiting `__excalidrawPrepareClose` — the live dirty-state query.
+    Querying {
+        rx: tokio::sync::oneshot::Receiver<NativeActionResult>,
+        deadline: std::time::Instant,
+        request_id: String,
+    },
+    /// Awaiting `__excalidrawSave({ reason: 'close' })` — the save round-trip.
+    Waiting {
+        rx: tokio::sync::oneshot::Receiver<NativeActionResult>,
+        deadline: std::time::Instant,
+        /// Correlation id registered in `pending_actions`. Kept so the flow can
+        /// evict its own entry if it ends by timeout / channel drop rather than
+        /// by a `/native-action-result` (which would remove it).
+        request_id: String,
+    },
+}
+
+/// How long to wait for the save-and-close JS round-trip before giving up and
+/// keeping the window open.
+const CLOSE_SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long to wait for the live dirty-state query before falling back to the
+/// last reported (cached) dirty state. Short because it is a single read of a
+/// ref in the already-mounted WebView, not a serialize-and-POST.
+const CLOSE_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Dispatches `window.__excalidrawPrepareClose({ requestId })` — which reports
+/// the WebView's *live* dirty state to `/native-action-result` (`ok: true` ⇒
+/// clean ⇒ safe to close) — and registers a correlation entry to await it.
+///
+/// The `&&` guard makes the call a no-op if the React app hasn't mounted yet; the
+/// query then times out and the loop falls back to the cached dirty state.
+fn begin_query_close(
+    webview: &wry::WebView,
+    pending_actions: &PendingActions,
+    seq: u64,
+) -> CloseFlow {
+    let request_id = format!("query-{seq}");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Ok(mut pending) = pending_actions.lock() {
+        pending.insert(request_id.clone(), tx);
+    }
+    let id_json =
+        serde_json::to_string(&request_id).unwrap_or_else(|_| "\"query\"".to_string());
+    let script = format!(
+        "window.__excalidrawPrepareClose && window.__excalidrawPrepareClose({{ requestId: {id_json} }})"
+    );
+    let _ = webview.evaluate_script(&script);
+    CloseFlow::Querying {
+        rx,
+        deadline: std::time::Instant::now() + CLOSE_QUERY_TIMEOUT,
+        request_id,
+    }
+}
+
+/// Dispatches `window.__excalidrawSave({ reason: 'close', requestId })` and
+/// registers a correlation entry so the event loop can await the result.
+///
+/// `seq` is a per-window monotonic counter used only to make the request id
+/// unique. Returns the `Waiting` state to install. The `&&` guard makes the
+/// call a no-op (and the wait a timeout) if the React app hasn't mounted yet.
+fn begin_save_close(
+    webview: &wry::WebView,
+    pending_actions: &PendingActions,
+    seq: u64,
+) -> CloseFlow {
+    let request_id = format!("close-{seq}");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Ok(mut pending) = pending_actions.lock() {
+        pending.insert(request_id.clone(), tx);
+    }
+    let id_json =
+        serde_json::to_string(&request_id).unwrap_or_else(|_| "\"close\"".to_string());
+    let script = format!(
+        "window.__excalidrawSave && window.__excalidrawSave({{ reason: 'close', requestId: {id_json} }})"
+    );
+    let _ = webview.evaluate_script(&script);
+    CloseFlow::Waiting {
+        rx,
+        deadline: std::time::Instant::now() + CLOSE_SAVE_TIMEOUT,
+        request_id,
+    }
+}
+
+/// The user's answer to the unsaved-changes confirmation dialog.
+enum CloseChoice {
+    Save,
+    DontSave,
+    Cancel,
+}
+
+/// Shows the synchronous 3-way "unsaved changes" dialog (tao path: macOS/Windows).
+fn confirm_close_dialog() -> CloseChoice {
+    use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+    let result = MessageDialog::new()
+        .set_level(MessageLevel::Warning)
+        .set_title("Unsaved changes")
+        .set_description("This drawing has unsaved changes. Save before closing?")
+        .set_buttons(MessageButtons::YesNoCancelCustom(
+            "Save".to_owned(),
+            "Don't Save".to_owned(),
+            "Cancel".to_owned(),
+        ))
+        .show();
+    match result {
+        MessageDialogResult::Custom(label) if label == "Save" => CloseChoice::Save,
+        MessageDialogResult::Custom(label) if label == "Don't Save" => CloseChoice::DontSave,
+        MessageDialogResult::Yes => CloseChoice::Save,
+        MessageDialogResult::No => CloseChoice::DontSave,
+        _ => CloseChoice::Cancel,
+    }
+}
+
+/// The result of polling a pending native-action round-trip once.
+enum ActionOutcome {
+    /// No result yet and the deadline has not passed.
+    Pending,
+    /// The frontend reported a result; `ok` is its success flag.
+    Resolved(bool),
+    /// The deadline passed or the channel dropped with no result.
+    Lost,
+}
+
+/// Polls a single pending native-action oneshot with a deadline. On any terminal
+/// outcome (resolved, timed out, or channel closed) the correlation entry is
+/// evicted if still present — a resolving `/native-action-result` already
+/// removed it, but a timeout/drop must clean up its own stale entry so a late
+/// result can't resurrect the flow.
+fn poll_action_result(
+    rx: &mut tokio::sync::oneshot::Receiver<NativeActionResult>,
+    deadline: std::time::Instant,
+    request_id: &str,
+    pending_actions: &PendingActions,
+) -> ActionOutcome {
+    use tokio::sync::oneshot::error::TryRecvError;
+    match rx.try_recv() {
+        Ok(result) => ActionOutcome::Resolved(result.ok),
+        Err(TryRecvError::Empty) => {
+            if std::time::Instant::now() >= deadline {
+                if let Ok(mut pending) = pending_actions.lock() {
+                    pending.remove(request_id);
+                }
+                ActionOutcome::Lost
+            } else {
+                ActionOutcome::Pending
+            }
+        }
+        Err(TryRecvError::Closed) => {
+            if let Ok(mut pending) = pending_actions.lock() {
+                pending.remove(request_id);
+            }
+            ActionOutcome::Lost
+        }
+    }
+}
+
+/// Polls an in-flight save-and-close (`CloseFlow::Waiting`) once. Returns
+/// `(should_exit, finished)`: `should_exit` means the save succeeded and the
+/// window may close now; `finished` (without exit) means the flow ended without
+/// closing (save failed, timed out, or the channel dropped) and the window
+/// should stay open.
+fn poll_close_flow(flow: &mut CloseFlow, pending_actions: &PendingActions) -> (bool, bool) {
+    if let CloseFlow::Waiting {
+        rx,
+        deadline,
+        request_id,
+    } = flow
+    {
+        match poll_action_result(rx, *deadline, request_id, pending_actions) {
+            // Save succeeded → exit. Failure keeps the window open (the frontend
+            // already shows a "Save failed" toast via the save indicator).
+            ActionOutcome::Resolved(ok) => (ok, true),
+            ActionOutcome::Lost => (false, true),
+            ActionOutcome::Pending => (false, false),
+        }
+    } else {
+        (false, false)
+    }
+}
+
+/// Polls an in-flight dirty-state query (`CloseFlow::Querying`) once.
+///
+/// Returns `Some(is_clean)` once the query resolves (or is lost): `true` means
+/// the WebView reports no unsaved changes (safe to close), `false` means dirty
+/// (the caller must save or confirm). On a lost query (timeout / channel drop)
+/// the caller's `cached_dirty` is used as the answer, so an unresponsive or
+/// not-yet-mounted WebView falls back to the last reported state. Returns `None`
+/// while the query is still pending.
+fn poll_query_flow(
+    flow: &mut CloseFlow,
+    pending_actions: &PendingActions,
+    cached_dirty: bool,
+) -> Option<bool> {
+    if let CloseFlow::Querying {
+        rx,
+        deadline,
+        request_id,
+    } = flow
+    {
+        match poll_action_result(rx, *deadline, request_id, pending_actions) {
+            ActionOutcome::Resolved(ok) => Some(ok),
+            ActionOutcome::Lost => Some(!cached_dirty),
+            ActionOutcome::Pending => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Spawns the async 3-way "unsaved changes" dialog on the glib main context
+/// (Linux). `rfd::AsyncMessageDialog` avoids the re-entrant GTK main loop a
+/// *synchronous* dialog would trigger from inside the tick. On "Save" it installs
+/// a save-and-close `CloseFlow` (driven by the tick); "Don't Save" quits;
+/// "Cancel" leaves the window open.
+#[cfg(target_os = "linux")]
+fn spawn_gtk_close_dialog(
+    webview: std::rc::Rc<wry::WebView>,
+    flow: std::rc::Rc<std::cell::RefCell<CloseFlow>>,
+    ctx: CloseContext,
+    counter: std::rc::Rc<std::cell::Cell<u64>>,
+) {
+    gtk::glib::MainContext::default().spawn_local(async move {
+        use rfd::{AsyncMessageDialog, MessageButtons, MessageDialogResult, MessageLevel};
+        let result = AsyncMessageDialog::new()
+            .set_level(MessageLevel::Warning)
+            .set_title("Unsaved changes")
+            .set_description("This drawing has unsaved changes. Save before closing?")
+            .set_buttons(MessageButtons::YesNoCancelCustom(
+                "Save".to_owned(),
+                "Don't Save".to_owned(),
+                "Cancel".to_owned(),
+            ))
+            .show()
+            .await;
+        let save = matches!(&result, MessageDialogResult::Yes)
+            || matches!(&result, MessageDialogResult::Custom(l) if l == "Save");
+        let dont_save = matches!(&result, MessageDialogResult::No)
+            || matches!(&result, MessageDialogResult::Custom(l) if l == "Don't Save");
+        if save {
+            let seq = counter.get() + 1;
+            counter.set(seq);
+            *flow.borrow_mut() = begin_save_close(&webview, &ctx.pending_actions, seq);
+        } else if dont_save {
+            ctx.cleanup_lock();
+            gtk::main_quit();
+        }
+        // Cancel (or any other result) keeps the window open.
+    });
 }
 
 /// Opens the WebView at an arbitrary URL. Used both for the normal server and
@@ -659,40 +1384,149 @@ fn run_webview_url(
     url: &str,
     focus_rx: watch::Receiver<bool>,
     export_rx: std::sync::mpsc::Receiver<ExportRequest>,
+    library_open_rx: std::sync::mpsc::Receiver<LibraryOpenRequest>,
+    close_ctx: CloseContext,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use gtk::glib::Propagation;
     use gtk::prelude::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
     use wry::WebViewBuilderExtUnix;
 
+    // Native menu decision (spec leaves this open — option (b)): Linux keeps the
+    // in-WebView `MainMenu` plus the page's `Ctrl+S` keydown handler. WebKitGTK
+    // *does* deliver `Ctrl+S` to web content (unlike AppKit on macOS, which is why
+    // the tao path adds a `muda` menu with an accelerator), so the existing web
+    // handler already saves correctly here. No GTK `GtkMenuBar`/`AccelGroup` is
+    // wired this pass; if added later, it belongs in this function.
     gtk::init().map_err(|e| format!("Failed to init GTK: {}", e))?;
 
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title("Excalidraw Preview");
     window.set_default_size(1200, 800);
 
-    let _webview = wry::WebViewBuilder::new()
-        .with_url(url)
-        .build_gtk(&window)
-        .map_err(|e| format!("Failed to create WebView: {}", e))?;
+    // Window / taskbar icon: load the embedded PNG straight into a Pixbuf.
+    {
+        let loader = gtk::gdk_pixbuf::PixbufLoader::new();
+        if loader.write(APP_ICON_PNG).is_ok() && loader.close().is_ok() {
+            if let Some(pixbuf) = loader.pixbuf() {
+                window.set_icon(Some(&pixbuf));
+            }
+        }
+    }
+
+    // Shared with the delete handler and the tick so both can call
+    // `evaluate_script` for the save-and-close flow. Rc (single-threaded GTK).
+    let webview = Rc::new(
+        wry::WebViewBuilder::new()
+            .with_url(url)
+            // External links (Help/docs, Browse libraries) open in the system browser
+            // instead of navigating away from — or spawning a popup inside — the editor.
+            .with_navigation_handler(allow_navigation)
+            .with_new_window_req_handler(|url, _features| {
+                if (url.starts_with("http://") || url.starts_with("https://"))
+                    && !is_internal_url(&url)
+                {
+                    open_external(&url);
+                }
+                wry::NewWindowResponse::Deny
+            })
+            .build_gtk(&window)
+            .map_err(|e| format!("Failed to create WebView: {}", e))?,
+    );
 
     window.show_all();
 
+    // Unsaved-changes close flow, shared between the delete handler (which starts
+    // it) and the 100 ms tick (which polls it to completion). A monotonically
+    // increasing counter generates correlation ids for the JS round-trip.
+    let close_flow = Rc::new(RefCell::new(CloseFlow::Idle));
+    let close_counter = Rc::new(Cell::new(0u64));
+
     let window_for_tick = window.clone();
+    let close_flow_tick = close_flow.clone();
+    let close_ctx_tick = close_ctx.clone();
+    let webview_tick = webview.clone();
+    let close_counter_tick = close_counter.clone();
     let mut focus_rx = focus_rx;
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         while let Ok(req) = export_rx.try_recv() {
             handle_export_request(req);
         }
+        while let Ok(req) = library_open_rx.try_recv() {
+            handle_library_open_request(req);
+        }
         if focus_rx.has_changed().unwrap_or(false) {
             let _ = focus_rx.borrow_and_update();
             window_for_tick.present();
         }
+        // Drive the in-flight close flow started by the delete handler: first the
+        // live dirty-state query, then (if dirty) the save-and-close round-trip.
+        let mut should_exit = false;
+        {
+            let mut flow = close_flow_tick.borrow_mut();
+            if matches!(&*flow, CloseFlow::Querying { .. }) {
+                let cached_dirty =
+                    close_ctx_tick.dirty.read().map(|d| d.dirty).unwrap_or(false);
+                if let Some(is_clean) =
+                    poll_query_flow(&mut flow, &close_ctx_tick.pending_actions, cached_dirty)
+                {
+                    if is_clean {
+                        should_exit = true; // no unsaved changes → close now
+                    } else if close_ctx_tick.auto_save {
+                        let seq = close_counter_tick.get() + 1;
+                        close_counter_tick.set(seq);
+                        *flow = begin_save_close(
+                            &webview_tick,
+                            &close_ctx_tick.pending_actions,
+                            seq,
+                        );
+                    } else {
+                        // Dirty + auto-save off → async 3-way dialog (no nested loop).
+                        *flow = CloseFlow::Idle;
+                        spawn_gtk_close_dialog(
+                            webview_tick.clone(),
+                            close_flow_tick.clone(),
+                            close_ctx_tick.clone(),
+                            close_counter_tick.clone(),
+                        );
+                    }
+                }
+            } else if matches!(&*flow, CloseFlow::Waiting { .. }) {
+                let (exit, finished) = poll_close_flow(&mut flow, &close_ctx_tick.pending_actions);
+                should_exit = exit; // RefMut derefs to CloseFlow for the call above
+                if finished && !exit {
+                    *flow = CloseFlow::Idle;
+                }
+            }
+        }
+        if should_exit {
+            close_ctx_tick.cleanup_lock();
+            gtk::main_quit();
+            return gtk::glib::ControlFlow::Break;
+        }
         gtk::glib::ControlFlow::Continue
     });
 
+    // Unsaved-changes confirmation on close. Rather than trust the cached
+    // `POST /dirty` value (which can lag a just-made edit — finding 2), the
+    // delete handler starts a live dirty-state query and vetoes the close
+    // (`Stop`); the tick decides (close / save / async confirm dialog) once the
+    // query resolves and calls `main_quit` when it's time to exit.
+    let webview_del = webview.clone();
+    let close_flow_del = close_flow.clone();
+    let close_ctx_del = close_ctx.clone();
+    let counter_del = close_counter.clone();
     window.connect_delete_event(move |_, _| {
-        gtk::main_quit();
-        Propagation::Proceed
+        if matches!(&*close_flow_del.borrow(), CloseFlow::Idle) {
+            let seq = counter_del.get() + 1;
+            counter_del.set(seq);
+            *close_flow_del.borrow_mut() =
+                begin_query_close(&webview_del, &close_ctx_del.pending_actions, seq);
+        }
+        // A query or save-and-close is already in flight — veto and let the tick
+        // drive it to completion.
+        Propagation::Stop
     });
 
     gtk::main();
@@ -708,6 +1542,8 @@ fn run_webview_url(
     url: &str,
     mut focus_rx: watch::Receiver<bool>,
     export_rx: std::sync::mpsc::Receiver<ExportRequest>,
+    library_open_rx: std::sync::mpsc::Receiver<LibraryOpenRequest>,
+    close_ctx: CloseContext,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tao::{
         event_loop::{ControlFlow, EventLoop},
@@ -722,14 +1558,53 @@ fn run_webview_url(
         .build(&event_loop)
         .map_err(|e| format!("Failed to create window: {}", e))?;
 
-    let _webview = WebViewBuilder::new()
+    // Window / taskbar icon (Windows). On macOS this is a no-op — the Dock tile is
+    // set via `set_macos_app_icon` below — but it is harmless to call.
+    if let Some((rgba, w, h)) = decode_icon_rgba() {
+        if let Ok(icon) = tao::window::Icon::from_rgba(rgba, w, h) {
+            window.set_window_icon(Some(icon));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    set_macos_app_icon();
+
+    let webview = WebViewBuilder::new()
         .with_url(url)
+        // External links (Help/docs, Browse libraries) open in the system browser
+        // instead of navigating away from — or spawning a popup inside — the editor.
+        .with_navigation_handler(allow_navigation)
+        .with_new_window_req_handler(|url, _features| {
+            if (url.starts_with("http://") || url.starts_with("https://")) && !is_internal_url(&url)
+            {
+                open_external(&url);
+            }
+            wry::NewWindowResponse::Deny
+        })
         .build(&window)
         .map_err(|e| format!("Failed to create WebView: {}", e))?;
 
+    // Native menu bar. Built after the window so it can attach to it, and held
+    // alive for the whole event loop. Menu clicks/accelerators arrive on the
+    // global `MenuEvent` channel and are dispatched into the JS bridge below.
+    let (menu, menu_ids) = build_menu()?;
+    #[cfg(target_os = "macos")]
+    menu.init_for_nsapp();
+    #[cfg(target_os = "windows")]
+    {
+        use tao::platform::windows::WindowExtWindows;
+        let _ = menu.init_for_hwnd(window.hwnd() as isize);
+    }
+    let menu_channel = muda::MenuEvent::receiver();
+
+    // Unsaved-changes close flow state, owned by the event loop.
+    let mut close_flow = CloseFlow::Idle;
+    let mut close_counter: u64 = 0;
+
     event_loop.run(move |event, _, control_flow| {
-        // Wake at least every 100 ms so export/focus requests are handled promptly
-        // even when no OS events arrive (ControlFlow::Wait would starve them).
+        // Keep the menu alive for the lifetime of the event loop.
+        let _ = &menu;
+        // Wake at least every 100 ms so export/focus/menu requests are handled
+        // promptly even when no OS events arrive (ControlFlow::Wait would starve them).
         *control_flow = ControlFlow::WaitUntil(
             std::time::Instant::now() + std::time::Duration::from_millis(100),
         );
@@ -739,11 +1614,78 @@ fn run_webview_url(
             ..
         } = event
         {
-            *control_flow = ControlFlow::Exit;
+            // tao has no veto: to keep the window alive we simply do NOT set
+            // ControlFlow::Exit, and instead drive a query → decide → save flow,
+            // exiting only once it resolves. The flow always *starts* by asking
+            // the WebView for its live dirty state (finding 2) rather than
+            // trusting the possibly-stale cached `POST /dirty` value.
+            if matches!(close_flow, CloseFlow::Idle) {
+                close_counter += 1;
+                close_flow =
+                    begin_query_close(&webview, &close_ctx.pending_actions, close_counter);
+            }
+            // else: a query or save-and-close is already in flight — ignore the repeat.
+        }
+
+        // Drive an in-flight close flow: first the live dirty-state query, then
+        // (if dirty) the save-and-close round-trip.
+        if matches!(close_flow, CloseFlow::Querying { .. }) {
+            let cached_dirty = close_ctx.dirty.read().map(|d| d.dirty).unwrap_or(false);
+            if let Some(is_clean) =
+                poll_query_flow(&mut close_flow, &close_ctx.pending_actions, cached_dirty)
+            {
+                if is_clean {
+                    // Live state says no unsaved changes → close now.
+                    close_ctx.cleanup_lock();
+                    *control_flow = ControlFlow::Exit;
+                } else if close_ctx.auto_save {
+                    // Dirty + auto-save on: save silently, then close when it completes.
+                    close_counter += 1;
+                    close_flow =
+                        begin_save_close(&webview, &close_ctx.pending_actions, close_counter);
+                } else {
+                    // Dirty + auto-save off: ask the user.
+                    match confirm_close_dialog() {
+                        CloseChoice::Save => {
+                            close_counter += 1;
+                            close_flow = begin_save_close(
+                                &webview,
+                                &close_ctx.pending_actions,
+                                close_counter,
+                            );
+                        }
+                        CloseChoice::DontSave => {
+                            close_ctx.cleanup_lock();
+                            *control_flow = ControlFlow::Exit;
+                        }
+                        CloseChoice::Cancel => close_flow = CloseFlow::Idle,
+                    }
+                }
+            }
+        } else if matches!(close_flow, CloseFlow::Waiting { .. }) {
+            let (should_exit, finished) =
+                poll_close_flow(&mut close_flow, &close_ctx.pending_actions);
+            if should_exit {
+                close_ctx.cleanup_lock();
+                *control_flow = ControlFlow::Exit;
+            } else if finished {
+                close_flow = CloseFlow::Idle;
+            }
+        }
+
+        // Dispatch native menu clicks / accelerators (e.g. Cmd+S) into the JS bridge.
+        while let Ok(menu_event) = menu_channel.try_recv() {
+            if let Some(script) = menu_event_script(&menu_event.id, &menu_ids) {
+                let _ = webview.evaluate_script(script);
+            }
         }
 
         while let Ok(req) = export_rx.try_recv() {
             handle_export_request(req);
+        }
+
+        while let Ok(req) = library_open_rx.try_recv() {
+            handle_library_open_request(req);
         }
 
         if focus_rx.has_changed().unwrap_or(false) {
@@ -787,7 +1729,7 @@ struct CliArgs {
     /// e.g. --dev-server http://localhost:5173
     #[arg(long, value_name = "URL")]
     dev_server: Option<String>,
-    /// Automatically save the diagram back to disk after every change (debounced 600 ms).
+    /// Automatically save the diagram back to disk after every change (debounced 300 ms).
     /// Default: off — use Ctrl+S to save manually.
     #[arg(long)]
     auto_save: bool,
@@ -795,7 +1737,10 @@ struct CliArgs {
     #[arg(long, hide = true)]
     foreground: bool,
     /// Run the server without opening a WebView window (tests / headless environments).
-    #[arg(long)]
+    /// Also enabled by setting `EXCALIDRAW_PREVIEW_HEADLESS=true`, which propagates to
+    /// previews the LSP server spawns (so integration tests can drive `didOpen` /
+    /// `didSave` without opening real windows).
+    #[arg(long, env = "EXCALIDRAW_PREVIEW_HEADLESS")]
     headless: bool,
     /// Write exports directly into this directory instead of showing a save dialog.
     /// Intended for tests and headless use.
@@ -860,8 +1805,13 @@ fn run_lsp_server() -> Result<()> {
                     "id": id,
                     "result": {
                         "capabilities": {
-                            // 1 = Full sync — Zed will send textDocument/didOpen
-                            "textDocumentSync": 1
+                            // openClose → didOpen/didClose; change:1 = Full sync;
+                            // save:true → Zed sends textDocument/didSave (reopen-on-save).
+                            "textDocumentSync": {
+                                "openClose": true,
+                                "change": 1,
+                                "save": true
+                            }
                         },
                         "serverInfo": { "name": "excalidraw-preview", "version": "0.1.0" }
                     }
@@ -883,6 +1833,20 @@ fn run_lsp_server() -> Result<()> {
                 if let Some(uri) = msg["params"]["textDocument"]["uri"].as_str() {
                     if let Some(path) = file_uri_to_path(uri) {
                         shutdown_preview(&path);
+                    }
+                }
+            }
+
+            "textDocument/didSave" => {
+                // Saving a buffer reopens a preview the user deliberately closed.
+                // This is acceptable: a save is explicit and low-frequency. We do
+                // NOT spawn on didChange — typing must never resurrect a closed
+                // preview. If a live instance already exists, this is a no-op.
+                if let Some(uri) = msg["params"]["textDocument"]["uri"].as_str() {
+                    if let Some(path) = file_uri_to_path(uri) {
+                        if !preview_is_live(&path) {
+                            spawn_preview(&exe, &path);
+                        }
                     }
                 }
             }
@@ -948,6 +1912,35 @@ fn spawn_preview(exe: &std::path::Path, path: &str) {
             .stderr(std::process::Stdio::null())
             .spawn();
     }
+}
+
+/// Returns `true` if a live preview server is already serving `path`.
+///
+/// Reads the per-file lock file and probes `GET /ping`. Uses a blocking client,
+/// so it is safe to call from the synchronous LSP loop. A missing/stale lock or a
+/// failed ping reports "not live" so the caller can spawn a fresh instance.
+fn preview_is_live(path: &str) -> bool {
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let lock_path = get_lock_path(&canonical);
+    let Ok(port_str) = std::fs::read_to_string(&lock_path) else {
+        return false;
+    };
+    let Ok(port) = port_str.trim().parse::<u16>() else {
+        return false;
+    };
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!("http://127.0.0.1:{}/ping", port))
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
 }
 
 /// Sends GET /shutdown to the preview server for the given file path.
@@ -1016,6 +2009,7 @@ mod tests {
         let (broadcast_tx, _) = broadcast::channel(16);
         let (focus_tx, _) = watch::channel(false);
         let (export_tx, _) = std::sync::mpsc::channel();
+        let (library_open_tx, _) = std::sync::mpsc::channel();
         Arc::new(AppState {
             file_path: file.to_path_buf(),
             lock_path: std::env::temp_dir().join("excalidraw-test.lock"),
@@ -1029,7 +2023,10 @@ mod tests {
             broadcast_tx,
             focus_tx: Arc::new(focus_tx),
             export_tx,
+            library_open_tx,
             export_dir: None,
+            dirty: Arc::new(RwLock::new(DirtyState::default())),
+            pending_actions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1100,13 +2097,19 @@ mod tests {
     }
 
     #[test]
-    fn test_find_available_port_returns_bindable_port() {
-        let port = find_available_port();
-        assert!(port >= 10000, "port {port} is below minimum");
-        assert!(
-            std::net::TcpListener::bind(format!("127.0.0.1:{port}")).is_ok(),
-            "port {port} should be bindable"
-        );
+    fn test_is_internal_url_classifies_hosts_and_schemes() {
+        // Loopback hosts and editor schemes stay inside the WebView.
+        assert!(is_internal_url("http://127.0.0.1:18733/assets/x.js"));
+        assert!(is_internal_url("http://localhost:5173/"));
+        assert!(is_internal_url("https://localhost/data"));
+        assert!(is_internal_url("data:image/png;base64,AAAA"));
+        assert!(is_internal_url("blob:http://127.0.0.1/abc"));
+        assert!(is_internal_url("about:blank"));
+        // External hosts and unknown schemes are not internal.
+        assert!(!is_internal_url("https://libraries.excalidraw.com/"));
+        assert!(!is_internal_url("https://github.com/excalidraw/excalidraw"));
+        assert!(!is_internal_url("http://example.com:8080/path"));
+        assert!(!is_internal_url("mailto:hi@example.com"));
     }
 
     // ── Route tests ──────────────────────────────────────────────────────────
@@ -1225,6 +2228,7 @@ mod tests {
         let (focus_tx, _focus_rx) = watch::channel(false);
         let focus_tx = Arc::new(focus_tx);
         let (export_tx, _) = std::sync::mpsc::channel();
+        let (library_open_tx, _) = std::sync::mpsc::channel();
 
         let state = Arc::new(AppState {
             file_path: tmp.path().to_path_buf(),
@@ -1235,7 +2239,10 @@ mod tests {
             broadcast_tx,
             focus_tx,
             export_tx,
+            library_open_tx,
             export_dir: None,
+            dirty: Arc::new(RwLock::new(DirtyState::default())),
+            pending_actions: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let app = Router::new()
@@ -1258,6 +2265,407 @@ mod tests {
         // behavior is verified in integration tests that run the full event loop.
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), b"OK");
+    }
+
+    // ── /dirty and /native-action-result ───────────────────────────────────────
+
+    fn bridge_app(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/dirty", axum::routing::post(receive_dirty))
+            .route(
+                "/native-action-result",
+                axum::routing::post(receive_native_action_result),
+            )
+            .with_state(state)
+    }
+
+    fn post_json(uri: &str, body: &str) -> Request<axum::body::Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_receive_dirty_updates_shared_state() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let state = make_state(tmp.path(), "application/json");
+        let app = bridge_app(state.clone());
+
+        let response = app
+            .oneshot(post_json(
+                "/dirty",
+                r#"{"dirty":true,"pendingSave":true,"lastSavedAt":1717000000000}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let dirty = state.dirty.read().unwrap();
+        assert!(dirty.dirty);
+        assert!(dirty.pending_save);
+        assert_eq!(dirty.last_saved_at, Some(1717000000000));
+    }
+
+    #[tokio::test]
+    async fn test_receive_dirty_accepts_null_last_saved_at() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let state = make_state(tmp.path(), "application/json");
+        let app = bridge_app(state.clone());
+
+        let response = app
+            .oneshot(post_json(
+                "/dirty",
+                r#"{"dirty":false,"pendingSave":false,"lastSavedAt":null}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let dirty = state.dirty.read().unwrap();
+        assert!(!dirty.dirty);
+        assert!(!dirty.pending_save);
+    }
+
+    #[tokio::test]
+    async fn test_receive_dirty_rejects_malformed_body() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let state = make_state(tmp.path(), "application/json");
+        let app = bridge_app(state);
+
+        let response = app
+            .oneshot(post_json("/dirty", r#"{"dirty":"not-a-bool"}"#))
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "expected 4xx, got {}",
+            response.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_native_action_result_resolves_pending() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let state = make_state(tmp.path(), "application/json");
+
+        // Register a pending action keyed by id, mirroring what native dispatch will do.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state
+            .pending_actions
+            .lock()
+            .unwrap()
+            .insert("req-1".to_string(), tx);
+
+        let app = bridge_app(state.clone());
+        let response = app
+            .oneshot(post_json(
+                "/native-action-result",
+                r#"{"id":"req-1","action":"save","ok":true,"error":null}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let result = rx.await.expect("pending action should be resolved");
+        assert_eq!(result.action, "save");
+        assert!(result.ok);
+        assert!(result.error.is_none());
+        // The entry must have been removed from the table.
+        assert!(state.pending_actions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_native_action_result_unknown_id_is_noop() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let state = make_state(tmp.path(), "application/json");
+        let app = bridge_app(state);
+
+        let response = app
+            .oneshot(post_json(
+                "/native-action-result",
+                r#"{"id":"missing","action":"save","ok":false,"error":"boom"}"#,
+            ))
+            .await
+            .unwrap();
+        // Unknown ids are accepted (no waiter) — must not error.
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_native_action_result_rejects_malformed_body() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let state = make_state(tmp.path(), "application/json");
+        let app = bridge_app(state);
+
+        let response = app
+            .oneshot(post_json("/native-action-result", r#"{"id":"x"}"#))
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "expected 4xx, got {}",
+            response.status()
+        );
+    }
+
+    // ── Close-flow cleanup ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_poll_close_flow_evicts_pending_entry_on_timeout() {
+        // A Waiting flow whose deadline has already passed must drop its
+        // correlation entry so a late /native-action-result can't resurrect it.
+        let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pending.lock().unwrap().insert("close-1".to_string(), tx);
+
+        let mut flow = CloseFlow::Waiting {
+            rx,
+            deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            request_id: "close-1".to_string(),
+        };
+
+        let (should_exit, finished) = poll_close_flow(&mut flow, &pending);
+        assert!(!should_exit, "a timeout must not close the window");
+        assert!(finished, "a timeout ends the flow");
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "stale pending entry must be evicted on timeout"
+        );
+    }
+
+    #[test]
+    fn test_poll_close_flow_evicts_pending_entry_on_channel_drop() {
+        // If the sender is dropped without a result, the flow finishes and must
+        // also clear its correlation entry.
+        let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
+        // The flow's own channel, closed by dropping its sender.
+        let (tx, rx) = tokio::sync::oneshot::channel::<NativeActionResult>();
+        drop(tx); // close the channel → rx.try_recv() yields Closed
+        // A still-registered correlation entry under the same id (a stray sender
+        // that no resolving result will ever remove).
+        let (placeholder_tx, _placeholder_rx) = tokio::sync::oneshot::channel::<NativeActionResult>();
+        pending
+            .lock()
+            .unwrap()
+            .insert("close-2".to_string(), placeholder_tx);
+
+        let mut flow = CloseFlow::Waiting {
+            rx,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            request_id: "close-2".to_string(),
+        };
+
+        let (should_exit, finished) = poll_close_flow(&mut flow, &pending);
+        assert!(!should_exit);
+        assert!(finished, "a closed channel ends the flow");
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "stale pending entry must be evicted when the channel drops"
+        );
+    }
+
+    #[test]
+    fn test_poll_close_flow_still_waiting_keeps_entry() {
+        // Before the deadline with no result, the flow stays pending and the
+        // entry is retained.
+        let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pending.lock().unwrap().insert("close-3".to_string(), tx);
+
+        let mut flow = CloseFlow::Waiting {
+            rx,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            request_id: "close-3".to_string(),
+        };
+
+        let (should_exit, finished) = poll_close_flow(&mut flow, &pending);
+        assert!(!should_exit);
+        assert!(!finished, "still within the deadline → not finished");
+        assert_eq!(pending.lock().unwrap().len(), 1, "entry retained while waiting");
+    }
+
+    // ── Live dirty-state query (close flow, finding 2) ──────────────────────────
+
+    /// Helper: a `Querying` flow whose result channel is held by the caller.
+    fn querying_flow(
+        request_id: &str,
+        deadline: std::time::Instant,
+    ) -> (CloseFlow, tokio::sync::oneshot::Sender<NativeActionResult>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let flow = CloseFlow::Querying {
+            rx,
+            deadline,
+            request_id: request_id.to_string(),
+        };
+        (flow, tx)
+    }
+
+    #[test]
+    fn test_poll_query_flow_reports_clean_when_webview_says_not_dirty() {
+        // The query resolved with ok:true (no unsaved changes) → safe to close,
+        // regardless of the (here, stale) cached dirty flag.
+        let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
+        let (mut flow, tx) =
+            querying_flow("query-1", std::time::Instant::now() + std::time::Duration::from_secs(60));
+        tx.send(NativeActionResult {
+            action: "prepareClose".to_string(),
+            ok: true,
+            error: None,
+        })
+        .unwrap();
+
+        // cached_dirty=true would have closed-without-saving under the old logic;
+        // the live query overrides it.
+        assert_eq!(poll_query_flow(&mut flow, &pending, true), Some(true));
+    }
+
+    #[test]
+    fn test_poll_query_flow_reports_dirty_when_webview_says_dirty() {
+        let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
+        let (mut flow, tx) =
+            querying_flow("query-2", std::time::Instant::now() + std::time::Duration::from_secs(60));
+        tx.send(NativeActionResult {
+            action: "prepareClose".to_string(),
+            ok: false,
+            error: None,
+        })
+        .unwrap();
+
+        // Live query says dirty even though the cached flag is clean (the exact
+        // finding-2 race: an edit landed before its POST /dirty was delivered).
+        assert_eq!(poll_query_flow(&mut flow, &pending, false), Some(false));
+    }
+
+    #[test]
+    fn test_poll_query_flow_pending_before_deadline() {
+        let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
+        let (mut flow, _tx) =
+            querying_flow("query-3", std::time::Instant::now() + std::time::Duration::from_secs(60));
+        // No result yet, deadline far off → still pending (None).
+        assert_eq!(poll_query_flow(&mut flow, &pending, true), None);
+    }
+
+    #[test]
+    fn test_poll_query_flow_lost_falls_back_to_cached_dirty() {
+        // An unresponsive / not-yet-mounted WebView: the query times out and the
+        // loop falls back to the last reported dirty state. cached_dirty=true ⇒
+        // NOT clean (we must not close silently over possible unsaved changes).
+        let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pending.lock().unwrap().insert("query-4".to_string(), tx);
+        let mut flow = CloseFlow::Querying {
+            rx,
+            deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            request_id: "query-4".to_string(),
+        };
+
+        assert_eq!(poll_query_flow(&mut flow, &pending, true), Some(false));
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "a lost query evicts its stale correlation entry"
+        );
+    }
+
+    #[test]
+    fn test_poll_query_flow_lost_with_clean_cache_allows_close() {
+        let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
+        let (_tx, rx) = tokio::sync::oneshot::channel::<NativeActionResult>();
+        let mut flow = CloseFlow::Querying {
+            rx,
+            deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            request_id: "query-5".to_string(),
+        };
+        // No correlation entry registered; deadline passed; cached clean → close.
+        assert_eq!(poll_query_flow(&mut flow, &pending, false), Some(true));
+    }
+
+    // ── /native-library-request ────────────────────────────────────────────────
+
+    #[test]
+    fn test_dialog_filter_for_known_and_unknown() {
+        assert_eq!(
+            dialog_filter_for("excalidrawlib").unwrap().0,
+            "Excalidraw Library"
+        );
+        assert_eq!(dialog_filter_for("png").unwrap().0, "PNG Image");
+        assert_eq!(dialog_filter_for("svg").unwrap().0, "SVG Image");
+        assert!(dialog_filter_for("bin").is_none());
+    }
+
+    /// Builds an `AppState` whose library-open channel receiver is returned to the
+    /// caller, so a test can stand in for the UI thread that answers the dialog.
+    fn make_state_with_library(
+        file: &std::path::Path,
+    ) -> (Arc<AppState>, std::sync::mpsc::Receiver<LibraryOpenRequest>) {
+        let (broadcast_tx, _) = broadcast::channel(16);
+        let (focus_tx, _) = watch::channel(false);
+        let (export_tx, _) = std::sync::mpsc::channel();
+        let (library_open_tx, library_open_rx) = std::sync::mpsc::channel();
+        let state = Arc::new(AppState {
+            file_path: file.to_path_buf(),
+            lock_path: std::env::temp_dir().join("excalidraw-test-lib.lock"),
+            content_type: "application/json".to_string(),
+            file_name: "test".to_string(),
+            auto_save: false,
+            broadcast_tx,
+            focus_tx: Arc::new(focus_tx),
+            export_tx,
+            library_open_tx,
+            export_dir: None,
+            dirty: Arc::new(RwLock::new(DirtyState::default())),
+            pending_actions: Arc::new(Mutex::new(HashMap::new())),
+        });
+        (state, library_open_rx)
+    }
+
+    #[tokio::test]
+    async fn test_receive_library_request_returns_picked_bytes() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (state, library_open_rx) = make_state_with_library(tmp.path());
+
+        // Stand in for the UI thread: answer the dialog with file bytes.
+        std::thread::spawn(move || {
+            if let Ok(req) = library_open_rx.recv() {
+                let _ = req
+                    .reply
+                    .send(Some(br#"{"type":"excalidrawlib","libraryItems":[]}"#.to_vec()));
+            }
+        });
+
+        let response = receive_library_request(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["type"], "excalidrawlib");
+    }
+
+    #[tokio::test]
+    async fn test_receive_library_request_cancel_returns_204() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (state, library_open_rx) = make_state_with_library(tmp.path());
+
+        // Stand in for the UI thread: user cancelled the dialog.
+        std::thread::spawn(move || {
+            if let Ok(req) = library_open_rx.recv() {
+                let _ = req.reply.send(None);
+            }
+        });
+
+        let response = receive_library_request(State(state)).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_receive_library_request_no_window_returns_500() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (state, library_open_rx) = make_state_with_library(tmp.path());
+        // Drop the receiver: no UI thread → the send fails → 500.
+        drop(library_open_rx);
+
+        let response = receive_library_request(State(state)).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

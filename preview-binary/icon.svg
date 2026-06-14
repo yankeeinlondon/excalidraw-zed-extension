@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Original app/window icon for the Excalidraw preview binary.
+
+  A stylized "preview frame" (rounded window) with a hand-drawn pencil crossing
+  it and a sketched diagram glyph inside. Deliberately NOT the Excalidraw brand
+  mark — this is an independent, generic "sketch preview" motif to avoid any
+  trademark/brand risk.
+-->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6c63ff"/>
+      <stop offset="1" stop-color="#3b34c4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- rounded app tile background -->
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#bg)"/>
+
+  <!-- preview frame -->
+  <rect x="232" y="248" width="560" height="440" rx="40"
+        fill="#ffffff" fill-opacity="0.08"
+        stroke="#ffffff" stroke-width="26" stroke-linejoin="round"/>
+
+  <!-- sketched diagram glyph inside the frame -->
+  <g fill="none" stroke="#ffffff" stroke-width="22" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="300" y="330" width="150" height="110" rx="18"/>
+    <circle cx="650" cy="400" r="70"/>
+    <path d="M450 392 H560"/>
+    <path d="M375 440 V560 H650 V475"/>
+  </g>
+
+  <!-- hand-drawn pencil crossing the lower-right corner -->
+  <g stroke-linejoin="round" stroke-linecap="round">
+    <!-- pencil body -->
+    <path d="M612 760 L792 580 L860 648 L680 828 Z" fill="#ffd166" stroke="#1f1a4d" stroke-width="20"/>
+    <!-- pencil tip -->
+    <path d="M612 760 L680 828 L596 844 Z" fill="#ffffff" stroke="#1f1a4d" stroke-width="20"/>
+    <!-- graphite point -->
+    <path d="M612 760 L596 844 L640 800 Z" fill="#1f1a4d"/>
+    <!-- eraser band -->
+    <path d="M792 580 L860 648" fill="none" stroke="#ef476f" stroke-width="20"/>
+  </g>
+</svg>

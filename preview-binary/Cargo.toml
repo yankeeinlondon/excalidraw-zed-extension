@@ -17,7 +17,7 @@ hyper = "1"
 notify = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 sha2 = "0.11"
 rust-embed = "8"
@@ -26,9 +26,28 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.13", features = ["json", "blocking"] }
 mime_guess = "2"
 dirs = "6"
+open = "5"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rfd = "0.17"
+# Decode the embedded PNG icon to RGBA for the tao window/taskbar icon (Windows)
+# and the macOS Dock tile.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Native menu bar (File → Save with Cmd+S/Ctrl+S, Export, Library) on the tao path.
+# The Linux/GTK path keeps the in-WebView MainMenu + web Ctrl+S handler instead.
+muda = "0.19"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSResponder",
+    "NSImage",
+    "NSImageRep",
+    "NSBitmapImageRep",
+    "NSGraphics",
+    "NSRunningApplication",
+] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSGeometry"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", features = ["v3_24"] }
