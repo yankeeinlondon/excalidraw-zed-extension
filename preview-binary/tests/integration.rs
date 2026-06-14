@@ -463,7 +463,9 @@ fn lsp_did_save_spawns_preview_then_reuses_live_instance() {
     use std::io::{BufReader, Write};
 
     let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("save-target.excalidraw");
+    // A space in the name forces the URI to be percent-encoded, exercising the
+    // full file:// decode path (finding 1) end-to-end, not just the host shape.
+    let file = dir.path().join("save target.excalidraw");
     std::fs::write(&file, BLANK_SCENE).unwrap();
     let canonical = std::fs::canonicalize(&file).unwrap();
     let lock = lock_path_for(&canonical);
@@ -485,7 +487,8 @@ fn lsp_did_save_spawns_preview_then_reuses_live_instance() {
     lsp_write(&mut stdin, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
     let _ = lsp_read(&mut stdout);
 
-    let uri = format!("file://{}", canonical.display());
+    // Percent-encode spaces the way a real LSP client (Zed) would.
+    let uri = format!("file://{}", canonical.display()).replace(' ', "%20");
     let did_save = format!(
         r#"{{"jsonrpc":"2.0","method":"textDocument/didSave","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
     );

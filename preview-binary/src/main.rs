@@ -1240,12 +1240,45 @@ fn confirm_close_dialog() -> CloseChoice {
     }
 }
 
+/// Shows a blocking "save failed" error dialog (tao path: macOS/Windows) when a
+/// close-time save or other native round-trip fails or times out. Without this
+/// the window would stay open with no explanation, which reads as broken.
+#[cfg(not(target_os = "linux"))]
+fn show_close_error_dialog(detail: Option<&str>) {
+    use rfd::{MessageButtons, MessageDialog, MessageLevel};
+    MessageDialog::new()
+        .set_level(MessageLevel::Error)
+        .set_title("Save failed")
+        .set_description(close_error_message(detail))
+        .set_buttons(MessageButtons::Ok)
+        .show();
+}
+
+/// Spawns an async "save failed" error dialog on the glib main context (Linux).
+/// Async (like the close-confirm dialog) to avoid a re-entrant GTK main loop
+/// from inside the tick.
+#[cfg(target_os = "linux")]
+fn spawn_gtk_error_dialog(detail: Option<String>) {
+    gtk::glib::MainContext::default().spawn_local(async move {
+        use rfd::{AsyncMessageDialog, MessageButtons, MessageLevel};
+        let _ = AsyncMessageDialog::new()
+            .set_level(MessageLevel::Error)
+            .set_title("Save failed")
+            .set_description(close_error_message(detail.as_deref()))
+            .set_buttons(MessageButtons::Ok)
+            .show()
+            .await;
+    });
+}
+
 /// The result of polling a pending native-action round-trip once.
 enum ActionOutcome {
     /// No result yet and the deadline has not passed.
     Pending,
-    /// The frontend reported a result; `ok` is its success flag.
-    Resolved(bool),
+    /// The frontend reported a result, carrying its success flag and any error
+    /// detail (preserved so close-time failures can be surfaced to the user
+    /// rather than reduced to a bare `bool`).
+    Resolved(NativeActionResult),
     /// The deadline passed or the channel dropped with no result.
     Lost,
 }
@@ -1263,7 +1296,7 @@ fn poll_action_result(
 ) -> ActionOutcome {
     use tokio::sync::oneshot::error::TryRecvError;
     match rx.try_recv() {
-        Ok(result) => ActionOutcome::Resolved(result.ok),
+        Ok(result) => ActionOutcome::Resolved(result),
         Err(TryRecvError::Empty) => {
             if std::time::Instant::now() >= deadline {
                 if let Ok(mut pending) = pending_actions.lock() {
@@ -1283,12 +1316,26 @@ fn poll_action_result(
     }
 }
 
-/// Polls an in-flight save-and-close (`CloseFlow::Waiting`) once. Returns
-/// `(should_exit, finished)`: `should_exit` means the save succeeded and the
-/// window may close now; `finished` (without exit) means the flow ended without
-/// closing (save failed, timed out, or the channel dropped) and the window
-/// should stay open.
-fn poll_close_flow(flow: &mut CloseFlow, pending_actions: &PendingActions) -> (bool, bool) {
+/// The outcome of polling an in-flight save-and-close (`CloseFlow::Waiting`).
+enum CloseOutcome {
+    /// No result yet — keep the window open and keep polling.
+    Pending,
+    /// The save succeeded; the window may close now.
+    Exit,
+    /// The flow ended without closing — the window stays open and the user must
+    /// be told why. `Some` carries the frontend's error text (save failure,
+    /// library write failure, …); `None` means the round-trip was lost to a
+    /// timeout, an unmounted bridge, or a dropped channel with no detail.
+    Failed(Option<String>),
+}
+
+/// Polls an in-flight save-and-close (`CloseFlow::Waiting`) once.
+///
+/// A bare `bool` would hide *why* a close failed; the spec requires close-save
+/// failures to keep the window open *and* show an error, so this preserves the
+/// frontend's error text (and distinguishes a true failure from a lost
+/// round-trip) for the caller to surface in a dialog.
+fn poll_close_flow(flow: &mut CloseFlow, pending_actions: &PendingActions) -> CloseOutcome {
     if let CloseFlow::Waiting {
         rx,
         deadline,
@@ -1296,14 +1343,27 @@ fn poll_close_flow(flow: &mut CloseFlow, pending_actions: &PendingActions) -> (b
     } = flow
     {
         match poll_action_result(rx, *deadline, request_id, pending_actions) {
-            // Save succeeded → exit. Failure keeps the window open (the frontend
-            // already shows a "Save failed" toast via the save indicator).
-            ActionOutcome::Resolved(ok) => (ok, true),
-            ActionOutcome::Lost => (false, true),
-            ActionOutcome::Pending => (false, false),
+            ActionOutcome::Resolved(result) if result.ok => CloseOutcome::Exit,
+            ActionOutcome::Resolved(result) => CloseOutcome::Failed(result.error),
+            ActionOutcome::Lost => CloseOutcome::Failed(None),
+            ActionOutcome::Pending => CloseOutcome::Pending,
         }
     } else {
-        (false, false)
+        CloseOutcome::Pending
+    }
+}
+
+/// Builds the user-facing message shown when a close-time save (or other native
+/// round-trip) fails or times out. `detail` is the frontend's error text when
+/// present; `None` covers a timeout / unmounted bridge / dropped channel.
+fn close_error_message(detail: Option<&str>) -> String {
+    match detail {
+        Some(d) if !d.trim().is_empty() => {
+            format!("Could not save before closing: {d}\n\nThe window has been kept open.")
+        }
+        _ => "Could not save before closing — the editor did not respond in time.\n\n\
+              The window has been kept open."
+            .to_string(),
     }
 }
 
@@ -1327,7 +1387,7 @@ fn poll_query_flow(
     } = flow
     {
         match poll_action_result(rx, *deadline, request_id, pending_actions) {
-            ActionOutcome::Resolved(ok) => Some(ok),
+            ActionOutcome::Resolved(result) => Some(result.ok),
             ActionOutcome::Lost => Some(!cached_dirty),
             ActionOutcome::Pending => None,
         }
@@ -1493,10 +1553,15 @@ fn run_webview_url(
                     }
                 }
             } else if matches!(&*flow, CloseFlow::Waiting { .. }) {
-                let (exit, finished) = poll_close_flow(&mut flow, &close_ctx_tick.pending_actions);
-                should_exit = exit; // RefMut derefs to CloseFlow for the call above
-                if finished && !exit {
-                    *flow = CloseFlow::Idle;
+                // RefMut derefs to CloseFlow for the call below.
+                match poll_close_flow(&mut flow, &close_ctx_tick.pending_actions) {
+                    CloseOutcome::Exit => should_exit = true,
+                    CloseOutcome::Failed(detail) => {
+                        // Keep the window open and show why (spec requirement).
+                        *flow = CloseFlow::Idle;
+                        spawn_gtk_error_dialog(detail);
+                    }
+                    CloseOutcome::Pending => {}
                 }
             }
         }
@@ -1663,13 +1728,18 @@ fn run_webview_url(
                 }
             }
         } else if matches!(close_flow, CloseFlow::Waiting { .. }) {
-            let (should_exit, finished) =
-                poll_close_flow(&mut close_flow, &close_ctx.pending_actions);
-            if should_exit {
-                close_ctx.cleanup_lock();
-                *control_flow = ControlFlow::Exit;
-            } else if finished {
-                close_flow = CloseFlow::Idle;
+            match poll_close_flow(&mut close_flow, &close_ctx.pending_actions) {
+                CloseOutcome::Exit => {
+                    close_ctx.cleanup_lock();
+                    *control_flow = ControlFlow::Exit;
+                }
+                CloseOutcome::Failed(detail) => {
+                    // Save/library write failed or the round-trip was lost: keep
+                    // the window open and tell the user why (spec requirement).
+                    close_flow = CloseFlow::Idle;
+                    show_close_error_dialog(detail.as_deref());
+                }
+                CloseOutcome::Pending => {}
             }
         }
 
@@ -1891,7 +1961,7 @@ fn lsp_send(writer: &mut impl std::io::Write, msg: &serde_json::Value) -> Result
 /// Spawns `excalidraw-preview <path>` as a fully detached process so that
 /// closing the LSP server (when Zed shuts down the language server) does not
 /// kill the preview window.
-fn spawn_preview(exe: &std::path::Path, path: &str) {
+fn spawn_preview(exe: &std::path::Path, path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -1919,7 +1989,7 @@ fn spawn_preview(exe: &std::path::Path, path: &str) {
 /// Reads the per-file lock file and probes `GET /ping`. Uses a blocking client,
 /// so it is safe to call from the synchronous LSP loop. A missing/stale lock or a
 /// failed ping reports "not live" so the caller can spawn a fresh instance.
-fn preview_is_live(path: &str) -> bool {
+fn preview_is_live(path: &std::path::Path) -> bool {
     let Ok(canonical) = std::fs::canonicalize(path) else {
         return false;
     };
@@ -1945,7 +2015,7 @@ fn preview_is_live(path: &str) -> bool {
 
 /// Sends GET /shutdown to the preview server for the given file path.
 /// Reads the port from the lock file, then calls the HTTP endpoint.
-fn shutdown_preview(path: &str) {
+fn shutdown_preview(path: &std::path::Path) {
     let canonical = match std::fs::canonicalize(path) {
         Ok(p) => p,
         Err(_) => return,
@@ -1967,31 +2037,15 @@ fn shutdown_preview(path: &str) {
 }
 
 /// Converts a `file://` URI to an absolute filesystem path.
-fn file_uri_to_path(uri: &str) -> Option<String> {
-    let path = uri.strip_prefix("file://")?;
-    Some(percent_decode(path))
-}
-
-/// Decodes percent-encoded bytes in a URI path component.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (
-                (bytes[i + 1] as char).to_digit(16),
-                (bytes[i + 2] as char).to_digit(16),
-            ) {
-                out.push(((hi << 4) | lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+///
+/// Delegates to a real URL parser so percent-encoding and platform-specific path
+/// shapes resolve correctly — not just POSIX `file:///tmp/a.excalidraw`, but also
+/// Windows drive-letter URIs (`file:///C:/Users/me/a.excalidraw`) and UNC paths
+/// (`file://server/share/a.excalidraw`). The hand-rolled prefix-strip it replaces
+/// turned `file:///C:/...` into `/C:/...`, silently breaking the LSP-driven
+/// auto-open and save-triggered reopen on Windows.
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    url::Url::parse(uri).ok()?.to_file_path().ok()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -2426,9 +2480,13 @@ mod tests {
             request_id: "close-1".to_string(),
         };
 
-        let (should_exit, finished) = poll_close_flow(&mut flow, &pending);
-        assert!(!should_exit, "a timeout must not close the window");
-        assert!(finished, "a timeout ends the flow");
+        let outcome = poll_close_flow(&mut flow, &pending);
+        // A timeout with no frontend detail → Failed(None): keep the window open
+        // and surface a generic error.
+        assert!(
+            matches!(outcome, CloseOutcome::Failed(None)),
+            "a timeout must end the flow as Failed(None), not close the window"
+        );
         assert!(
             pending.lock().unwrap().is_empty(),
             "stale pending entry must be evicted on timeout"
@@ -2457,9 +2515,11 @@ mod tests {
             request_id: "close-2".to_string(),
         };
 
-        let (should_exit, finished) = poll_close_flow(&mut flow, &pending);
-        assert!(!should_exit);
-        assert!(finished, "a closed channel ends the flow");
+        let outcome = poll_close_flow(&mut flow, &pending);
+        assert!(
+            matches!(outcome, CloseOutcome::Failed(None)),
+            "a closed channel ends the flow as Failed(None)"
+        );
         assert!(
             pending.lock().unwrap().is_empty(),
             "stale pending entry must be evicted when the channel drops"
@@ -2480,10 +2540,78 @@ mod tests {
             request_id: "close-3".to_string(),
         };
 
-        let (should_exit, finished) = poll_close_flow(&mut flow, &pending);
-        assert!(!should_exit);
-        assert!(!finished, "still within the deadline → not finished");
+        let outcome = poll_close_flow(&mut flow, &pending);
+        assert!(
+            matches!(outcome, CloseOutcome::Pending),
+            "still within the deadline → Pending"
+        );
         assert_eq!(pending.lock().unwrap().len(), 1, "entry retained while waiting");
+    }
+
+    #[test]
+    fn test_poll_close_flow_exits_on_successful_save() {
+        // A resolved ok:true close round-trip → Exit (the window may close).
+        let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(NativeActionResult {
+            action: "save".to_string(),
+            ok: true,
+            error: None,
+        })
+        .unwrap();
+        let mut flow = CloseFlow::Waiting {
+            rx,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            request_id: "close-ok".to_string(),
+        };
+
+        assert!(matches!(
+            poll_close_flow(&mut flow, &pending),
+            CloseOutcome::Exit
+        ));
+    }
+
+    #[test]
+    fn test_poll_close_flow_failed_save_preserves_error_detail() {
+        // A resolved ok:false close round-trip must surface the frontend's error
+        // text (not a bare bool) so the dialog can explain the failure.
+        let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(NativeActionResult {
+            action: "save".to_string(),
+            ok: false,
+            error: Some("disk full".to_string()),
+        })
+        .unwrap();
+        let mut flow = CloseFlow::Waiting {
+            rx,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            request_id: "close-fail".to_string(),
+        };
+
+        match poll_close_flow(&mut flow, &pending) {
+            CloseOutcome::Failed(Some(detail)) => assert_eq!(detail, "disk full"),
+            CloseOutcome::Failed(None) => panic!("error detail was dropped"),
+            CloseOutcome::Exit => panic!("a failed save must not close the window"),
+            CloseOutcome::Pending => panic!("a resolved result must not be Pending"),
+        }
+    }
+
+    #[test]
+    fn test_close_error_message_uses_detail_when_present() {
+        let msg = close_error_message(Some("disk full"));
+        assert!(msg.contains("disk full"), "detail must appear in the message");
+        assert!(msg.contains("kept open"), "must reassure the window stayed open");
+    }
+
+    #[test]
+    fn test_close_error_message_falls_back_when_no_detail() {
+        // Lost round-trip (timeout / unmounted bridge) → generic timeout copy.
+        for detail in [None, Some(""), Some("   ")] {
+            let msg = close_error_message(detail);
+            assert!(msg.contains("did not respond"), "blank detail → timeout copy");
+            assert!(msg.contains("kept open"));
+        }
     }
 
     // ── Live dirty-state query (close flow, finding 2) ──────────────────────────
@@ -2780,5 +2908,51 @@ mod tests {
         let resp = serve_library().await.into_response();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), payload);
+    }
+
+    // ── LSP file:// URI parsing (finding 1) ─────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_file_uri_to_path_posix_percent_decoded() {
+        // A normal POSIX URI with a percent-encoded space must decode to the
+        // real path, not the literal `%20`.
+        let path = file_uri_to_path("file:///Users/me/a%20b.excalidraw")
+            .expect("POSIX file URI should parse");
+        assert_eq!(path, std::path::Path::new("/Users/me/a b.excalidraw"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_file_uri_to_path_posix_plain() {
+        let path = file_uri_to_path("file:///tmp/diagram.excalidraw")
+            .expect("POSIX file URI should parse");
+        assert_eq!(path, std::path::Path::new("/tmp/diagram.excalidraw"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_file_uri_to_path_windows_drive_letter() {
+        // The regression from finding 1: the old strip-prefix turned this into
+        // `/C:/Users/me/a.excalidraw`. A real parser yields the Windows path.
+        let path = file_uri_to_path("file:///C:/Users/me/a.excalidraw")
+            .expect("Windows drive-letter URI should parse");
+        assert_eq!(path, std::path::Path::new(r"C:\Users\me\a.excalidraw"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_file_uri_to_path_windows_unc() {
+        // UNC-style host: file://server/share/... → \\server\share\...
+        let path = file_uri_to_path("file://server/share/a.excalidraw")
+            .expect("UNC file URI should parse");
+        assert_eq!(path, std::path::Path::new(r"\\server\share\a.excalidraw"));
+    }
+
+    #[test]
+    fn test_file_uri_to_path_rejects_non_file_scheme() {
+        // A non-file URI (or garbage) must not be coerced into a path.
+        assert!(file_uri_to_path("https://example.com/a.excalidraw").is_none());
+        assert!(file_uri_to_path("not a uri").is_none());
     }
 }
