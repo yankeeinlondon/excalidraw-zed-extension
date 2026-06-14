@@ -148,7 +148,7 @@ Additional flags:
 |---|---|
 | `--new <path>` | Create `<path>` as a new blank drawing (format from extension) and open the preview. Fails if the file already exists. Conflicts with the positional file arg. |
 | `--foreground` | Internal: run in the foreground without self-detaching. Set automatically on re-spawn (hidden). |
-| `--headless` | Run the HTTP server without opening a WebView window (tests / headless environments). |
+| `--headless` | Run the HTTP server without opening a WebView window (tests / headless environments). Also enabled by `EXCALIDRAW_PREVIEW_HEADLESS=true`, which propagates to LSP-spawned previews so `didOpen`/`didSave` can be integration-tested windowless. |
 | `--export-dir <dir>` | Write exports directly into `<dir>` instead of showing a native save dialog. Intended for tests and headless use. |
 
 ### Startup sequence
@@ -303,7 +303,7 @@ tokio      = { version = "1", features = ["full"] }
 notify     = "8"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-clap       = { version = "4", features = ["derive"] }
+clap       = { version = "4", features = ["derive", "env"] }   # env: EXCALIDRAW_PREVIEW_HEADLESS
 anyhow     = "1"
 sha2       = "0.11"          # for lock file path hashing
 rust-embed = "8"             # for embedding assets/ directory
