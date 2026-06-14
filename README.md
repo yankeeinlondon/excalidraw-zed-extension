@@ -101,7 +101,8 @@ Re-running the command focuses the existing window instead of opening a new one.
 
 ### Auto-save
 
-Pass `--auto-save` to enable debounced auto-save (600 ms after every change):
+Pass `--auto-save` to enable debounced auto-save (300 ms after you stop changing
+the scene, with a 2 s max-wait so continuous drawing still flushes periodically):
 
 ```
 /preview-excalidraw --auto-save
@@ -144,8 +145,14 @@ then run it via `task: spawn` in the command palette.
   contribution points (tracked upstream: zed-industries/zed#8441, #18043). If Zed ships
   extension-registered actions, a *New Excalidraw Drawing* palette action will become the
   primary creation flow (it's a thin wrapper over `--new`).
-- **"Browse libraries" doesn't work** inside the preview window — the excalidraw.com
-  round-trip needs a browser. Library items you add locally persist in
-  `<config-dir>/excalidraw-zed/library.excalidrawlib` and are shared across all diagrams.
-- **`.excalidraw.png` click-to-open:** _record Task 13 outcome here — auto-opens, or use
-  `/preview-excalidraw` as the entry point._
+- **"Browse libraries" opens in your system browser**, not inside the preview
+  window — the excalidraw.com round-trip needs a real browser, so the preview routes
+  that link (and Help / docs links) out through `open` instead of navigating away.
+  Library items you add locally persist in
+  `<config-dir>/excalidraw-zed/library.excalidrawlib` and are shared across all diagrams;
+  use **Library → Import/Export Library…** for native `.excalidrawlib` round-trips.
+- **`.excalidraw.png` is a fully editable format**, not just a viewer target. Opening
+  one (via `/preview-excalidraw`, or automatically on `didOpen` once the extension is
+  installed) decodes the scene embedded in the PNG, lets you edit it, and re-embeds the
+  scene on save so the file stays a valid Excalidraw PNG. The same applies to
+  `.excalidraw.svg`.
