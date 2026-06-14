@@ -42,3 +42,22 @@ self-contained.
   `git log -1 --format=%H <branch>` immediately after the commit, *before*
   the next subagent lands — but the captured-from-output approach is
   race-free.
+
+---
+
+## `git commit -- path1 path2 dir/` accepts directories, not just files
+
+- When committing a whole newly-added asset tree (e.g. 234 woff2 fonts under
+  `preview-binary/assets/fonts/`), pass the directory path on the command line
+  *with a trailing slash* and git will include every staged file under it —
+  no need to enumerate hundreds of paths.
+- Example from a 2026-06-13 commit: `git commit --only -F - -- preview-binary/assets/index.html preview-binary/assets/fonts/`
+  commits 235 files (1 modified `index.html` + 234 staged woff2 fonts) in one
+  call, scoped exactly to the assignment.
+- This is race-free in the same way pathspecs are: it commits *only* what's
+  staged under the listed paths, never anything else.
+- Crucial: do **not** add a bare `.` or `--all` — that would scoop up other
+  in-flight staged files from sibling subagents. Keep the pathspec explicit.
+- For very small sets (≤ ~5 files), listing the files explicitly is still
+  preferred because the resulting `git show --stat` is more readable and
+  reviews can quickly eyeball the inclusion set.
