@@ -5,9 +5,43 @@ they cannot be exercised by the headless Rust suite or jsdom-less Vitest. Run
 through this list against a real build (`just build && ./target/release/excalidraw-preview <file>`)
 on macOS, and on Linux (WebKitGTK) where noted. Check each box per platform.
 
+## Automated coverage
+
+An automated **real-WebView** smoke harness now covers the *programmatic core* of
+the highest-risk flows, shrinking (but not eliminating) the manual pass below:
+
+- `just smoke` (or `cargo nextest run --run-ignored ignored-only smoke_self_test`)
+  opens a real `wry` window and asserts, with a PASS/FAIL report + exit code:
+  1. the React app mounts and a native→JS **save** round-trip (`window.__excalidrawSave`,
+     the same global the File-menu Save and `Cmd/Ctrl+S` accelerator dispatch) writes
+     to disk via `POST /data`;
+  2. the **close-interception** dirty-state query (`window.__excalidrawPrepareClose`)
+     responds — the first step of every native close;
+  3. **external links** classify as external (handler routes them to the system
+     browser, blocks in-editor nav) and loopback URLs stay internal.
+- `embedded_assets_serve_index_bundle_and_drawing_fonts` (runs in the normal
+  headless suite) proves the embedded `index.html`, JS/CSS bundle, and all nine
+  drawing-font families' woff2 files serve over `GET /assets/**` — i.e. **fonts
+  resolve, no 404s**, the regression that motivated this pass.
+
+Status: **smoke harness PASS (4/4) and asset/font test PASS on macOS, 2026-06-14.**
+**Linux (WebKitGTK):** the smoke harness now runs on every push via the
+`smoke-linux` CI job (`.github/workflows/test.yml`), which executes the
+otherwise-`#[ignore]`d `smoke_self_test` under `Xvfb` against
+`libwebkit2gtk-4.1`. This automates the previously-manual Linux smoke run; gate
+the release on the first green CI run of that job rather than ticking it by hand.
+
+What the automation deliberately does **not** prove (still requires a human, below):
+literal AppKit `Cmd+S` key delivery and native File-menu clicks, the `rfd` 3-way
+close dialog buttons, native save/import/export file dialogs, the actual
+system-browser launch, and Dock/taskbar tile rendering. Items below that the
+harness covers programmatically are marked _(smoke-covered)_.
+
 ## Save / dirty
 
 - [ ] Edit the scene, press `Cmd+S` / `Ctrl+S` → "Saved" toast; file on disk updates.
+      _(the save bridge that the keypress drives is smoke-covered; the literal
+      `Cmd+S`/`Ctrl+S` AppKit/WebKitGTK key delivery is not — verify by hand)_
 - [ ] Edit, then trigger Save from the **native File menu** → saves (covers AppKit
       consuming `Cmd+S` before WKWebView).
 - [ ] Edit, then Save from the in-canvas **MainMenu → "Save to file"** → saves.
@@ -19,6 +53,9 @@ on macOS, and on Linux (WebKitGTK) where noted. Check each box per platform.
       loss). Covered logically by `dirty-state.test.ts`, but confirm end-to-end.
 
 ## Close confirmation
+
+_(the close flow's first step — the live dirty-state query — is smoke-covered;
+the dialog itself and its three buttons are not — verify by hand)_
 
 - [ ] Auto-save **off**, dirty scene, close window → 3-way "Unsaved changes" dialog.
   - [ ] "Save" → saves then closes.
@@ -59,8 +96,13 @@ on macOS, and on Linux (WebKitGTK) where noted. Check each box per platform.
 
 - [ ] Click Help / "Browse libraries" / any docs link → opens in the **system
       browser**, not inside the editor; the editor does not navigate away.
+      _(URL classification is smoke-covered; the actual browser launch is not —
+      verify by hand)_
 - [ ] Hand-drawn fonts (Excalifont etc.) render in-canvas and in exported SVG —
       confirms `/assets/fonts/**` resolve (no 404s in WebView devtools).
+      _(serving of every font family over `/assets/fonts/**` is automated by
+      `embedded_assets_serve_index_bundle_and_drawing_fonts`; visual rendering /
+      SVG inlining still wants a human eye)_
 
 ## Concurrency (covered by automated tests, spot-check manually)
 
