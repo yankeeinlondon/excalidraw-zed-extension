@@ -1965,7 +1965,10 @@ fn run_webview_url(
     #[cfg(target_os = "windows")]
     {
         use tao::platform::windows::WindowExtWindows;
-        let _ = menu.init_for_hwnd(window.hwnd() as isize);
+        // SAFETY: `window.hwnd()` returns the live HWND owned by the window we
+        // just built; it stays valid for the menu's lifetime (both are held by
+        // the event loop below).
+        let _ = unsafe { menu.init_for_hwnd(window.hwnd() as isize) };
     }
     let menu_channel = muda::MenuEvent::receiver();
 
