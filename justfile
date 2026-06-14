@@ -103,6 +103,18 @@ test:
     cargo nextest run
     cd {{webview}} && npm run typecheck && npm test --if-present
 
+# Automated real-WebView self-test: opens a window, drives the native↔JS bridge
+# (save + close-interception query) and external-link routing, prints a PASS/FAIL
+# report, exits non-zero on failure. Requires a display (run on a real desktop).
+# Covers the programmatic core of features/2026-06-13-rough-edges/manual-checklist.md.
+smoke: build-debug
+    #!/usr/bin/env bash
+    set -euo pipefail
+    file="$(mktemp -t excalidraw-smoke).excalidraw"
+    printf '{"type":"excalidraw","version":2,"source":"smoke","elements":[],"appState":{"viewBackgroundColor":"#ffffff"},"files":{}}' > "$file"
+    trap 'rm -f "$file"' EXIT
+    {{debug}} "$file" --smoke
+
 # Symlink ~/.local/bin/excalidraw-preview → target/release (one-time setup)
 symlink:
     mkdir -p {{home_directory()}}/.local/bin
