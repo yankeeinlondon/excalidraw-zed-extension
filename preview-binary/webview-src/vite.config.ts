@@ -52,15 +52,27 @@ function copyDrawingFontsPlugin() {
         "node_modules/@excalidraw/excalidraw/dist/prod/fonts",
       );
       const destDir = path.resolve(__dirname, "../assets/fonts");
+      // A release build that embeds the assets must ship the drawing fonts, or
+      // every runtime font fetch 404s and exported SVGs reference missing fonts
+      // (the original bug). Fail the build loudly rather than emit a broken bundle.
       if (!fs.existsSync(srcDir)) {
-        console.warn(`[copy-drawing-fonts] source not found: ${srcDir}`);
-        return;
+        throw new Error(
+          `[copy-drawing-fonts] font source not found: ${srcDir}\n` +
+            `Run \`npm install\` in preview-binary/webview-src so @excalidraw/excalidraw ` +
+            `ships its prod fonts before building the release bundle.`,
+        );
       }
       fs.cpSync(srcDir, destDir, { recursive: true });
       const families = fs
         .readdirSync(destDir, { withFileTypes: true })
         .filter((e) => e.isDirectory())
         .map((e) => e.name);
+      if (families.length === 0) {
+        throw new Error(
+          `[copy-drawing-fonts] no font families copied into ${destDir}; ` +
+            `the font source at ${srcDir} appears empty. Reinstall @excalidraw/excalidraw.`,
+        );
+      }
       console.info(
         `[copy-drawing-fonts] copied ${families.length} font families → assets/fonts/ (${families.join(", ")})`,
       );
