@@ -7,8 +7,10 @@ use zed_extension_api::{
     SlashCommandOutput, SlashCommandOutputSection, Worktree,
 };
 
-/// Must match the GitHub Release tag (v{VERSION}).
-const BINARY_VERSION: &str = "0.3.0";
+/// Must match the GitHub Release tag (v{VERSION}) **and** the `version` in
+/// `extension.toml` — enforced by `test_binary_version_matches_manifest` so an
+/// installed user never downloads a binary that predates the shipped manifest.
+const BINARY_VERSION: &str = "0.4.0";
 const BINARY_NAME: &str = "excalidraw-preview";
 
 struct ExcalidrawPreviewExtension {
@@ -296,5 +298,38 @@ mod tests {
         assert!(ExcalidrawPreviewExtension::is_valid_extension(
             &PathBuf::from("/home/user/diagrams/arch.excalidraw")
         ));
+    }
+
+    /// Parses the top-level `version = "x.y.z"` out of `extension.toml`,
+    /// ignoring keys like `schema_version` and any nested-table `version` lines.
+    fn manifest_version() -> String {
+        let manifest = include_str!("../extension.toml");
+        for line in manifest.lines() {
+            let line = line.trim();
+            // Stop at the first table header so only the top-level package
+            // version (declared before any `[...]` section) is considered.
+            if line.starts_with('[') {
+                break;
+            }
+            if let Some(rest) = line.strip_prefix("version") {
+                let value = rest.trim_start().trim_start_matches('=').trim();
+                return value.trim_matches('"').to_string();
+            }
+        }
+        panic!("extension.toml must declare a top-level `version`");
+    }
+
+    #[test]
+    fn test_binary_version_matches_manifest() {
+        // Guards the release-path drift that shipped a 0.3.0 download tag against
+        // a 0.4.0 manifest (review 3, finding 1): installed users download from
+        // releases/download/v{BINARY_VERSION}, so this constant must track the
+        // published manifest version. Bump both together before each release.
+        assert_eq!(
+            BINARY_VERSION,
+            manifest_version(),
+            "BINARY_VERSION must match the `version` in extension.toml; bump it \
+             before release so installed users fetch the matching preview binary"
+        );
     }
 }
