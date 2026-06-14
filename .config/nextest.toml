@@ -1,9 +1,8 @@
-# The integration tests each spawn a real preview binary that binds a TCP port and
-# writes a lock file. Running them concurrently causes port races ("Address already
-# in use") and lock-file contention, so they share a single-threaded test group while
-# the fast, server-less unit tests keep running in parallel.
-[test-groups]
-serial-integration = { max-threads = 1 }
+# The integration tests each spawn a real preview binary. The binary now binds an
+# ephemeral port (port 0) and reads the assigned port back from the bound socket,
+# so concurrent startups no longer race for a port — the suite is safe under
+# nextest's default parallel execution (and under `cargo test`'s threaded runner).
+# No serial test group is needed.
 
 [profile.default]
 retries = 0
@@ -11,19 +10,11 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # Integration tests spawn the preview binary; flag tests that leave orphans behind.
 leak-timeout = "500ms"
 
-[[profile.default.overrides]]
-filter = 'binary_id(excalidraw-preview-binary::integration)'
-test-group = 'serial-integration'
-
 [profile.ci]
 inherits = "default"
 retries = 2
 fail-fast = false
 failure-output = "immediate-final"
-
-[[profile.ci.overrides]]
-filter = 'binary_id(excalidraw-preview-binary::integration)'
-test-group = 'serial-integration'
 
 [profile.ci.junit]
 path = "junit.xml"
