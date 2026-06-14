@@ -181,7 +181,7 @@ Additional flags:
 | `GET /events` | SSE stream; emit `data: reload` on file change |
 | `GET /focus` | Signal WebView window to call `window.set_focus()` |
 | `GET /ping` | 200 OK liveness probe |
-| `GET /shutdown` | Graceful shutdown (called on `textDocument/didClose`) |
+| `GET /shutdown` | Graceful shutdown (window close, or test teardown) |
 | `GET /assets/*` | Serve embedded assets (rust-embed, MIME via mime_guess) |
 
 ### AppState fields
@@ -210,7 +210,14 @@ struct AppState {
 
 Implements a minimal JSON-RPC LSP so Zed can invoke the binary as a language server for `.excalidraw` files:
 - `textDocument/didOpen` → spawns `excalidraw-preview <path>` as a detached process
-- `textDocument/didClose` → sends `GET /shutdown` to the running instance
+- `textDocument/didClose` → **no-op.** The preview persists until the user closes its
+  window. Zed reuses one "preview tab" for single-clicked files and sends `didClose`
+  whenever you browse to another file, so tearing the window down here made previews
+  flicker shut while navigating. The window owns its own teardown (close button → lock
+  cleanup + server shutdown).
+- `textDocument/didSave` → reopens a preview the user closed (spawns only if no live
+  instance). This is the way to bring back a preview after closing its window, since
+  Zed does not re-send `didOpen` for an already-open buffer.
 - `initialize` / `shutdown` / `exit` handled normally
 
 ---
@@ -253,6 +260,11 @@ const bytes = await fetch(apiUrl('/data')).then(r => r.arrayBuffer());
 // Format fallback chain: try declared type first, then the other two.
 for (const type of reorderFallbacks(config.contentType)) { ... }
 
+// If every fallback fails AND the file is image/svg+xml or image/png, the scene
+// can't be reconstructed (the image was exported without an embedded scene).
+// renderReadonlyImage() then shows the raw image read-only with a banner instead
+// of erroring, so the user still gets a preview (editing is disabled).
+
 // SSE live reload — calls reloadScene() provided by App.
 const es = new EventSource(apiUrl('/events'));
 es.onmessage = debounce(async () => {
@@ -264,6 +276,13 @@ es.onmessage = debounce(async () => {
 ### App.tsx — save modes
 
 **Manual save (default):** Ctrl+S / Cmd+S or "Save to file" menu item → `POST /data`.
+
+**`.excalidraw.svg` / `.excalidraw.png` saves embed the scene.** The canonical-file save
+path passes `appState.exportEmbedScene: true` to `exportToSvg` / `exportToBlob`, so the
+written file carries the recoverable scene JSON and round-trips back into the editor.
+Without it, saving an image-format file strips the scene and the file becomes an
+unloadable plain image. (The "Export as image" menu in `export.ts` deliberately does
+*not* embed — those are clean shareable images written to a different filename.)
 
 **Auto-save:** when `autoSave` prop is `true` (set from `config.autoSave`), `onChange` is wired to a debounced save (600 ms). Only fires when element hash changes (not on viewport/selection events).
 

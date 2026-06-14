@@ -535,6 +535,84 @@ fn lsp_did_save_spawns_preview_then_reuses_live_instance() {
     let _ = child.wait();
 }
 
+/// Drives the `--lsp` server through `textDocument/didOpen` then `didClose`: the
+/// preview must keep serving after `didClose`. Zed reuses one "preview tab" and
+/// sends `didClose` whenever you browse to another file, so tearing the window
+/// down on `didClose` made previews flicker shut while navigating. The window now
+/// owns its own lifecycle, so `didClose` is a no-op.
+#[test]
+fn lsp_did_close_keeps_preview_alive() {
+    use std::io::{BufReader, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("persist.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+    let canonical = std::fs::canonicalize(&file).unwrap();
+    let lock = lock_path_for(&canonical);
+    let _ = std::fs::remove_file(&lock);
+
+    let mut child = std::process::Command::new(binary())
+        .arg("--lsp")
+        .env("EXCALIDRAW_PREVIEW_HEADLESS", "true")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn --lsp");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    lsp_write(&mut stdin, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    let _ = lsp_read(&mut stdout);
+
+    let uri = format!("file://{}", canonical.display());
+    let did_open = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"excalidraw","version":1,"text":""}}}}}}"#
+    );
+    let did_close = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didClose","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
+    );
+
+    // didOpen → preview spawns. Wait for its lock/port.
+    lsp_write(&mut stdin, &did_open);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let port = loop {
+        if let Ok(s) = std::fs::read_to_string(&lock) {
+            if let Ok(p) = s.trim().parse::<u16>() {
+                break p;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "didOpen never spawned a preview (no lock file at {})",
+            lock.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let (status, _) = http_get(&format!("http://127.0.0.1:{port}/ping"));
+    assert_eq!(status, 200, "spawned preview not serving");
+
+    // didClose must NOT tear the preview down: it keeps serving on the same port.
+    lsp_write(&mut stdin, &did_close);
+    std::thread::sleep(Duration::from_millis(500));
+    let (status, body) = http_get(&format!("http://127.0.0.1:{port}/ping"));
+    assert_eq!(status, 200, "preview must survive didClose (persist until window close)");
+    assert_eq!(body, "OK");
+    assert!(lock.exists(), "lock file must remain after didClose");
+
+    // Tear down the detached preview, then the LSP server.
+    let _ = http_get(&format!("http://127.0.0.1:{port}/shutdown"));
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = std::fs::remove_file(&lock);
+
+    let exit = r#"{"jsonrpc":"2.0","method":"exit"}"#;
+    let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", exit.len(), exit);
+    let _ = stdin.flush();
+    drop(stdin);
+    let _ = child.wait();
+}
+
 /// Walks `preview-binary/assets/fonts` and returns every embedded drawing-font
 /// woff2 as the `/assets/...` URL path the Excalidraw runtime fetches it at.
 fn embedded_font_routes() -> Vec<String> {

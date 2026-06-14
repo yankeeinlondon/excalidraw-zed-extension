@@ -2225,11 +2225,12 @@ fn run_lsp_server() -> Result<()> {
             }
 
             "textDocument/didClose" => {
-                if let Some(uri) = msg["params"]["textDocument"]["uri"].as_str() {
-                    if let Some(path) = file_uri_to_path(uri) {
-                        shutdown_preview(&path);
-                    }
-                }
+                // Intentionally a no-op: the preview window persists until the user
+                // closes it. Zed reuses one "preview tab" for single-clicked files,
+                // so it sends didClose whenever you browse to another file — tearing
+                // the window down here made previews flicker shut while navigating.
+                // The window owns its own lifecycle (close button → lock cleanup +
+                // server shutdown); reopening a closed preview is handled by didSave.
             }
 
             "textDocument/didSave" => {
@@ -2336,29 +2337,6 @@ fn preview_is_live(path: &std::path::Path) -> bool {
         .send()
         .map(|r| r.status().is_success())
         .unwrap_or(false)
-}
-
-/// Sends GET /shutdown to the preview server for the given file path.
-/// Reads the port from the lock file, then calls the HTTP endpoint.
-fn shutdown_preview(path: &std::path::Path) {
-    let canonical = match std::fs::canonicalize(path) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let lock_path = get_lock_path(&canonical);
-    let port_str = match std::fs::read_to_string(&lock_path) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    if let Ok(port) = port_str.trim().parse::<u16>() {
-        let url = format!("http://127.0.0.1:{}/shutdown", port);
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build();
-        if let Ok(client) = client {
-            let _ = client.get(&url).send();
-        }
-    }
 }
 
 /// Converts a `file://` URI to an absolute filesystem path.
