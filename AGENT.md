@@ -150,6 +150,7 @@ Additional flags:
 | `--foreground` | Internal: run in the foreground without self-detaching. Set automatically on re-spawn (hidden). |
 | `--headless` | Run the HTTP server without opening a WebView window (tests / headless environments). Also enabled by `EXCALIDRAW_PREVIEW_HEADLESS=true`, which propagates to LSP-spawned previews so `didOpen`/`didSave` can be integration-tested windowless. |
 | `--export-dir <dir>` | Write exports directly into `<dir>` instead of showing a native save dialog. Intended for tests and headless use. |
+| `--smoke` | Open a real WebView and run an automated self-test: drive the native→JS bridge (save, close-interception query) and external-link classification, print a PASS/FAIL report, then exit (0 = all passed, 1 = any failed). Implies `--foreground`, overrides `--headless` (needs a window). Run via `just smoke`. See `features/2026-06-13-rough-edges/manual-checklist.md`. |
 
 ### Startup sequence
 
@@ -385,6 +386,7 @@ just release
 | `just release` | UI + binary + extension WASM |
 | `just install-locally` | One-shot local install: prereq checks + `ui` + `build` + `symlink`, with progress feedback |
 | `just test` | `cargo nextest run` + webview `typecheck` (`tsc --noEmit`) + vitest |
+| `just smoke` | Automated real-WebView self-test (`--smoke`): native↔JS bridge + external-link routing, PASS/FAIL report. Needs a display. |
 | `just symlink` | One-time: symlink `~/.local/bin/excalidraw-preview` → `target/release` |
 | `just dev` | Debug build + Vite dev server + WebView window in parallel |
 | `just dev-ui` | Vite dev server only |
