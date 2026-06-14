@@ -30,6 +30,29 @@ jobs:
           name: junit-${{ matrix.os }}
           path: target/nextest/ci/junit.xml
 
+  smoke-linux:
+    name: Smoke (Linux/WebKitGTK, real WebView)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libglib2.0-dev libatk1.0-dev libgtk-3-dev \
+            xvfb
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      # The smoke test (`smoke_self_test_reports_all_checks_passing`) is
+      # `#[ignore]`d because it opens a *real* `wry`/WebKitGTK window. Run it under
+      # a virtual X display so WebKitGTK close-interception, the native→JS save
+      # bridge, and external-link routing are verified on Linux on every push —
+      # the gap the manual checklist used to track by hand.
+      - name: Run real-WebView smoke harness under Xvfb
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x1024x24" \
+            cargo nextest run --profile ci --run-ignored ignored-only smoke_self_test
+
   webview:
     name: Webview (vitest)
     runs-on: ubuntu-latest
