@@ -15,6 +15,7 @@ export default defineConfig(({ command }) => {
     plugins: [
       isDev ? mockApiPlugin() : null,
       react(),
+      isDev ? null : copyDrawingFontsPlugin(),
     ].filter(Boolean),
     base: "/assets/",
     build: {
@@ -23,6 +24,49 @@ export default defineConfig(({ command }) => {
     },
   };
 });
+
+// ── Production-only: copy Excalidraw's drawing fonts into the embedded assets ──
+//
+// Excalidraw's runtime font loader fetches the seven hand-drawn font families
+// (Excalifont, Nunito, ComicShanns, Lilita, Cascadia, Virgil, Xiaolai) from
+// `${EXCALIDRAW_ASSET_PATH}fonts/<Family>/<hashed>.woff2` at runtime. The bundle
+// ships these as `node_modules/@excalidraw/excalidraw/dist/prod/fonts/`; Vite's
+// own asset graph never emits them, so without this copy every drawing-font fetch
+// 404s and exported SVGs reference fonts that aren't there.
+//
+// With `EXCALIDRAW_ASSET_PATH = "/assets/"`, the runtime requests
+// `/assets/fonts/<Family>/…woff2`, which the Rust server resolves to the embedded
+// `assets/fonts/…` path (rust-embed `folder = "assets/"`). So the destination is
+// `<outDir>/fonts` = `preview-binary/assets/fonts`.
+//
+// Implemented with `fs.cpSync` in `closeBundle` (no extra dependency, guaranteed
+// to work on Vite 8) rather than vite-plugin-static-copy.
+function copyDrawingFontsPlugin() {
+  return {
+    name: "copy-drawing-fonts",
+    closeBundle() {
+      const fs = require("fs") as typeof import("fs");
+      const path = require("path") as typeof import("path");
+      const srcDir = path.resolve(
+        __dirname,
+        "node_modules/@excalidraw/excalidraw/dist/prod/fonts",
+      );
+      const destDir = path.resolve(__dirname, "../assets/fonts");
+      if (!fs.existsSync(srcDir)) {
+        console.warn(`[copy-drawing-fonts] source not found: ${srcDir}`);
+        return;
+      }
+      fs.cpSync(srcDir, destDir, { recursive: true });
+      const families = fs
+        .readdirSync(destDir, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name);
+      console.info(
+        `[copy-drawing-fonts] copied ${families.length} font families → assets/fonts/ (${families.join(", ")})`,
+      );
+    },
+  };
+}
 
 // ── Dev-only mock API ─────────────────────────────────────────────────────────
 
@@ -169,6 +213,29 @@ function mockApiPlugin() {
           res.writeHead(500);
           res.end(`read failed: ${e}`);
         }
+      });
+
+      // Narrow WebView↔Rust bridge routes. The dev mock just acknowledges them
+      // so `?file=` flows don't 404 when the frontend reports dirty state or a
+      // native action result.
+      const ack = (req: import("http").IncomingMessage, res: import("http").ServerResponse) => {
+        req.on("data", () => {});
+        req.on("end", () => {
+          res.writeHead(200);
+          res.end("ok");
+        });
+      };
+      server.middlewares.use("/dirty", ack);
+      server.middlewares.use("/native-action-result", ack);
+
+      // Native library import is a Rust-dialog flow with no browser equivalent;
+      // in dev there's no native menu to trigger it, so just answer 204 (cancel).
+      server.middlewares.use("/native-library-request", (req: import("http").IncomingMessage, res: import("http").ServerResponse) => {
+        req.on("data", () => {});
+        req.on("end", () => {
+          res.writeHead(204);
+          res.end();
+        });
       });
 
       server.middlewares.use("/events", (req: import("http").IncomingMessage, res: import("http").ServerResponse) => {
