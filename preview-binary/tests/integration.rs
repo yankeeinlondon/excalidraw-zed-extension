@@ -534,3 +534,143 @@ fn lsp_did_save_spawns_preview_then_reuses_live_instance() {
     drop(stdin);
     let _ = child.wait();
 }
+
+/// Walks `preview-binary/assets/fonts` and returns every embedded drawing-font
+/// woff2 as the `/assets/...` URL path the Excalidraw runtime fetches it at.
+fn embedded_font_routes() -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("woff2") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let mut files = Vec::new();
+    walk(&assets.join("fonts"), &mut files);
+    files
+        .iter()
+        .map(|p| {
+            // Build the URL with `/` separators regardless of host OS so the test
+            // exercises the same browser-style path the Excalidraw runtime fetches
+            // (`/assets/fonts/<Family>/<file>.woff2`) on Windows as on Unix.
+            let rel = p.strip_prefix(&assets).unwrap();
+            let url_path = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("/assets/{url_path}")
+        })
+        .collect()
+}
+
+/// The embedded UI must serve its index, JS/CSS bundle, and — critically — the
+/// hand-drawn font woff2 files. Missing fonts were the originally reported bug:
+/// every runtime font fetch 404'd and exported SVGs referenced absent fonts. This
+/// proves the rust-embed → `GET /assets/fonts/**` path resolves for the real
+/// embedded assets, automating the "fonts resolve, no 404s" manual-checklist item.
+#[test]
+fn embedded_assets_serve_index_bundle_and_drawing_fonts() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+
+    let preview = Preview::spawn(&file, &[]);
+
+    // index.html at the root.
+    let (status, index) = http_get(&preview.url("/"));
+    assert_eq!(status, 200, "GET / must serve the embedded index.html");
+    assert!(
+        index.contains("EXCALIDRAW_ASSET_PATH"),
+        "index.html must set the asset path before the module loads; got: {index}"
+    );
+
+    // Every JS/CSS bundle the index references must resolve.
+    for asset in index
+        .match_indices("/assets/assets/")
+        .filter_map(|(i, _)| index[i..].split(['"', '\'']).next())
+    {
+        let (status, body) = http_get(&preview.url(asset));
+        assert_eq!(status, 200, "bundle asset {asset} must serve (got {status})");
+        assert!(!body.is_empty(), "bundle asset {asset} was empty");
+    }
+
+    // The drawing fonts must be present and served — the regression that
+    // motivated this whole pass. Sample one woff2 per family so a single missing
+    // family is caught without fetching all 234 files over HTTP.
+    let routes = embedded_font_routes();
+    assert!(
+        routes.len() >= 9,
+        "expected the copied font families' woff2 files to be embedded, found {} files",
+        routes.len()
+    );
+    let mut families_checked = std::collections::HashSet::new();
+    for route in &routes {
+        // /assets/fonts/<Family>/<file>.woff2 → key on <Family>, one probe each.
+        let family = route.split('/').nth(3).unwrap_or("").to_string();
+        if !families_checked.insert(family) {
+            continue;
+        }
+        let resp = reqwest::blocking::Client::new()
+            .get(preview.url(route))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .expect("font request failed");
+        assert_eq!(resp.status().as_u16(), 200, "font {route} must serve, not 404");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = resp.bytes().expect("font body");
+        assert!(!bytes.is_empty(), "font {route} served an empty body");
+        assert!(
+            ct.contains("woff2") || ct.contains("octet-stream"),
+            "font {route} served unexpected content-type {ct}"
+        );
+    }
+    assert!(
+        families_checked.len() >= 9,
+        "expected ≥9 font families, checked {}",
+        families_checked.len()
+    );
+}
+
+/// End-to-end self-test of the native shell against a *real* WebView: runs the
+/// binary in `--smoke` mode and asserts a clean (exit 0) report. This exercises
+/// the OS-specific paths unit tests cannot — actual `wry` window creation, React
+/// mount + asset/font fetch, `evaluate_script` delivery, the
+/// `/native-action-result` round-trip, and the close-interception state machine.
+///
+/// `#[ignore]` because it opens a real window and so needs a display; CI/headless
+/// runs skip it. Run it on a desktop with `just smoke` or
+/// `cargo nextest run --run-ignored ignored-only smoke_self_test`.
+#[test]
+#[ignore = "opens a real WebView window; needs a display. Run via `just smoke`."]
+fn smoke_self_test_reports_all_checks_passing() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("smoke.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+    let lock = lock_path_for(&std::fs::canonicalize(&file).unwrap());
+    let _ = std::fs::remove_file(&lock);
+
+    let status = std::process::Command::new(binary())
+        .arg(&file)
+        .arg("--smoke")
+        .status()
+        .expect("failed to spawn --smoke");
+    let _ = std::fs::remove_file(&lock);
+
+    assert!(
+        status.success(),
+        "--smoke reported a failing check (exit {:?})",
+        status.code()
+    );
+}
