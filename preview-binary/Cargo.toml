@@ -59,3 +59,6 @@ tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 sha2 = "0.11"
 reqwest = { version = "0.13", features = ["blocking"] }
+# Build file:// URIs in the LSP tests the way a real client does, so they are
+# valid and percent-encoded on every platform (not just POSIX).
+url = "2"

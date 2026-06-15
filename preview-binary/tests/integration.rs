@@ -487,8 +487,11 @@ fn lsp_did_save_spawns_preview_then_reuses_live_instance() {
     lsp_write(&mut stdin, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
     let _ = lsp_read(&mut stdout);
 
-    // Percent-encode spaces the way a real LSP client (Zed) would.
-    let uri = format!("file://{}", canonical.display()).replace(' ', "%20");
+    // Build the URI the way a real LSP client (Zed) does: a platform-correct,
+    // percent-encoded file:// URI. `format!("file://{path}")` only happens to be
+    // valid on POSIX — on Windows it yields `file://C:\…`, which never decodes
+    // back to a path, so the spawn never fires.
+    let uri = url::Url::from_file_path(&canonical).unwrap().to_string();
     let did_save = format!(
         r#"{{"jsonrpc":"2.0","method":"textDocument/didSave","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
     );
@@ -566,7 +569,8 @@ fn lsp_did_close_keeps_preview_alive() {
     lsp_write(&mut stdin, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
     let _ = lsp_read(&mut stdout);
 
-    let uri = format!("file://{}", canonical.display());
+    // Platform-correct file:// URI (see lsp_did_save for why format! is wrong).
+    let uri = url::Url::from_file_path(&canonical).unwrap().to_string();
     let did_open = format!(
         r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"excalidraw","version":1,"text":""}}}}}}"#
     );
