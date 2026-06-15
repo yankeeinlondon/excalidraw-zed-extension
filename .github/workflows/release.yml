@@ -46,6 +46,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The webview bundle (assets/assets/*.js, *.css) is build output, not
+      # committed to git, but rust-embed embeds assets/ at compile time. Build
+      # the UI before cargo so the released binary actually serves the app
+      # instead of an index.html referencing an absent bundle.
+      - name: Build webview UI
+        run: cd preview-binary/webview-src && npm ci && npm run build
+
       - name: Build binary
         run: cargo build --release --target ${{ matrix.target }} -p excalidraw-preview-binary
 

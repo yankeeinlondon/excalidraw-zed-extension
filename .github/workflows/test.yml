@@ -22,6 +22,14 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libglib2.0-dev libatk1.0-dev libgtk-3-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # rust-embed bakes assets/ in at compile time and the webview bundle isn't
+      # committed, so build the UI before the tests that assert it serves
+      # (embedded_assets_serve_index_bundle_and_drawing_fonts).
+      - name: Build webview UI
+        run: cd preview-binary/webview-src && npm ci && npm run build
       - run: cargo nextest run --profile ci
       - name: Upload JUnit report
         if: always()
@@ -43,6 +51,13 @@ jobs:
             xvfb
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The smoke test opens a real WebView and loads the embedded app, so the
+      # bundle (uncommitted build output) must exist before cargo compiles it in.
+      - name: Build webview UI
+        run: cd preview-binary/webview-src && npm ci && npm run build
       # The smoke test (`smoke_self_test_reports_all_checks_passing`) is
       # `#[ignore]`d because it opens a *real* `wry`/WebKitGTK window. Run it under
       # a virtual X display so WebKitGTK close-interception, the native→JS save
