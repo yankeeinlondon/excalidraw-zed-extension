@@ -11,8 +11,10 @@ default:
     @just --list | grep -v 'default'
     @echo
 
-# Build the release binary (embeds current assets/)
-build:
+# Build the release binary. Depends on `ui` because the webview bundle is
+# embedded (rust-embed) at compile time and is not committed, so the UI must be
+# built first or the binary embeds nothing.
+build: ui
     cargo build -p excalidraw-preview-binary --release
 
 # Build the debug binary
@@ -30,8 +32,10 @@ commit:
 ui:
     cd {{webview}} && npm install && npm run build
 
-# Full release: UI + binary + extension WASM
-release: ui build build-ext
+# Full release: UI + binary + extension WASM. `build` already depends on `ui`
+# (just runs each dependency once per invocation), so listing it here would be
+# redundant.
+release: build build-ext
 
 # One-shot local install: check prereqs, build UI + binary, symlink onto PATH
 install-locally:
@@ -69,13 +73,9 @@ install-locally:
         ok "wasm32-wasip1 installed"
     fi
 
-    step "Building the webview UI (npm install + vite build)"
-    just ui
-    ok "UI built → preview-binary/assets/"
-
-    step "Building the release binary"
+    step "Building the webview UI + release binary (npm install + vite build, then cargo)"
     just build
-    ok "binary built → {{release}}"
+    ok "UI built → preview-binary/assets/ and binary built → {{release}}"
 
     step "Linking the binary onto your PATH"
     just symlink
