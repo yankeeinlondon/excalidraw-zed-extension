@@ -69,10 +69,31 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$ASSET"
           echo "ASSET=$ASSET" >> "$GITHUB_ENV"
 
+      # Upload this target's binary only — no body/notes here. When every matrix
+      # job generated release notes, each (× re-runs) appended its own "Full
+      # Changelog" line, so the body filled up with duplicates. Notes are now
+      # written exactly once by the `notes` job below.
       - name: Upload binary
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ASSET }}
-          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Generate the changelog once and set it as the body (replacing, not
+  # appending), so re-running the release for a tag never duplicates notes.
+  notes:
+    name: Release notes
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate and set release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          body=$(gh api -X POST \
+            "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="${{ github.ref_name }}" --jq .body)
+          gh release edit "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --notes "$body"
