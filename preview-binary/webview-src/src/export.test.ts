@@ -28,6 +28,7 @@ describe("exportFilename", () => {
     ["png", "diagram.png"],
     ["png2x", "diagram.png"],
     ["svg", "diagram.svg"],
+    ["svg-scene", "diagram.excalidraw.svg"],
     ["scene", "diagram.excalidraw"],
   ])("maps %s to %s", (kind, expected) => {
     expect(exportFilename("diagram", kind)).toBe(expected);
@@ -46,6 +47,20 @@ describe("postExport", () => {
     expect(url).toBe("/export?name=diagram.svg");
     expect((init.headers as Record<string, string>)["Content-Type"]).toBe("image/svg+xml");
     expect(init.body).toBe("<svg>mock</svg>");
+  });
+
+  it("embeds the scene for an editable svg-scene export", async () => {
+    const { exportToSvg } = await import("@excalidraw/excalidraw");
+    (exportToSvg as ReturnType<typeof vi.fn>).mockClear();
+    const fetchFn = fetchStub(200, "/home/user/diagram.excalidraw.svg");
+    const result = await postExport(fakeApi, "diagram", "svg-scene", fetchFn);
+    expect(result).toBe("/home/user/diagram.excalidraw.svg");
+    const [url] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string];
+    expect(url).toBe("/export?name=diagram.excalidraw.svg");
+    const svgArgs = (exportToSvg as ReturnType<typeof vi.fn>).mock.calls[0][0] as {
+      appState: { exportEmbedScene?: boolean };
+    };
+    expect(svgArgs.appState.exportEmbedScene).toBe(true);
   });
 
   it("returns null when the server reports the dialog was cancelled (204)", async () => {

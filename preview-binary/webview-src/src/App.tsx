@@ -617,6 +617,33 @@ export default function App({
       void handleExport(kind as ExportKind);
     };
 
+    // Apply queued "Browse libraries" installs. Fired by the SSE `library` event
+    // after the user clicked "Add to Excalidraw" on libraries.excalidraw.com: the
+    // server fetched the raw document(s) and parked them, and we now merge each
+    // into the panel. Excalidraw's updateLibrary parses a Blob in either the v1
+    // (`library`) or v2 (`libraryItems`) shape, so no format handling lives here.
+    // The resulting onLibraryChange persists the merged set via handleLibraryChange.
+    window.__excalidrawApplyPendingLibraries = async (): Promise<void> => {
+      const api = apiRef.current;
+      if (!api) return;
+      try {
+        const res = await fetch("/pending-library");
+        if (!res.ok) return;
+        const { libraries } = (await res.json()) as { libraries?: unknown };
+        if (!Array.isArray(libraries) || libraries.length === 0) return;
+        for (const raw of libraries as string[]) {
+          const merged = await api.updateLibrary({
+            libraryItems: new Blob([raw], { type: "application/json" }),
+            merge: true,
+            openLibraryMenu: true,
+          });
+          libraryItemsRef.current = merged;
+        }
+      } catch {
+        // server gone / malformed library — leave the panel as-is
+      }
+    };
+
     // Live dirty-state query for the native close flow. Reports the *current*
     // dirtyRef (ok:true ⇒ no unsaved changes ⇒ safe to close) so native code
     // decides from truth rather than a possibly-stale POST /dirty (finding 2).
@@ -751,6 +778,7 @@ export default function App({
     return () => {
       delete window.__excalidrawSave;
       delete window.__excalidrawExport;
+      delete window.__excalidrawApplyPendingLibraries;
       delete window.__excalidrawPrepareClose;
       delete window.__excalidrawImportLibrary;
       delete window.__excalidrawExportLibrary;
@@ -784,6 +812,13 @@ export default function App({
         initialData={{ ...initialData, scrollToContent: true }}
         theme={resolvedTheme}
         name={name}
+        // Point the built-in "Browse libraries" round-trip at our server's
+        // landing page instead of excalidraw.com. The libraries site opens in the
+        // system browser and its "Add to Excalidraw" button returns here as
+        // `…/library-install#addLibrary=<url>`; that page hands the URL to the
+        // server, which fetches it and pushes it back over SSE (the `library`
+        // event runs __excalidrawApplyPendingLibraries below).
+        libraryReturnUrl={`${window.location.origin}/library-install`}
         onChange={handleChange}
         onLibraryChange={handleLibraryChange}
       >
@@ -799,6 +834,9 @@ export default function App({
           <MainMenu.Item onSelect={() => void handleExport("png")}>Export PNG</MainMenu.Item>
           <MainMenu.Item onSelect={() => void handleExport("png2x")}>Export PNG (2x)</MainMenu.Item>
           <MainMenu.Item onSelect={() => void handleExport("svg")}>Export SVG</MainMenu.Item>
+          <MainMenu.Item onSelect={() => void handleExport("svg-scene")}>
+            Export editable SVG (.excalidraw.svg)
+          </MainMenu.Item>
           <MainMenu.Item onSelect={() => void handleExport("scene")}>
             Export scene (.excalidraw)
           </MainMenu.Item>

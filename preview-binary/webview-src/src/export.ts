@@ -1,7 +1,7 @@
 import { exportToSvg, exportToBlob, serializeAsJSON } from "@excalidraw/excalidraw";
 import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
 
-export type ExportKind = "png" | "png2x" | "svg" | "scene";
+export type ExportKind = "png" | "png2x" | "svg" | "svg-scene" | "scene";
 
 /** Maps an export kind to the suggested file name shown in the native save dialog. */
 export function exportFilename(baseName: string, kind: ExportKind): string {
@@ -11,6 +11,11 @@ export function exportFilename(baseName: string, kind: ExportKind): string {
       return `${baseName}.png`;
     case "svg":
       return `${baseName}.svg`;
+    case "svg-scene":
+      // Editable SVG: the scene JSON is embedded, so the file round-trips back
+      // into the editor. Suffix it `.excalidraw.svg` so the preview treats it as
+      // an Excalidraw scene rather than a plain image.
+      return `${baseName}.excalidraw.svg`;
     case "scene":
       return `${baseName}.excalidraw`;
   }
@@ -32,6 +37,18 @@ async function buildExportPayload(
   switch (kind) {
     case "svg": {
       const svg = await exportToSvg({ elements, appState, files });
+      return { body: svg.outerHTML, mime: "image/svg+xml" };
+    }
+    case "svg-scene": {
+      // exportEmbedScene writes the recoverable scene JSON into the SVG so the
+      // exported `.excalidraw.svg` re-opens as an editable scene (the path that
+      // turns a `.excalidraw` into a `.excalidraw.svg`). Plain "svg" deliberately
+      // omits this to produce a clean shareable image.
+      const svg = await exportToSvg({
+        elements,
+        appState: { ...appState, exportEmbedScene: true },
+        files,
+      });
       return { body: svg.outerHTML, mime: "image/svg+xml" };
     }
     case "png":

@@ -109,13 +109,24 @@ export function computeFilesFingerprint(
  * Fingerprint of the parts of the scene that constitute a "real" change for
  * dirty-tracking: the element graph, the embedded files, and the persisted /
  * export-related appState. Excludes viewport pan/zoom and selection.
+ *
+ * Deleted elements are filtered out first so the fingerprint matches exactly
+ * what `serializeAsJSON` writes to disk (non-deleted elements only). This is
+ * essential because Excalidraw's `onChange` reports elements *including* deleted
+ * ones while the save path fingerprints `api.getSceneElements()` (non-deleted);
+ * hashing the raw arrays would make a freshly-saved scene read as dirty whenever
+ * any deleted element lingered in the array, so a save would never be
+ * acknowledged ("Unsaved changes" after Ctrl+S).
  */
 export function computeSceneHash(
   elements: readonly ExcalidrawElement[],
   appState: Partial<ExcalidrawAppState> | null | undefined,
   files: BinaryFiles | null | undefined,
 ): string {
-  const elementsHash = hashElementsVersion(elements);
+  const nonDeleted = elements.filter(
+    (element) => !(element as { isDeleted?: boolean }).isDeleted,
+  );
+  const elementsHash = hashElementsVersion(nonDeleted);
   const filesKey = computeFilesFingerprint(files);
   const appStateKey = computeAppStateFingerprint(appState);
   return `${elementsHash}|${filesKey}|${appStateKey}`;

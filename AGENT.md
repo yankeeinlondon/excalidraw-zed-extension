@@ -170,7 +170,10 @@ Additional flags:
 6. Bind axum server on ephemeral port (or `--port`).
 7. Write port to lock file.
 8. Spawn file watcher thread (notify v6, 80 ms debounce → broadcast channel).
-9. Open WebView window at `http://127.0.0.1:{port}`.
+9. Open WebView window at `http://localhost:{port}` (the server binds `127.0.0.1`;
+   the WebView uses the `localhost` *hostname* deliberately — WebKit only treats
+   `localhost` as a secure context, and a bare loopback IP leaves
+   `navigator.clipboard` undefined, breaking Excalidraw copy/paste).
 10. On window close: remove lock file, shut down server.
 
 ### HTTP Routes
@@ -183,8 +186,11 @@ Additional flags:
 | `POST /data` | Write request body back to disk (save from WebView) |
 | `GET /library` | Read the shared library file; return its `.excalidrawlib` JSON |
 | `POST /library` | Persist library items to the shared library file |
+| `GET /library-install` | Landing page for the "Browse libraries" round-trip (`libraryReturnUrl`); reads `#addLibrary=<url>` and POSTs it to `/install-library` |
+| `POST /install-library` | `{ libraryUrl }`: server-side fetch (allow-listed https hosts) of the chosen `.excalidrawlib`, validate, queue it, broadcast `library` |
+| `GET /pending-library` | Drain queued installs as `{ libraries: [rawDoc, …] }` for the WebView to feed to `updateLibrary` |
 | `POST /export` | Receive exported bytes; write via native save dialog (or `--export-dir`) |
-| `GET /events` | SSE stream; emit `data: reload` on file change |
+| `GET /events` | SSE stream; emit `data: reload` on file change, `data: library` after a "Browse libraries" install |
 | `GET /focus` | Signal WebView window to call `window.set_focus()` |
 | `GET /ping` | 200 OK liveness probe |
 | `GET /shutdown` | Graceful shutdown (window close, or test teardown) |
@@ -199,11 +205,29 @@ struct AppState {
     content_type: String,   // MIME string
     file_name: String,
     auto_save: bool,        // forwarded to /config → frontend
-    broadcast_tx: broadcast::Sender<()>,
+    broadcast_tx: broadcast::Sender<PreviewEvent>,      // SSE: Reload (file) / Library (install)
     focus_tx: Arc<watch::Sender<bool>>,
     export_tx: std::sync::mpsc::Sender<ExportRequest>, // POST /export → UI-thread dialog
     export_dir: Option<PathBuf>,                        // --export-dir: bypass dialog
+    pending_libraries: Arc<Mutex<Vec<String>>>,         // queued "Browse libraries" installs
 }
+```
+
+Library browse/install flow (offline-friendly, since the click lands in the system
+browser, not the WebView):
+
+1. `<Excalidraw libraryReturnUrl={origin + "/library-install"}>` — the built-in
+   "Browse libraries" button opens libraries.excalidraw.com in the system browser
+   with this return URL.
+2. "Add to Excalidraw" there redirects the browser to `…/library-install#addLibrary=<url>`.
+3. `GET /library-install` serves a tiny page that reads the fragment and `POST`s the
+   URL to `/install-library`.
+4. The server fetches the raw `.excalidrawlib` (allow-listed https hosts only — SSRF
+   guard), validates it, queues it, and broadcasts `PreviewEvent::Library`.
+5. The WebView's SSE handler runs `window.__excalidrawApplyPendingLibraries`, which
+   drains `GET /pending-library` and feeds each raw doc to `updateLibrary` as a Blob
+   (Excalidraw parses both v1 `library` and v2 `libraryItems`); `onLibraryChange`
+   then persists the merged set via `POST /library`.
 ```
 
 ### ConfigResponse (camelCase via serde)
@@ -287,8 +311,15 @@ es.onmessage = debounce(async () => {
 path passes `appState.exportEmbedScene: true` to `exportToSvg` / `exportToBlob`, so the
 written file carries the recoverable scene JSON and round-trips back into the editor.
 Without it, saving an image-format file strips the scene and the file becomes an
-unloadable plain image. (The "Export as image" menu in `export.ts` deliberately does
-*not* embed — those are clean shareable images written to a different filename.)
+unloadable plain image. (The plain "Export PNG/SVG" menu items in `export.ts`
+deliberately do *not* embed — those are clean shareable images written to a different
+filename.)
+
+**Export menu — converting a `.excalidraw` to `.excalidraw.svg`.** The "Export editable
+SVG (.excalidraw.svg)" menu item (`ExportKind` `"svg-scene"`) writes a scene-embedded SVG
+via the native save dialog, giving a graceful conversion path from a JSON scene to an
+editable `.excalidraw.svg`. Equivalently, copy/paste between two preview windows works now
+that the WebView loads from a secure-context `localhost` origin (see startup step 9).
 
 **Auto-save:** when `autoSave` prop is `true` (set from `config.autoSave`), `onChange` is wired to a debounced save (600 ms). Only fires when element hash changes (not on viewport/selection events).
 
@@ -467,3 +498,5 @@ After UI changes are done: `just ui && just build` to bake them into the release
 - **Lock file cleanup**: always remove `$TMPDIR/excalidraw-{sha256}.lock` on exit. Use a `Drop` impl to handle panics and signals.
 - **Format detection**: detect by file *extension*, not by sniffing bytes. Extension is authoritative; fallback chain handles mismatches.
 - **`scrollToContent: true`**: must be set on `initialData` passed to `<Excalidraw>` so the diagram auto-fits the window on first load.
+- **macOS close dialog re-entrancy**: the tao close flow's `confirm_close_dialog()` is a *blocking* `NSAlert.runModal()` that pumps the run loop and re-enters the event-loop closure on the 100 ms tick. The `CloseFlow` must be moved out of `Querying` (→ `Idle`) **before** the dialog is shown, or the re-entrant tick re-polls the consumed oneshot, falls back to the cached (still-dirty) state, and reopens the dialog — making "Don't Save" loop forever. The Linux path sidesteps this with an async dialog; both must leave `Querying` before prompting.
+- **macOS clipboard keyboard shortcuts need an Edit menu**: AppKit only delivers `Cmd+C`/`Cmd+V`/`Cmd+X`/`Cmd+A`/`Cmd+Z` to the focused WKWebView when the menu bar has an Edit menu wired to the standard `copy:`/`paste:`/… selectors. `build_menu()` therefore includes an Edit submenu of `PredefinedMenuItem`s (Undo/Redo/Cut/Copy/Paste/Select All); without it those shortcuts are swallowed and only the WebView's right-click context menu can copy/paste. Linux/WebKitGTK delivers them to web content natively, so its in-WebView menu needs no Edit entries. (`Cmd+S` is handled separately by the File → Save accelerator.)

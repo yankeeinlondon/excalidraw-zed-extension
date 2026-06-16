@@ -181,4 +181,20 @@ describe("computeSceneHash", () => {
     const b = computeSceneHash(els(1), appState({ scrollX: 500, gridSize: 20 }), filesOf({}));
     expect(a).toBe(b);
   });
+
+  it("ignores deleted elements so onChange (incl. deleted) matches the saved scene", () => {
+    // onChange reports elements *including* deleted ones; the save path
+    // fingerprints getSceneElements() (non-deleted only). Both must hash equal
+    // for the same live scene, else a saved scene reads as dirty forever
+    // ("Unsaved changes" after Ctrl+S).
+    const withDeleted = [
+      { id: "a" },
+      { id: "b", isDeleted: true },
+    ] as unknown as readonly ExcalidrawElement[];
+    const nonDeletedOnly = [{ id: "a" }] as unknown as readonly ExcalidrawElement[];
+
+    expect(
+      computeSceneHash(withDeleted, appState({ gridSize: 20 }), filesOf({})),
+    ).toBe(computeSceneHash(nonDeletedOnly, appState({ gridSize: 20 }), filesOf({})));
+  });
 });

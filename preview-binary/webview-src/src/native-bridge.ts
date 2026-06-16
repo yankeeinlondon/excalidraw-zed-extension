@@ -47,6 +47,14 @@ declare global {
      */
     __excalidrawExport?: (kind: string) => void;
     /**
+     * Drains the server's queued "Browse libraries" installs (`GET
+     * /pending-library`) and merges each raw `.excalidrawlib` document into the
+     * panel via Excalidraw's own parser (handles both the v1 `library` and v2
+     * `libraryItems` shapes). Invoked by the SSE `library` event. Present only
+     * while the React app is mounted.
+     */
+    __excalidrawApplyPendingLibraries?: () => Promise<void>;
+    /**
      * Reports the WebView's *live* dirty state to `/native-action-result`
      * (`ok: true` ⇒ no unsaved changes ⇒ safe to close). The native close flow
      * dispatches this first so its decision reflects the current scene rather

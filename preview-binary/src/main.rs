@@ -70,6 +70,26 @@ struct NativeActionResult {
 /// `/native-action-result` handler removes and fulfils the matching entry.
 type PendingActions = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<NativeActionResult>>>>;
 
+/// An event pushed to the WebView over the `/events` SSE stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewEvent {
+    /// The scene file changed on disk — reload the drawing.
+    Reload,
+    /// The shared shape library changed (e.g. a "Browse libraries" install) —
+    /// reload the library panel.
+    Library,
+}
+
+impl PreviewEvent {
+    /// The SSE `data:` payload the WebView switches on.
+    fn as_sse_data(self) -> &'static str {
+        match self {
+            PreviewEvent::Reload => "reload",
+            PreviewEvent::Library => "library",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     file_path: PathBuf,
@@ -77,7 +97,7 @@ struct AppState {
     content_type: String,
     file_name: String,
     auto_save: bool,
-    broadcast_tx: broadcast::Sender<()>,
+    broadcast_tx: broadcast::Sender<PreviewEvent>,
     /// Sends `true` to signal the webview window to focus.
     focus_tx: Arc<watch::Sender<bool>>,
     /// Sends export requests to the UI thread for the native save dialog.
@@ -90,6 +110,10 @@ struct AppState {
     dirty: Arc<RwLock<DirtyState>>,
     /// Pending native-action correlation table, resolved by `POST /native-action-result`.
     pending_actions: PendingActions,
+    /// Raw `.excalidrawlib` documents fetched by a "Browse libraries" install and
+    /// not yet pulled into the editor. `POST /install-library` pushes; the WebView
+    /// drains them via `GET /pending-library` after the `library` SSE event.
+    pending_libraries: Arc<Mutex<Vec<String>>>,
 }
 
 /// Everything the WebView event loop needs to run the unsaved-changes close
@@ -280,7 +304,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (broadcast_tx, _) = broadcast::channel::<()>(16);
+    let (broadcast_tx, _) = broadcast::channel::<PreviewEvent>(16);
     let (focus_tx, focus_rx) = watch::channel(false);
     let focus_tx = Arc::new(focus_tx);
     let (export_tx, export_rx) = std::sync::mpsc::channel::<ExportRequest>();
@@ -312,6 +336,7 @@ fn main() -> Result<()> {
         export_dir: args.export_dir.clone(),
         dirty: Arc::new(RwLock::new(DirtyState::default())),
         pending_actions: Arc::new(Mutex::new(HashMap::new())),
+        pending_libraries: Arc::new(Mutex::new(Vec::new())),
     });
 
     // Only now that the port is bound and known do we publish it to the lock file.
@@ -322,6 +347,9 @@ fn main() -> Result<()> {
         .route("/config", get(serve_config))
         .route("/data", get(serve_data).post(receive_data))
         .route("/library", get(serve_library).post(receive_library))
+        .route("/library-install", get(serve_library_install))
+        .route("/install-library", axum::routing::post(install_library))
+        .route("/pending-library", get(drain_pending_libraries))
         .route("/events", get(serve_events))
         .route("/focus", get(handle_focus))
         .route("/shutdown", get(handle_shutdown))
@@ -367,7 +395,7 @@ fn main() -> Result<()> {
                     if now.duration_since(last_sent) >= debounce {
                         last_sent = now;
                         info!("File changed, sending reload event");
-                        let _ = watcher_broadcast.send(());
+                        let _ = watcher_broadcast.send(PreviewEvent::Reload);
                     }
                 }
                 _ => {}
@@ -594,7 +622,9 @@ async fn serve_events(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let stream = async_stream::stream! {
         loop {
             match rx.recv().await {
-                Ok(_) => yield Ok::<Event, Infallible>(Event::default().data("reload")),
+                Ok(event) => {
+                    yield Ok::<Event, Infallible>(Event::default().data(event.as_sse_data()))
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
             }
@@ -663,6 +693,195 @@ async fn receive_library(body: axum::body::Bytes) -> Response {
         Ok(_) => axum::http::StatusCode::OK.into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// Landing page for the "Browse libraries" install round-trip.
+///
+/// `libraryReturnUrl` points the libraries.excalidraw.com "Add to Excalidraw"
+/// button back here as `…/library-install#addLibrary=<libraryUrl>&token=<token>`.
+/// The click happens in the *system browser* (the libraries site opens there),
+/// and the `addLibrary` value rides in the URL fragment — which is never sent to
+/// the server — so this tiny page reads it client-side and hands the library URL
+/// to `POST /install-library`. The server then fetches + merges + persists it and
+/// notifies the live WebView over SSE, so the items appear back in the editor.
+const LIBRARY_INSTALL_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Add to Excalidraw</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+         font: 16px/1.5 system-ui, -apple-system, sans-serif; background: #1e1e1e; color: #e6e6e6; }
+  .card { max-width: 420px; padding: 32px; text-align: center; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  p { margin: 8px 0; color: #b8b8b8; }
+  .ok { color: #6ee7a8; }
+  .err { color: #ff8a8a; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1 id="title">Adding library…</h1>
+    <p id="status">Contacting the Excalidraw preview…</p>
+  </div>
+<script>
+  (function () {
+    var title = document.getElementById("title");
+    var status = document.getElementById("status");
+    function params(s) { try { return new URLSearchParams(s); } catch (e) { return new URLSearchParams(); } }
+    // useHash=true puts addLibrary in the fragment; fall back to the query string.
+    var hash = params(location.hash.replace(/^#/, ""));
+    var search = params(location.search.replace(/^\?/, ""));
+    var libraryUrl = hash.get("addLibrary") || search.get("addLibrary");
+    if (!libraryUrl) {
+      title.textContent = "No library to add";
+      title.className = "err";
+      status.textContent = "This page is opened automatically when you click “Add to Excalidraw”.";
+      return;
+    }
+    fetch("/install-library", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ libraryUrl: libraryUrl }),
+    })
+      .then(function (r) { return r.text().then(function (t) { return { ok: r.ok, text: t }; }); })
+      .then(function (res) {
+        if (res.ok) {
+          title.textContent = "Library added ✓";
+          title.className = "ok";
+          status.textContent = "Switch back to the Excalidraw window — the shapes are in your library panel. You can close this tab.";
+        } else {
+          title.textContent = "Could not add library";
+          title.className = "err";
+          status.textContent = res.text || "The preview rejected the install.";
+        }
+      })
+      .catch(function () {
+        title.textContent = "Could not add library";
+        title.className = "err";
+        status.textContent = "The Excalidraw preview is no longer running. Reopen the file and try again.";
+      });
+  })();
+</script>
+</body>
+</html>"#;
+
+/// Serves the static "Add to Excalidraw" landing page (see [`LIBRARY_INSTALL_HTML`]).
+async fn serve_library_install() -> impl IntoResponse {
+    axum::response::Html(LIBRARY_INSTALL_HTML)
+}
+
+/// Request body for [`install_library`].
+#[derive(serde::Deserialize)]
+struct InstallLibraryRequest {
+    #[serde(rename = "libraryUrl")]
+    library_url: String,
+}
+
+/// Whether a library URL is safe for the server to fetch. Guards against SSRF:
+/// only `https` URLs on Excalidraw's libraries host or the GitHub raw/gist hosts
+/// those libraries are published from are allowed.
+fn is_allowed_library_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    matches!(
+        parsed.host_str(),
+        Some(
+            "libraries.excalidraw.com"
+                | "excalidraw.com"
+                | "raw.githubusercontent.com"
+                | "gist.githubusercontent.com"
+        )
+    )
+}
+
+/// Fetches the `.excalidrawlib` the user picked on libraries.excalidraw.com and
+/// queues it for the open editor. Called by the `/library-install` landing page.
+///
+/// The server (not the browser) does the fetch — sidestepping CORS and confining
+/// it to allow-listed hosts — then validates the bytes are an Excalidraw library
+/// and parks the raw document in `pending_libraries`. A `PreviewEvent::Library`
+/// broadcast wakes the WebView, which drains [`drain_pending_libraries`] and hands
+/// each document to Excalidraw's own `updateLibrary` (it parses both the legacy
+/// `library` v1 and the `libraryItems` v2 shapes, so no migration lives here).
+async fn install_library(
+    State(state): State<Arc<AppState>>,
+    axum::Json(req): axum::Json<InstallLibraryRequest>,
+) -> Response {
+    use axum::http::StatusCode;
+
+    if !is_allowed_library_url(&req.library_url) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Library URL is not an allowed https Excalidraw/GitHub source",
+        )
+            .into_response();
+    }
+
+    // Fetch the raw library document from the chosen source.
+    let body = match reqwest::get(&req.library_url).await {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("Could not read library: {e}"))
+                    .into_response();
+            }
+        },
+        Ok(resp) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("Library source returned HTTP {}", resp.status()),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("Could not fetch library: {e}"))
+                .into_response();
+        }
+    };
+
+    // Validate it's actually an Excalidraw library (either format) before queuing,
+    // so a wrong URL can't park garbage for the editor to choke on.
+    if !is_excalidraw_library(&body) {
+        return (StatusCode::BAD_REQUEST, "Not an Excalidraw library file").into_response();
+    }
+
+    if let Ok(mut pending) = state.pending_libraries.lock() {
+        pending.push(body);
+    }
+    let _ = state.broadcast_tx.send(PreviewEvent::Library);
+    (StatusCode::OK, "Library queued for the editor").into_response()
+}
+
+/// Whether `body` parses as an Excalidraw library document — `type` is
+/// `"excalidrawlib"` and it carries either a v2 `libraryItems` array or a legacy
+/// v1 `library` array.
+fn is_excalidraw_library(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let is_lib_type = value.get("type").and_then(|t| t.as_str()) == Some("excalidrawlib");
+    let has_items = value.get("libraryItems").is_some_and(|v| v.is_array())
+        || value.get("library").is_some_and(|v| v.is_array());
+    is_lib_type && has_items
+}
+
+/// Drains the queued "Browse libraries" installs, returning the raw documents for
+/// the WebView to feed to `updateLibrary`. Returns `{ "libraries": [...] }`;
+/// empties the queue so each document is applied once.
+async fn drain_pending_libraries(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let libraries: Vec<String> = state
+        .pending_libraries
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default();
+    axum::Json(serde_json::json!({ "libraries": libraries }))
 }
 
 #[derive(serde::Deserialize)]
@@ -1037,6 +1256,27 @@ fn build_menu() -> Result<(muda::Menu, MenuIds), Box<dyn std::error::Error>> {
     ])?;
     menu.append(&file_menu)?;
 
+    // Edit menu with the standard system items (Undo/Redo/Cut/Copy/Paste/Select
+    // All). On macOS, AppKit only delivers the `Cmd+C`/`Cmd+V`/`Cmd+X`/`Cmd+A`/
+    // `Cmd+Z` key equivalents to the focused WKWebView when the menu bar contains
+    // items wired to the standard `copy:`/`paste:`/… selectors — without this
+    // menu those shortcuts are swallowed and Excalidraw's clipboard handlers
+    // never fire (only the WebView's right-click context menu worked). These
+    // predefined items carry the conventional accelerators automatically and are
+    // dispatched natively, so they need no `MenuId` handling. Harmless on Windows
+    // (WebView2 already handles the shortcuts natively).
+    let edit_menu = Submenu::new("Edit", true);
+    edit_menu.append_items(&[
+        &PredefinedMenuItem::undo(None),
+        &PredefinedMenuItem::redo(None),
+        &PredefinedMenuItem::separator(),
+        &PredefinedMenuItem::cut(None),
+        &PredefinedMenuItem::copy(None),
+        &PredefinedMenuItem::paste(None),
+        &PredefinedMenuItem::select_all(None),
+    ])?;
+    menu.append(&edit_menu)?;
+
     let import_library = MenuItem::new("Import Library…", true, None);
     let export_library = MenuItem::new("Export Library…", true, None);
     let library_menu = Submenu::new("Library", true);
@@ -1133,8 +1373,16 @@ fn run_webview(
     library_open_rx: std::sync::mpsc::Receiver<LibraryOpenRequest>,
     close_ctx: CloseContext,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Load the WebView from `localhost`, not the literal `127.0.0.1`. WebKit
+    // (WKWebView on macOS, WebKitGTK on Linux) only treats the *hostname*
+    // `localhost` as a secure context — a bare loopback IP is considered
+    // insecure, which leaves `window.isSecureContext` false and
+    // `navigator.clipboard` undefined, silently breaking Excalidraw copy/paste.
+    // Chromium treats both as secure, which is why this only bites the packaged
+    // WebKit window and not dev-mode testing. The server binds 127.0.0.1 and the
+    // OS resolves `localhost` to it (/etc/hosts), so the connection is identical.
     run_webview_url(
-        &format!("http://127.0.0.1:{}", port),
+        &format!("http://localhost:{}", port),
         focus_rx,
         export_rx,
         library_open_rx,
@@ -1768,6 +2016,9 @@ fn run_webview_url(
     let webview = Rc::new(
         wry::WebViewBuilder::new()
             .with_url(url)
+            // Enable clipboard access (copy/cut/paste) for the page. Required on
+            // Linux/WebKitGTK so Excalidraw's clipboard shortcuts reach web content.
+            .with_clipboard(true)
             // External links (Help/docs, Browse libraries) open in the system browser
             // instead of navigating away from — or spawning a popup inside — the editor.
             .with_navigation_handler(allow_navigation)
@@ -1943,6 +2194,10 @@ fn run_webview_url(
 
     let webview = WebViewBuilder::new()
         .with_url(url)
+        // Enable clipboard access (copy/cut/paste) for the page. Required on
+        // Windows so Excalidraw's clipboard shortcuts reach web content; a no-op
+        // on macOS where WKWebView grants clipboard access from a secure context.
+        .with_clipboard(true)
         // External links (Help/docs, Browse libraries) open in the system browser
         // instead of navigating away from — or spawning a popup inside — the editor.
         .with_navigation_handler(allow_navigation)
@@ -2014,6 +2269,17 @@ fn run_webview_url(
             if let Some(is_clean) =
                 poll_query_flow(&mut close_flow, &close_ctx.pending_actions, cached_dirty)
             {
+                // Leave `Querying` the instant the query resolves. `poll_query_flow`
+                // reads but never clears the flow, and `confirm_close_dialog()` below
+                // is a *blocking* `NSAlert.runModal()` that pumps the run loop — which
+                // re-enters this closure on the 100 ms tick. If the flow were still
+                // `Querying` then, the re-entrant poll would hit the already-consumed
+                // oneshot, fall back to the (still-dirty) cached state, and pop the
+                // dialog a second time — so "Don't Save" just reopened the prompt
+                // forever. Resetting to `Idle` first makes the re-entrant tick a
+                // no-op; the Save branch re-assigns to `Waiting` as needed. (The Linux
+                // path already does this before its async dialog.)
+                close_flow = CloseFlow::Idle;
                 if is_clean {
                     // Live state says no unsaved changes → close now.
                     close_ctx.cleanup_lock();
@@ -2387,6 +2653,7 @@ mod tests {
             export_dir: None,
             dirty: Arc::new(RwLock::new(DirtyState::default())),
             pending_actions: Arc::new(Mutex::new(HashMap::new())),
+            pending_libraries: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -2407,6 +2674,42 @@ mod tests {
             detect_content_type(&PathBuf::from("diagram.excalidraw")),
             "application/json"
         );
+    }
+
+    #[test]
+    fn test_is_allowed_library_url() {
+        // Allowed: https on Excalidraw / GitHub-raw hosts.
+        assert!(is_allowed_library_url(
+            "https://libraries.excalidraw.com/libraries/youritjang/software-architecture.excalidrawlib"
+        ));
+        assert!(is_allowed_library_url(
+            "https://raw.githubusercontent.com/someone/repo/main/shapes.excalidrawlib"
+        ));
+        // Rejected: non-https, and arbitrary/SSRF-prone hosts.
+        assert!(!is_allowed_library_url(
+            "http://libraries.excalidraw.com/x.excalidrawlib"
+        ));
+        assert!(!is_allowed_library_url("https://evil.example.com/x.excalidrawlib"));
+        assert!(!is_allowed_library_url("file:///etc/passwd"));
+        assert!(!is_allowed_library_url("http://169.254.169.254/latest/meta-data"));
+        assert!(!is_allowed_library_url("not a url"));
+    }
+
+    #[test]
+    fn test_is_excalidraw_library() {
+        // v2 (libraryItems) and v1 (library) shapes both accepted.
+        assert!(is_excalidraw_library(
+            r#"{"type":"excalidrawlib","version":2,"libraryItems":[]}"#
+        ));
+        assert!(is_excalidraw_library(
+            r#"{"type":"excalidrawlib","version":1,"library":[[]]}"#
+        ));
+        // Rejected: wrong type, missing items array, scene file, or non-JSON.
+        assert!(!is_excalidraw_library(
+            r#"{"type":"excalidraw","elements":[]}"#
+        ));
+        assert!(!is_excalidraw_library(r#"{"type":"excalidrawlib"}"#));
+        assert!(!is_excalidraw_library("not json"));
     }
 
     #[test]
@@ -2603,6 +2906,7 @@ mod tests {
             export_dir: None,
             dirty: Arc::new(RwLock::new(DirtyState::default())),
             pending_actions: Arc::new(Mutex::new(HashMap::new())),
+            pending_libraries: Arc::new(Mutex::new(Vec::new())),
         });
 
         let app = Router::new()
@@ -3050,6 +3354,7 @@ mod tests {
             export_dir: None,
             dirty: Arc::new(RwLock::new(DirtyState::default())),
             pending_actions: Arc::new(Mutex::new(HashMap::new())),
+            pending_libraries: Arc::new(Mutex::new(Vec::new())),
         });
         (state, library_open_rx)
     }

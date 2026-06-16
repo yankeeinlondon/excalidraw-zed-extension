@@ -193,7 +193,7 @@ async function main() {
     // Viewport + theme preservation and mid-edit skipping are handled inside
     // the reloadScene function provided by App.
     const es = new EventSource(apiUrl("/events"));
-    es.onmessage = debounce(async () => {
+    const reloadSceneFromDisk = debounce(async () => {
       if (Date.now() < ignoreSseUntil) return;
       try {
         const res = await fetch(apiUrl("/data"));
@@ -209,6 +209,16 @@ async function main() {
         console.error("Failed to reload:", e);
       }
     }, 150);
+    es.onmessage = (event: MessageEvent<string>) => {
+      // A "Browse libraries" install merged items server-side: reload only the
+      // library panel, never the scene. Handled inline (not via the scene
+      // debounce) so a library + scene event can't collapse into one.
+      if (event.data === "library") {
+        void window.__excalidrawApplyPendingLibraries?.();
+        return;
+      }
+      reloadSceneFromDisk();
+    };
   } catch (e) {
     showError(`Error: ${e instanceof Error ? e.message : String(e)}`);
   }
