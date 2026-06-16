@@ -6,7 +6,7 @@ use zed_extension_api::{
 /// Must match the GitHub Release tag (v{VERSION}) **and** the `version` in
 /// `extension.toml` — enforced by `test_binary_version_matches_manifest` so an
 /// installed user never downloads a binary that predates the shipped manifest.
-const BINARY_VERSION: &str = "0.4.2";
+const BINARY_VERSION: &str = "0.5.0";
 const BINARY_NAME: &str = "excalidraw-preview";
 
 struct ExcalidrawPreviewExtension {

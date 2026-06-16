@@ -1,6 +1,6 @@
 id = "excalidraw-preview"
 name = "Excalidraw Preview"
-version = "0.4.2"
+version = "0.5.0"
 schema_version = 1
 authors = ["Ken Snyder <ken@ken.net>"]
 description = "Preview .excalidraw files in a native window"
