@@ -27,7 +27,7 @@ excalidraw-zed-extension/
 ├── extension/                      ← Zed extension (Rust → WASM)
 │   ├── Cargo.toml
 │   ├── src/
-│   │   └── lib.rs                  ← slash command, spawn binary, focus ping
+│   │   └── lib.rs                  ← language server: download + spawn binary (--lsp)
 │   └── extension.toml              ← Zed extension manifest
 │
 ├── preview-binary/                 ← companion native binary
@@ -96,22 +96,28 @@ authors = ["you"]
 description = "Preview .excalidraw files in a native window"
 repository = "https://github.com/you/excalidraw-zed-extension"
 
-[slash_commands.preview-excalidraw]
-description = "Open live preview for the active .excalidraw file"
-requires_argument = false
+[language_servers.excalidraw-preview]
+name = "Excalidraw Preview"
+language = "Excalidraw"
+languages = []
 ```
+
+The extension does **not** register slash commands. An earlier version exposed
+`/preview-excalidraw` and `/new-excalidraw`, but Zed reserves the slash-command API
+for agent use and won't accept extension-provided commands into the registry yet
+(see PR zed-industries/extensions#6468). The preview is driven entirely through the
+language server instead — opening a `.excalidraw*` file auto-spawns the preview.
 
 ### extension/src/lib.rs — responsibilities
 
 1. Implement `zed_extension_api::Extension` trait.
-2. Register `/preview-excalidraw` slash command.
-3. On command run:
-   - Get `worktree` + active file path via extension API.
-   - Validate extension is `.excalidraw`, `.excalidraw.svg`, or `.excalidraw.png`.
-   - Resolve path to companion binary (`excalidraw-preview`).
-   - Spawn via `zed_extension_api::process::Command::new(binary).arg(file_path).spawn()`.
-4. Track `HashMap<PathBuf, (u32, u16)>` — PID + port per file (in-memory, single process lifetime).
-5. On re-invoke for same file: `GET http://127.0.0.1:{port}/focus` (HTTP ping via `zed::http_client_get`).
+2. In `language_server_command`, resolve the companion binary and spawn it as the
+   language server with `--lsp`. Binary resolution order: `PATH` (dev / `just symlink`)
+   → cached download → fresh download from GitHub Releases `v{BINARY_VERSION}`.
+3. That's it for the extension. The `--lsp` server *inside the binary* owns the rest:
+   `didOpen`/`didSave` spawn the detached preview, which self-daemonizes and dedups via
+   its lock file (focusing an existing window rather than opening a duplicate). The
+   extension keeps no per-file state and issues no HTTP pings.
 
 **Key constraint:** WASM extensions cannot open sockets or use `std::process`.
 Use `zed_extension_api::process::Command` and `zed::http_client_get` only.
@@ -443,7 +449,7 @@ After UI changes are done: `just ui && just build` to bake them into the release
 | M1    | Rust binary opens wry window + serves static index.html | ✓ |
 | M2    | `webview-src/` scaffolded; Vite builds; `<Excalidraw>` renders from `/data` | ✓ |
 | M3    | File watcher + SSE + `updateScene` live reload | ✓ |
-| M4    | Zed extension spawns binary; slash command works end-to-end | ✓ |
+| M4    | Zed extension spawns binary as language server; auto-preview on open | ✓ |
 | M5    | Process reuse: lock file + `/focus` + `/ping` | ✓ |
 | M6    | All three file formats + fallback chain | ✓ |
 | M7    | Cross-platform CI + prebuilt binary download | [ ] |

@@ -46,14 +46,15 @@ Reference implementation: `refs/excalidraw-vscode/` (git submodule) — the VS C
 **Primary flow**
 
 1. Open `diagram.excalidraw` in Zed.
-2. Run `/preview-excalidraw`.
-3. A native window opens showing the diagram, auto-fitted to content.
-4. On every save in Zed, preview updates automatically.
+2. A native window opens automatically showing the diagram, auto-fitted to content —
+   the extension's language server launches the preview on `didOpen`.
+3. On every save in Zed, preview updates automatically.
 
 **Secondary flows**
 
-* Re-running the command focuses the existing window.
-* Closing the window stops the preview server for that file.
+* Opening the same file again focuses the existing window.
+* Closing the window stops the preview server for that file; saving the file in Zed
+  reopens it.
 
 ---
 
@@ -61,7 +62,7 @@ Reference implementation: `refs/excalidraw-vscode/` (git submodule) — the VS C
 
 | ID   | Requirement |
 | ---- | ----------- |
-| FR1  | Zed command `/preview-excalidraw` available for `.excalidraw` files |
+| FR1  | Opening a `.excalidraw` file in Zed auto-opens a preview (extension language server, `didOpen`) |
 | FR2  | Extension reads active file path and spawns companion binary |
 | FR3  | Companion starts local HTTP server on ephemeral port |
 | FR4  | WebView window opens pointing to `http://127.0.0.1:{port}` |
@@ -102,14 +103,16 @@ excalidraw-preview (Rust binary)
 
 Responsibilities:
 
-* Register `/preview-excalidraw` slash command
-* Get current file path from worktree
-* Validate `.excalidraw`, `.excalidraw.svg`, or `.excalidraw.png` extension
-* Spawn `excalidraw-preview <file>` via `zed_extension_api::process::Command`
-* Track spawned PIDs + port in a `HashMap<PathBuf, (u32, u16)>`
-* On re-invoke for same file: send `GET http://127.0.0.1:{port}/focus`
+* Register the `excalidraw-preview` language server (for the "Excalidraw" language)
+* Resolve the companion binary (`PATH` → cached → download from GitHub Releases)
+* Spawn it as the language server with `--lsp` via `zed_extension_api::process::Command`
 
-No UI, no direct file I/O, no networking beyond the focus ping.
+The `--lsp` server inside the binary handles the rest: it spawns the detached preview
+on `didOpen`/`didSave`, and the preview self-daemonizes and dedups via its lock file
+(focusing an existing window instead of opening a duplicate). The extension keeps no
+per-file state and issues no HTTP pings.
+
+No UI, no direct file I/O, no networking beyond the binary download.
 
 ---
 
@@ -438,7 +441,7 @@ excalidrawAPI.updateScene({ elements, appState, files })
 | M1 | Rust binary: wry window opens, serves static `index.html` | [x] |
 | M2 | `webview-src/` scaffolded; Vite builds; `<Excalidraw>` renders from `/data` | [x] |
 | M3 | File watcher + SSE + `updateScene` live reload working | [x] |
-| M4 | Zed extension spawns binary, slash command works end-to-end | [ ] |
+| M4 | Zed extension spawns binary as language server; auto-preview on open | [x] |
 | M5 | Process reuse: lock file + `/focus` route | [x] |
 | M6 | All three file formats (JSON/SVG/PNG) with fallback chain | [ ] |
 | M7 | Cross-platform CI: build matrix + prebuilt binary download | [ ] |
@@ -471,9 +474,8 @@ excalidrawAPI.updateScene({ elements, appState, files })
 
 ### Zed Extension
 - [ ] WASM extension scaffold
-- [ ] `/preview-excalidraw` slash command
-- [ ] Spawn companion binary
-- [ ] Track PIDs + ports per file
+- [ ] Register `excalidraw-preview` language server (auto-preview on `didOpen`/`didSave`)
+- [ ] Spawn companion binary with `--lsp`
 - [ ] Focus existing window on re-invoke
 
 ### Testing & CI

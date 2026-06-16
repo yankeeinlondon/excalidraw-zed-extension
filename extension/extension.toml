@@ -15,11 +15,3 @@ languages = []
 kind = "process:exec"
 command = "excalidraw-preview"
 args = ["*"]
-
-[slash_commands.preview-excalidraw]
-description = "Open live preview for the active .excalidraw file"
-requires_argument = false
-
-[slash_commands.new-excalidraw]
-description = "Create a new blank Excalidraw drawing and open its preview"
-requires_argument = false

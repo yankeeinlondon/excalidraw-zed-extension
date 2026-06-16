@@ -1,10 +1,6 @@
-use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use zed_extension_api::{
-    self as zed,
-    process::Command as ProcessCommand,
-    Architecture, Command, Extension, LanguageServerId, Os, Range, Result, SlashCommand,
-    SlashCommandOutput, SlashCommandOutputSection, Worktree,
+    self as zed, Architecture, Command, Extension, LanguageServerId, Os, Result, Worktree,
 };
 
 /// Must match the GitHub Release tag (v{VERSION}) **and** the `version` in
@@ -19,29 +15,6 @@ struct ExcalidrawPreviewExtension {
 }
 
 impl ExcalidrawPreviewExtension {
-    fn is_valid_extension(path: &Path) -> bool {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        name.ends_with(".excalidraw")
-            || name.ends_with(".excalidraw.svg")
-            || name.ends_with(".excalidraw.png")
-    }
-
-    fn find_excalidraw_file(worktree: &Worktree) -> Option<PathBuf> {
-        let root_path = PathBuf::from(worktree.root_path());
-        if let Ok(entries) = std::fs::read_dir(&root_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && Self::is_valid_extension(&path) {
-                    return Some(path);
-                }
-            }
-        }
-        None
-    }
-
     /// Returns the path to the `excalidraw-preview` binary.
     ///
     /// Resolution order:
@@ -143,104 +116,6 @@ impl Extension for ExcalidrawPreviewExtension {
             Err(format!("unknown language server: {language_server_id}"))
         }
     }
-
-    fn run_slash_command(
-        &self,
-        command: SlashCommand,
-        args: Vec<String>,
-        worktree: Option<&Worktree>,
-    ) -> Result<SlashCommandOutput> {
-        match command.name.as_str() {
-            "preview-excalidraw" => {
-                let worktree = worktree.ok_or("No worktree available")?;
-
-                let binary = self.get_binary_path(worktree)?;
-
-                // Separate flags (--auto-save) from the positional file argument.
-                let auto_save = args.contains(&"--auto-save".to_string());
-                let file_arg = args.iter().find(|a| !a.starts_with("--"));
-
-                let file_path = if let Some(file_arg) = file_arg {
-                    let p = PathBuf::from(file_arg);
-                    if p.is_absolute() {
-                        p
-                    } else {
-                        PathBuf::from(worktree.root_path()).join(&p)
-                    }
-                } else {
-                    Self::find_excalidraw_file(worktree).ok_or(
-                        "No .excalidraw file found in workspace. Provide a file path as argument.",
-                    )?
-                };
-
-                if !Self::is_valid_extension(&file_path) {
-                    return Err(
-                        "File must end with .excalidraw, .excalidraw.svg, or .excalidraw.png"
-                            .into(),
-                    );
-                }
-
-                let file_path_str = file_path.to_string_lossy().to_string();
-
-                // The binary self-daemonizes (re-spawns detached, parent exits instantly),
-                // and self-deduplicates via its lock file: if a live instance is already
-                // serving this file it focuses that window and exits. So we always just run it.
-                let mut cmd = ProcessCommand::new(&binary).arg(&file_path_str);
-                if auto_save {
-                    cmd = cmd.arg("--auto-save");
-                }
-                match cmd.output() {
-                    Ok(_) => Ok(SlashCommandOutput {
-                        sections: vec![SlashCommandOutputSection {
-                            range: Range { start: 0, end: 1 },
-                            label: "Preview opened".into(),
-                        }],
-                        text: format!("Opened preview for {}", file_path.display()),
-                    }),
-                    Err(e) => Err(format!("Failed to start preview: {e}")),
-                }
-            }
-            "new-excalidraw" => {
-                let worktree = worktree.ok_or("No worktree available")?;
-                let binary = self.get_binary_path(worktree)?;
-                let root = PathBuf::from(worktree.root_path());
-
-                let file_path = if let Some(name) = args.iter().find(|a| !a.starts_with("--")) {
-                    let mut name = name.to_string();
-                    if !name.ends_with(".excalidraw") {
-                        name.push_str(".excalidraw");
-                    }
-                    root.join(name)
-                } else {
-                    (1..1000)
-                        .map(|n| root.join(format!("untitled-{n}.excalidraw")))
-                        .find(|p| !p.exists())
-                        .ok_or("Could not find a free untitled-N.excalidraw name")?
-                };
-
-                if file_path.exists() {
-                    return Err(format!("{} already exists", file_path.display()));
-                }
-
-                let file_path_str = file_path.to_string_lossy().to_string();
-                match ProcessCommand::new(&binary)
-                    .arg("--new")
-                    .arg(&file_path_str)
-                    .output()
-                {
-                    Ok(_) => Ok(SlashCommandOutput {
-                        sections: vec![SlashCommandOutputSection {
-                            range: Range { start: 0, end: 1 },
-                            label: "Drawing created".into(),
-                        }],
-                        text: format!("Created and opened {}", file_path.display()),
-                    }),
-                    Err(e) => Err(format!("Failed to create drawing: {e}")),
-                }
-            }
-            _ => Err(format!("Unknown command: {}", command.name)),
-        }
-    }
 }
 
 zed_extension_api::register_extension!(ExcalidrawPreviewExtension);
@@ -250,55 +125,6 @@ zed_extension_api::register_extension!(ExcalidrawPreviewExtension);
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_valid_extension_json() {
-        assert!(ExcalidrawPreviewExtension::is_valid_extension(
-            &PathBuf::from("diagram.excalidraw")
-        ));
-    }
-
-    #[test]
-    fn test_is_valid_extension_svg() {
-        assert!(ExcalidrawPreviewExtension::is_valid_extension(
-            &PathBuf::from("diagram.excalidraw.svg")
-        ));
-    }
-
-    #[test]
-    fn test_is_valid_extension_png() {
-        assert!(ExcalidrawPreviewExtension::is_valid_extension(
-            &PathBuf::from("diagram.excalidraw.png")
-        ));
-    }
-
-    #[test]
-    fn test_is_valid_extension_rejects_plain_svg() {
-        assert!(!ExcalidrawPreviewExtension::is_valid_extension(
-            &PathBuf::from("diagram.svg")
-        ));
-    }
-
-    #[test]
-    fn test_is_valid_extension_rejects_plain_json() {
-        assert!(!ExcalidrawPreviewExtension::is_valid_extension(
-            &PathBuf::from("diagram.json")
-        ));
-    }
-
-    #[test]
-    fn test_is_valid_extension_rejects_empty() {
-        assert!(!ExcalidrawPreviewExtension::is_valid_extension(
-            &PathBuf::from("")
-        ));
-    }
-
-    #[test]
-    fn test_is_valid_extension_with_absolute_path() {
-        assert!(ExcalidrawPreviewExtension::is_valid_extension(
-            &PathBuf::from("/home/user/diagrams/arch.excalidraw")
-        ));
-    }
 
     /// Parses the top-level `version = "x.y.z"` out of `extension.toml`,
     /// ignoring keys like `schema_version` and any nested-table `version` lines.

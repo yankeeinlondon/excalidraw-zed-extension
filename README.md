@@ -93,20 +93,27 @@ https://github.com/user-attachments/assets/af3cd686-56b8-413c-9012-0f1c75e5f6c9
 
 
 1. Open any `.excalidraw`, `.excalidraw.svg`, or `.excalidraw.png` file in Zed.
-2. Run `/preview-excalidraw` from the command palette.
-3. A native window opens with the rendered diagram.
-4. Save the file in Zed — preview updates automatically.
+2. A native window opens automatically with the rendered diagram — the extension's
+   language server launches the preview when the file opens (`didOpen`). No command
+   to run.
+3. Save the file in Zed — the preview live-reloads. Edit in the preview and press
+   Ctrl/Cmd+S — it writes back to the file on disk.
 
-Re-running the command focuses the existing window instead of opening a new one.
+Opening the same file again focuses the existing window instead of opening a new one.
+If you close the preview, saving the file in Zed reopens it.
 
 ### Auto-save
 
-Pass `--auto-save` to enable debounced auto-save (300 ms after you stop changing
-the scene, with a 2 s max-wait so continuous drawing still flushes periodically):
+Debounced auto-save (300 ms after you stop changing the scene, with a 2 s max-wait
+so continuous drawing still flushes periodically) is available when you launch the
+binary directly:
 
 ```
-/preview-excalidraw --auto-save
+excalidraw-preview ./path/to/diagram.excalidraw --auto-save
 ```
+
+It isn't exposed through the Zed extension, which spawns the preview in manual-save
+mode (Ctrl/Cmd+S in the preview window).
 
 ### Run Without Zed
 
@@ -117,14 +124,12 @@ the scene, with a 2 s max-wait so continuous drawing still flushes periodically)
 
 ## Creating a new drawing
 
-Three ways, pick your favorite:
+Two ways, pick your favorite:
 
 1. **Project panel (recommended):** right-click → *New File* → name it `whiteboard.excalidraw`.
    The extension detects the empty file, writes a valid blank scene into it, and opens
    the preview on an empty canvas.
-2. **Assistant panel:** `/new-excalidraw [name]` creates `name.excalidraw` (or
-   `untitled-N.excalidraw`) in the workspace root and opens the preview.
-3. **Terminal:** `excalidraw-preview --new path/to/drawing.excalidraw`
+2. **Terminal:** `excalidraw-preview --new path/to/drawing.excalidraw`
 
 Want a command-palette entry? Zed extensions can't register palette actions yet
 (zed-industries/zed#8441), but you can wire a Zed task to the CLI. Add to your `tasks.json`:
@@ -152,7 +157,7 @@ then run it via `task: spawn` in the command palette.
   `<config-dir>/excalidraw-zed/library.excalidrawlib` and are shared across all diagrams;
   use **Library → Import/Export Library…** for native `.excalidrawlib` round-trips.
 - **`.excalidraw.png` is a fully editable format**, not just a viewer target. Opening
-  one (via `/preview-excalidraw`, or automatically on `didOpen` once the extension is
-  installed) decodes the scene embedded in the PNG, lets you edit it, and re-embeds the
+  one (automatically when you open it in Zed, or via the CLI) decodes the scene
+  embedded in the PNG, lets you edit it, and re-embeds the
   scene on save so the file stays a valid Excalidraw PNG. The same applies to
   `.excalidraw.svg`.

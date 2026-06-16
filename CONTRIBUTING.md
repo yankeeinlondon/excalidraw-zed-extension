@@ -42,7 +42,7 @@ excalidraw-preview (native binary)
 
 | Component | Target | Role |
 |---|---|---|
-| `extension/` | `wasm32-wasip1` | Slash command, spawns binary, focus ping |
+| `extension/` | `wasm32-wasip1` | Language server: downloads + spawns the binary (`--lsp`) |
 | `preview-binary/` | native | HTTP server, file watcher, WebView window |
 | `preview-binary/webview-src/` | — | React + Vite source (`@excalidraw/excalidraw`) |
 | `preview-binary/assets/` | — | Vite build output, embedded in binary at compile time |
@@ -117,7 +117,7 @@ On save the webview POSTs to `/data`. The file watcher fires, but the SSE echo i
 | M1 | Rust binary opens WebView + static page | ✓ |
 | M2 | `webview-src/` scaffolded; Vite builds; `<Excalidraw>` renders from `/data` | ✓ |
 | M3 | File watcher + SSE + `updateScene` live reload | ✓ |
-| M4 | Zed extension spawns binary, slash command end-to-end | ✓ |
+| M4 | Zed extension spawns binary as language server; auto-preview on open | ✓ |
 | M5 | Process reuse / `/focus` + lock file | ✓ |
 | M6 | All three file formats + fallback chain | ✓ |
 | M7 | Cross-platform CI + prebuilt binary download | [ ] |
