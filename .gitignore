@@ -2,6 +2,12 @@
 target/
 **/*.rs.bk
 
+# Compiled Zed extension component. This is a build artifact: Zed (dev-install)
+# and the zed-industries/extensions registry both compile + componentize the
+# extension from source, so the .wasm is never consumed from git. Committing it
+# only caused version drift. See https://zed.dev/blog/zed-decoded-extensions
+extension/extension.wasm
+
 # Node modules (webview-src)
 preview-binary/webview-src/node_modules/
 preview-binary/webview-src/dist/
