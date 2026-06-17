@@ -849,14 +849,14 @@ checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
 name = "excalidraw-preview"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "zed_extension_api",
 ]
 
 [[package]]
 name = "excalidraw-preview-binary"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "arboard",
