@@ -37,6 +37,44 @@ ui:
 # redundant.
 release: build build-ext
 
+# Publish the release: push main and an annotated `v{version}` tag (version read
+# from extension.toml). Pushing the tag triggers the `Release` GitHub Actions
+# workflow, which builds the per-platform binaries and creates the GitHub release
+# with notes. Run this *after* the `chore: release vX.Y.Z` commit is in place.
+#
+# Prerequisites: clean working tree, on `main`, and the version not already tagged.
+publish:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    bold=$(tput bold 2>/dev/null || true); reset=$(tput sgr0 2>/dev/null || true)
+    green=$(tput setaf 2 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
+    die() { echo "${red}✗ $1${reset}" >&2; exit 1; }
+
+    version=$(grep -E '^version[[:space:]]*=' extension/extension.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+    [ -n "$version" ] || die "could not read version from extension.toml"
+    tag="v${version}"
+
+    # Safety checks: a release tags exactly what is committed on main.
+    [ -z "$(git status --porcelain)" ] || die "working tree is dirty — commit or stash first"
+    branch=$(git rev-parse --abbrev-ref HEAD)
+    [ "$branch" = "main" ] || die "not on main (on '$branch')"
+    if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+        die "tag ${tag} already exists locally — bump the version first"
+    fi
+
+    echo "${bold}▶ Publishing ${tag}${reset}"
+    git push origin main
+    # Annotated tag *with* a message (-m) so git never opens an editor and never
+    # aborts on an empty message.
+    git tag -a "${tag}" -m "Release ${tag}"
+    git push origin "${tag}"
+
+    echo
+    echo "${green}✓ Pushed ${tag}.${reset} The Release workflow is building binaries for every platform."
+    echo "  Watch:   gh run watch \$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.[0].databaseId')"
+    echo "  Release: https://github.com/yankeeinlondon/excalidraw-zed-extension/releases/tag/${tag}"
+
 # One-shot local install: check prereqs, build UI + binary, symlink onto PATH
 install-locally:
     #!/usr/bin/env bash
