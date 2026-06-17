@@ -37,10 +37,63 @@ ui:
 # redundant.
 release: build build-ext
 
+# Bump the version everywhere and commit it as `chore: release vX.Y.Z`. Updates
+# all four sites the release depends on — extension.toml, both [package] versions,
+# and BINARY_VERSION — plus the two workspace entries in Cargo.lock, then commits.
+# Run on a clean `main` (commit feature work first); follow with `just publish`.
+#
+# Usage: just bump 0.5.2
+bump version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    bold=$(tput bold 2>/dev/null || true); reset=$(tput sgr0 2>/dev/null || true)
+    green=$(tput setaf 2 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
+    die() { echo "${red}✗ $1${reset}" >&2; exit 1; }
+
+    version="{{version}}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || die "'$version' is not a valid version (expected X.Y.Z)"
+
+    # A release commit must contain *only* the version bump, so require a clean tree.
+    [ -z "$(git status --porcelain)" ] || die "working tree is dirty — commit feature work first"
+    [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || die "not on main"
+    current=$(grep -E '^version[[:space:]]*=' extension/extension.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+    [ "$version" != "$current" ] || die "version is already $version"
+
+    echo "${bold}▶ Bumping $current → $version${reset}"
+
+    # The single `[package]` version in each manifest is the only line that begins
+    # with `version = "` (dependency versions are inline or indented), so an
+    # anchored replace is unambiguous. perl -i is portable across macOS/Linux.
+    perl -i -pe 's/^version = "[^"]*"/version = "'"$version"'"/' \
+        extension/extension.toml extension/Cargo.toml preview-binary/Cargo.toml
+    perl -i -pe 's/(const BINARY_VERSION: &str = ")[^"]*(")/${1}'"$version"'${2}/' \
+        extension/src/lib.rs
+    # Cargo.lock: update only the two workspace members (slurp the file so the
+    # name→version line pair can be matched together).
+    perl -0777 -i -pe 's/(name = "excalidraw-preview"\nversion = ")[^"]*(")/${1}'"$version"'${2}/' Cargo.lock
+    perl -0777 -i -pe 's/(name = "excalidraw-preview-binary"\nversion = ")[^"]*(")/${1}'"$version"'${2}/' Cargo.lock
+
+    # Verify every site landed on the new version before committing.
+    grep -q "^version = \"$version\"\$" extension/extension.toml   || die "extension.toml not updated"
+    grep -q "^version = \"$version\"\$" extension/Cargo.toml       || die "extension/Cargo.toml not updated"
+    grep -q "^version = \"$version\"\$" preview-binary/Cargo.toml  || die "preview-binary/Cargo.toml not updated"
+    grep -q "const BINARY_VERSION: &str = \"$version\""            extension/src/lib.rs || die "lib.rs not updated"
+    grep -A1 '^name = "excalidraw-preview"$'        Cargo.lock | grep -q "version = \"$version\"" || die "Cargo.lock (extension) not updated"
+    grep -A1 '^name = "excalidraw-preview-binary"$' Cargo.lock | grep -q "version = \"$version\"" || die "Cargo.lock (binary) not updated"
+
+    git add extension/extension.toml extension/Cargo.toml preview-binary/Cargo.toml extension/src/lib.rs Cargo.lock
+    git commit -q -m "chore: release v${version}"
+
+    echo
+    echo "${green}✓ Committed chore: release v${version}.${reset}"
+    echo "  Review:  git show HEAD"
+    echo "  Publish: just publish"
+
 # Publish the release: push main and an annotated `v{version}` tag (version read
 # from extension.toml). Pushing the tag triggers the `Release` GitHub Actions
 # workflow, which builds the per-platform binaries and creates the GitHub release
-# with notes. Run this *after* the `chore: release vX.Y.Z` commit is in place.
+# with notes. Run this *after* `just bump` (or a manual `chore: release` commit).
 #
 # Prerequisites: clean working tree, on `main`, and the version not already tagged.
 publish:
