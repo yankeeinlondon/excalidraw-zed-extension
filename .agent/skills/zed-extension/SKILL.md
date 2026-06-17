@@ -84,6 +84,13 @@ description = "What the command does"
 requires_argument = false  # set true if it takes args
 ```
 
+> ⚠️ **Registry caveat (learned the hard way):** Zed reserves the slash-command
+> API for agent use and the **extensions registry will reject extension-provided
+> slash commands** (see PR `zed-industries/extensions#6468`). They work for a
+> locally-installed dev extension but not for a published one. To trigger behavior
+> on opening a file *without* a slash command, register a **language server** and
+> act on its `textDocument/didOpen` (see the companion-binary pattern below).
+
 #### Language + Grammar (Tree-sitter)
 
 ```toml
@@ -257,6 +264,43 @@ impl zed::Extension for MyLangExtension {
 
 zed::register_extension!(MyLangExtension);
 ```
+
+#### Companion native binary as a "language server" (preview/side-effect pattern)
+
+When the real work happens in a **native helper process** (a GUI window, a watcher,
+a server) rather than an LSP, you can still hang it off `language_server_command`:
+register a language for the file types, then spawn your binary as that language's
+"server". The binary speaks just enough JSON-RPC LSP to satisfy Zed (`initialize`,
+`shutdown`, `exit`) and uses `didOpen`/`didSave` notifications as triggers.
+
+- **Binary resolution order:** `worktree.which()` (dev / a symlink on PATH) →
+  cached download → fresh download from your GitHub Release `v{BINARY_VERSION}`.
+- **`BINARY_VERSION` must equal `version` in `extension.toml`** (the download URL is
+  `releases/download/v{BINARY_VERSION}/...`). Enforce it with a unit test so an
+  installed user never fetches a binary that predates the shipped manifest:
+
+  ```rust
+  #[test]
+  fn binary_version_matches_manifest() {
+      let manifest = include_str!("../extension.toml");
+      assert!(manifest.contains(&format!("version = \"{BINARY_VERSION}\"")));
+  }
+  ```
+
+- **Release asset naming** must match what the extension requests per platform —
+  `{name}-{arch}-{os}{ext}` using Rust target-triple parts, e.g.
+  `myhelper-aarch64-apple-darwin`, `myhelper-x86_64-unknown-linux-gnu`,
+  `myhelper-x86_64-pc-windows-msvc.exe`. Build them in CI on tag push (matrix over
+  `ubuntu/macos/windows`, `softprops/action-gh-release` to publish).
+- **`didOpen`/`didSave` semantics for side effects:**
+  - Gate the trigger on the *real* file types (`name.ends_with(".myext")`); Zed's
+    `path_suffixes` matching is loose and will attach your server to near-misses
+    (see gotchas) — acting on those spawns work that can only fail.
+  - `didClose` is usually a **no-op**: Zed reuses one preview tab and fires
+    `didClose` whenever you navigate to another file, so tearing your process down
+    there makes it flicker shut. Let the process own its own lifecycle.
+  - Zed does **not** re-send `didOpen` for an already-open buffer, so use
+    `didSave` to re-trigger (e.g. reopen a window the user closed).
 
 #### MCP server extension
 
@@ -687,7 +731,8 @@ zed --foreground     # stdout/stderr of extension visible here
 - [ ] Extension ID has no `zed`, `Zed`, or `extension`
 - [ ] `repository` field set in `extension.toml`
 - [ ] License file at repo root (MIT, Apache-2.0, GPL-3.0, BSD-2-Clause, BSD-3-Clause, CC-BY-4.0, LGPL-3.0, Unlicense, or zlib) — **required since Oct 1, 2025**
-- [ ] Version in `extension.toml` matches `Cargo.toml`
+- [ ] Version in `extension.toml` matches `Cargo.toml` (and any `BINARY_VERSION`/companion-binary download tag) — bump all sites together
+- [ ] If shipping a companion binary: a release workflow on tag `v*` builds the per-platform assets named `{name}-{target-triple}` and uploads them to the matching GitHub Release
 - [ ] Language servers / debug adapters downloaded at runtime, NOT bundled
 - [ ] Themes don't mix with language/tool extensions (keep as separate repo)
 - [ ] Fork `zed-industries/extensions` (to personal account, not org)
@@ -710,3 +755,8 @@ zed --foreground     # stdout/stderr of extension visible here
 - Tree-sitter grammar `rev` must be a full commit SHA, not a tag
 - The `grammar` field in `languages/<name>/config.toml` must exactly match the key in `[grammars.<key>]`
 - Agent Server extensions are deprecated since v0.221.x — use the ACP Registry instead for new agent integrations
+- **Extension-provided slash commands are rejected by the registry** (reserved for agents — PR `zed-industries/extensions#6468`). They work as a local dev extension but won't publish; drive on-open behavior from a language server's `didOpen` instead.
+- **`path_suffixes` matching is loose / "ends-with"-ish:** a compound suffix like `excalidraw.svg` also matches a *plain* `.svg` file, so your language server gets attached to files you didn't intend. Re-check the real extension inside `didOpen`/`didSave` before acting.
+- **A language can omit (or reuse) a grammar.** To claim `path_suffixes` + attach a language server for a non-source format, point `grammar` at an existing one (e.g. `json`) or leave it off. But the registry packager **rejects an *undeclared* grammar** ("grammar not found") — a named grammar must be bundled via `[grammars.*]`.
+- **Companion-binary version drift:** if the extension downloads a native binary from `releases/download/v{BINARY_VERSION}/`, that constant must track `version` in `extension.toml` (and any `Cargo.toml`). Keep one `bump` step that edits every site, guarded by a unit test (see the companion-binary pattern).
+- `url::Url::to_file_path()` rejects driveless POSIX paths (`/Users/...`) on **Windows** — gate POSIX `file://` URI tests with `#[cfg(unix)]`.

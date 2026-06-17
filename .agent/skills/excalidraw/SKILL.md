@@ -15,9 +15,8 @@ prompt: |-
         - how can these gotcha's be worked around?
 
     If you want to use diagrams then use Mermaid diagrams. Make sure your Markdown is idiomatic and standards based.
-last_updated: 2026-06-12
+last_updated: 2026-06-17
 ---
-Now let me fetch a few more resources to round out the research on earlier versions and element types:Now I have all the research needed. Let me compile it into the comprehensive Markdown document:
 
 # Excalidraw: Deep Research
 
@@ -553,6 +552,20 @@ import { getNonDeletedElements } from "@excalidraw/excalidraw";
 const visible = getNonDeletedElements(allElements);
 ```
 
+**Subtle corollary — `onChange` includes deleted elements, the save path doesn't.**
+The `onChange(elements, …)` callback receives elements *including* soft-deleted
+ones (`getElementsIncludingDeleted()`), but `api.getSceneElements()` and
+`serializeAsJSON()` write only the non-deleted set. If you build a "dirty"
+fingerprint (e.g. via `hashElementsVersion`) from the `onChange` array but compare
+it against what you saved, the two **never match once any deleted element lingers**,
+so the scene reads as permanently dirty (false "unsaved changes", failed
+close-and-save). Always filter `isDeleted` on *both* sides before hashing/comparing:
+
+```js
+const persisted = elements.filter((e) => !e.isDeleted);
+const fingerprint = hashElementsVersion(persisted);
+```
+
 ### 13. `exportToSvg` Returns a Promise (Since v0.9)
 
 **Problem:** Originally `exportToSvg` returned an SVG element synchronously. Since v0.9, it returns a `Promise<SVGSVGElement>`. Code that assumes synchronous access will fail silently.
@@ -595,6 +608,85 @@ const elements = convertToExcalidrawElements(skeleton, {
   regenerateIds: false,
 });
 ```
+
+### 17. Embedded WebView Clipboard Needs a Secure Context (`localhost`, not `127.0.0.1`)
+
+**Problem:** `navigator.clipboard` only exists in a *secure context*. WebKit
+(WKWebView on macOS, WebKitGTK on Linux) treats the **hostname `localhost`** as
+potentially-trustworthy but **does not** extend that to the bare loopback IP
+`127.0.0.1` (Chromium treats both as secure, so this only bites the packaged
+WebKit window, not dev-mode testing). Serving an embedded Excalidraw from
+`http://127.0.0.1:<port>` leaves `window.isSecureContext` false and
+`navigator.clipboard` `undefined`, silently breaking copy/paste and "Copy as SVG".
+
+**Workaround:** Load the WebView from `http://localhost:<port>` (you can still
+*bind* the server to `127.0.0.1`; the OS resolves `localhost` to it). On macOS,
+also add an **Edit menu** with the standard Copy/Paste/Cut/Select-All items, or
+AppKit won't deliver `Cmd+C`/`Cmd+V` keystrokes to the web content at all.
+
+### 18. WKWebView Rejects Async Clipboard Writes After an `await`
+
+**Problem:** Excalidraw's right-click **"Copy to clipboard as SVG"** generates the
+SVG with `await` and *then* calls the clipboard write. WebKit consumes the
+transient user-activation across the `await`, so the subsequent
+`navigator.clipboard` write is rejected → *"Couldn't copy to clipboard."* (Chromium
+is lenient here.)
+
+**Workaround:** Either keep the write inside the user gesture using the
+ClipboardItem-with-Promise pattern (Safari resolves the promise lazily):
+
+```js
+await navigator.clipboard.write([
+  new ClipboardItem({
+    "text/plain": (async () => new Blob([await makeSvg()], { type: "text/plain" }))(),
+  }),
+]);
+```
+
+…or, in a native wrapper, generate the SVG and hand the bytes to the **OS
+clipboard** (e.g. an `arboard`-backed endpoint), bypassing the WebKit restriction
+entirely.
+
+### 19. Library Files Have Two Formats — Let `updateLibrary` Migrate
+
+**Problem:** `.excalidrawlib` files exist in two shapes: the legacy **v1**
+(`{ type, version: 1, library: ElementGroup[][] }`) and **v2**
+(`{ type, version: 2, libraryItems: LibraryItem[] }`). Many public libraries on
+`libraries.excalidraw.com` are still v1, so code that only reads `libraryItems`
+silently imports nothing.
+
+**Workaround:** Don't reimplement the migration. `updateLibrary` accepts a `Blob`
+(its `LibraryItemsSource` union) and parses *both* formats internally:
+
+```js
+await api.updateLibrary({
+  libraryItems: new Blob([rawLibText], { type: "application/json" }),
+  merge: true,
+});
+```
+
+For the **"Browse libraries" install** in an embedded/self-hosted app, set the
+`libraryReturnUrl` prop so the library site's "Add to Excalidraw" button returns to
+your origin as `…?addLibrary=<url>` / `#addLibrary=<url>`; fetch that URL (the
+fragment isn't sent to a server — read it client-side) and feed it to
+`updateLibrary`. Excalidraw's own handling lives in the `useHandleLibrary` hook.
+
+### 20. Image/Clipboard-SVG Export Honors `appState.exportWithDarkMode`
+
+**Problem:** Both image exports *and* the right-click "Copy to clipboard as SVG"
+render using `appState.exportWithDarkMode`, which defaults to `false`. So even in a
+dark editor you get a light export, and there's no obvious UI to change it unless
+you expose Excalidraw's export dialog.
+
+**Workaround:** Flip it explicitly (it's persisted scene state, so it round-trips):
+
+```js
+api.updateScene({ appState: { exportWithDarkMode: true } });
+```
+
+Pass the same flag into `exportToSvg`/`exportToBlob` when exporting
+programmatically. Pair with `exportEmbedScene` (gotcha #9) when you need editable
+`.excalidraw.svg`/`.excalidraw.png` round-trips.
 
 ---
 
@@ -690,11 +782,4 @@ Elements use fractional indexing (the `index` property, e.g., `"a0"`, `"a1"`, `"
 
 ### Binary Files (Images)
 
-Image data is stored separately from elements in the `files` object at the top level of the scene. Images are referenced by `fileId` and stored as base64 data URLs. The `generateIdForFile` prop allows host applications to control file ID generation (default: SHA-1 digest).The research document above covers all requested topics:
-
-- **Core functionality**: Element types, editor features, collaboration, localization
-- **Export formats**: `.excalidraw`, `.excalidrawlib`, SVG, PNG, JPEG, WebP, clipboard (JSON/SVG/PNG)
-- **File structure**: Complete `.excalidraw` JSON schema with all element properties, a blank file example, and the clipboard format
-- **Schema status**: No formal JSON Schema publication; schema is defined implicitly by TypeScript types and normalized by `restore()`
-- **Version history**: Full release timeline from v0.9.0 (Jul 2021) through v0.18.1 (Apr 2025) with Mermaid timeline diagram
-- **Developer gotchas**: 16 documented gotchas with specific workarounds covering ESM migration, SSR, asset paths, undo history, font loading, Brave browser, and more
+Image data is stored separately from elements in the `files` object at the top level of the scene. Images are referenced by `fileId` and stored as base64 data URLs. The `generateIdForFile` prop allows host applications to control file ID generation (default: SHA-1 digest).
