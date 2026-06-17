@@ -28,6 +28,10 @@ mime_guess = "2"
 dirs = "6"
 open = "5"
 url = "2"
+# Native OS clipboard. Used by POST /copy-clipboard so "Copy SVG to clipboard"
+# works reliably in WKWebView, which blocks the page's async clipboard write
+# after the SVG is generated (the await drops the user-activation).
+arboard = "3"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rfd = "0.17"

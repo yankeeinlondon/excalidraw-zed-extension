@@ -128,6 +128,15 @@ export default function App({
 }: AppProps) {
   const resolvedTheme = useOsTheme(theme as "auto" | "light" | "dark");
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
+  // Mirror of appState.exportWithDarkMode so the menu toggle can show and flip
+  // the flag that image exports and the right-click "Copy to clipboard as SVG"
+  // both read. Seeded from the loaded scene; kept in sync by handleChange.
+  const [exportDarkMode, setExportDarkMode] = useState<boolean>(() =>
+    Boolean(
+      (initialData.appState as { exportWithDarkMode?: boolean } | undefined)
+        ?.exportWithDarkMode,
+    ),
+  );
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const libraryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Fingerprint of the last-observed scene (elements + files + meaningful
@@ -452,6 +461,14 @@ export default function App({
       if (hash === prevHashRef.current) return;
       prevHashRef.current = hash;
 
+      // Keep the menu toggle's label in step with the live export-dark-mode flag
+      // (it's part of the persisted appState, so it only changes on a real edit —
+      // here, past the no-op hash guard). setState bails out when unchanged.
+      const liveExportDark = Boolean(
+        (appState as { exportWithDarkMode?: boolean }).exportWithDarkMode,
+      );
+      setExportDarkMode((prev) => (prev === liveExportDark ? prev : liveExportDark));
+
       if (!dirtyRef.current) {
         dirtyRef.current = true;
         reportDirty(true, autoSave);
@@ -523,6 +540,60 @@ export default function App({
     },
     [name],
   );
+
+  /**
+   * Flips appState.exportWithDarkMode — the flag every image/SVG export and the
+   * right-click "Copy to clipboard as SVG" read to decide light vs dark. Applied
+   * via updateScene (a real appState edit), so it persists with the scene and the
+   * onChange it triggers updates the menu label and saves like any other edit.
+   */
+  const toggleExportDarkMode = useCallback(() => {
+    const api = apiRef.current;
+    if (!api) return;
+    const next = !api.getAppState().exportWithDarkMode;
+    api.updateScene({ appState: { exportWithDarkMode: next } });
+    api.setToast({
+      message: `Export color mode: ${next ? "dark" : "light"}`,
+      duration: 1500,
+    });
+  }, []);
+
+  /**
+   * Copies the current scene as an SVG to the system clipboard, honoring the
+   * export color mode (appState.exportWithDarkMode). Routes the SVG to Rust's
+   * `POST /copy-clipboard` (native OS clipboard) instead of `navigator.clipboard`
+   * because WKWebView rejects the page's async clipboard write once the SVG has
+   * been generated — the same limitation that breaks Excalidraw's built-in
+   * "Copy to clipboard as SVG" in the embedded window.
+   */
+  const handleCopySvgToClipboard = useCallback(async () => {
+    const api = apiRef.current;
+    if (!api) return;
+    const appState = api.getAppState();
+    try {
+      const elements = api.getSceneElements().filter((e) => !e.isDeleted);
+      if (elements.length === 0) {
+        api.setToast({ message: "Nothing to copy", duration: 1500 });
+        return;
+      }
+      const svg = await exportToSvg({ elements, appState, files: api.getFiles() });
+      const res = await fetch("/copy-clipboard", {
+        method: "POST",
+        headers: { "Content-Type": "image/svg+xml" },
+        body: svg.outerHTML,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      api.setToast({
+        message: `Copied SVG to clipboard (${appState.exportWithDarkMode ? "dark" : "light"})`,
+        duration: 2000,
+      });
+    } catch (e) {
+      api.setToast({
+        message: `Copy to clipboard failed: ${e instanceof Error ? e.message : String(e)}`,
+        duration: 4000,
+      });
+    }
+  }, []);
 
   /**
    * Writes the given library items to the shared library file and resolves to
@@ -839,6 +910,12 @@ export default function App({
           </MainMenu.Item>
           <MainMenu.Item onSelect={() => void handleExport("scene")}>
             Export scene (.excalidraw)
+          </MainMenu.Item>
+          <MainMenu.Item onSelect={toggleExportDarkMode}>
+            {`Export Color Mode: ${exportDarkMode ? "dark" : "light"}`}
+          </MainMenu.Item>
+          <MainMenu.Item onSelect={() => void handleCopySvgToClipboard()}>
+            Copy SVG to clipboard
           </MainMenu.Item>
           <MainMenu.Separator />
           {/*

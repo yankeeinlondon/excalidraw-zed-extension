@@ -350,6 +350,7 @@ fn main() -> Result<()> {
         .route("/library-install", get(serve_library_install))
         .route("/install-library", axum::routing::post(install_library))
         .route("/pending-library", get(drain_pending_libraries))
+        .route("/copy-clipboard", axum::routing::post(copy_to_clipboard))
         .route("/events", get(serve_events))
         .route("/focus", get(handle_focus))
         .route("/shutdown", get(handle_shutdown))
@@ -882,6 +883,30 @@ async fn drain_pending_libraries(State(state): State<Arc<AppState>>) -> impl Int
         .map(|mut q| std::mem::take(&mut *q))
         .unwrap_or_default();
     axum::Json(serde_json::json!({ "libraries": libraries }))
+}
+
+/// Writes the request body to the system clipboard as text.
+///
+/// The WebView posts here from "Copy SVG to clipboard" instead of using the
+/// page's `navigator.clipboard`: WKWebView rejects an async clipboard write once
+/// the SVG has been generated (the `await` drops the transient user-activation),
+/// which is why Excalidraw's built-in "Copy to clipboard as SVG" fails in the
+/// embedded window. Going through the OS clipboard here sidesteps that entirely.
+/// Runs on a blocking thread since `arboard` is synchronous.
+async fn copy_to_clipboard(body: axum::body::Bytes) -> Response {
+    use axum::http::StatusCode;
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(text))
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -2488,7 +2513,11 @@ fn run_lsp_server() -> Result<()> {
             "textDocument/didOpen" => {
                 if let Some(uri) = msg["params"]["textDocument"]["uri"].as_str() {
                     if let Some(path) = file_uri_to_path(uri) {
-                        spawn_preview(&exe, &path);
+                        // Only real Excalidraw files get a preview; Zed may attach
+                        // this server to plain .svg/.png too (see is_excalidraw_path).
+                        if is_excalidraw_path(&path) {
+                            spawn_preview(&exe, &path);
+                        }
                     }
                 }
             }
@@ -2509,7 +2538,7 @@ fn run_lsp_server() -> Result<()> {
                 // preview. If a live instance already exists, this is a no-op.
                 if let Some(uri) = msg["params"]["textDocument"]["uri"].as_str() {
                     if let Some(path) = file_uri_to_path(uri) {
-                        if !preview_is_live(&path) {
+                        if is_excalidraw_path(&path) && !preview_is_live(&path) {
                             spawn_preview(&exe, &path);
                         }
                     }
@@ -2618,6 +2647,25 @@ fn preview_is_live(path: &std::path::Path) -> bool {
 /// auto-open and save-triggered reopen on Windows.
 fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     url::Url::parse(uri).ok()?.to_file_path().ok()
+}
+
+/// Whether `path` is a file the preview actually handles: `.excalidraw`,
+/// `.excalidraw.svg`, or `.excalidraw.png`.
+///
+/// The language server is attached to the "Excalidraw" language (path suffixes
+/// `excalidraw`, `excalidraw.svg`, `excalidraw.png`), but Zed's suffix matching
+/// also fires the server for plain `.svg`/`.png` files. Gating `didOpen`/`didSave`
+/// on this keeps a plain image from spawning a preview that can only fail — a
+/// plain `.svg`/`.png` has no embedded Excalidraw scene and is MIME-detected as
+/// JSON, so every format fallback errors out ("all format fallbacks failed").
+fn is_excalidraw_path(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.ends_with(".excalidraw")
+                || name.ends_with(".excalidraw.svg")
+                || name.ends_with(".excalidraw.png")
+        })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -3524,6 +3572,23 @@ mod tests {
     // ── LSP file:// URI parsing (finding 1) ─────────────────────────────────────
 
     #[cfg(unix)]
+    #[test]
+    fn test_is_excalidraw_path() {
+        use std::path::Path;
+        // Handled: the three Excalidraw variants.
+        assert!(is_excalidraw_path(Path::new("/x/diagram.excalidraw")));
+        assert!(is_excalidraw_path(Path::new("/x/diagram.excalidraw.svg")));
+        assert!(is_excalidraw_path(Path::new("/x/diagram.excalidraw.png")));
+        // Not handled: plain images (the bug — Zed attaches the server to these,
+        // but spawning a preview only fails) and unrelated files.
+        assert!(!is_excalidraw_path(Path::new("/x/test.svg")));
+        assert!(!is_excalidraw_path(Path::new("/x/photo.png")));
+        assert!(!is_excalidraw_path(Path::new("/x/notes.md")));
+        // A directory named like one shouldn't matter, but the suffix still holds;
+        // guard only inspects the file name, which is correct for LSP URIs.
+        assert!(!is_excalidraw_path(Path::new("/x/excalidraw")));
+    }
+
     #[test]
     fn test_file_uri_to_path_posix_percent_decoded() {
         // A normal POSIX URI with a percent-encoded space must decode to the

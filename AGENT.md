@@ -189,6 +189,7 @@ Additional flags:
 | `GET /library-install` | Landing page for the "Browse libraries" round-trip (`libraryReturnUrl`); reads `#addLibrary=<url>` and POSTs it to `/install-library` |
 | `POST /install-library` | `{ libraryUrl }`: server-side fetch (allow-listed https hosts) of the chosen `.excalidrawlib`, validate, queue it, broadcast `library` |
 | `GET /pending-library` | Drain queued installs as `{ libraries: [rawDoc, …] }` for the WebView to feed to `updateLibrary` |
+| `POST /copy-clipboard` | Write the request body to the OS clipboard (via `arboard`); backs "Copy SVG to clipboard" since WKWebView blocks the page's async clipboard write |
 | `POST /export` | Receive exported bytes; write via native save dialog (or `--export-dir`) |
 | `GET /events` | SSE stream; emit `data: reload` on file change, `data: library` after a "Browse libraries" install |
 | `GET /focus` | Signal WebView window to call `window.set_focus()` |
@@ -239,7 +240,11 @@ browser, not the WebView):
 ### LSP server
 
 Implements a minimal JSON-RPC LSP so Zed can invoke the binary as a language server for `.excalidraw` files:
-- `textDocument/didOpen` → spawns `excalidraw-preview <path>` as a detached process
+- `textDocument/didOpen` → spawns `excalidraw-preview <path>` as a detached process,
+  **but only if `is_excalidraw_path` matches** (`.excalidraw`, `.excalidraw.svg`, or
+  `.excalidraw.png`). Zed's `path_suffixes` matching also attaches this server to plain
+  `.svg`/`.png` files; spawning a preview for those only fails (no embedded scene, wrong
+  MIME → "all format fallbacks failed"), so the guard skips them. Same guard on `didSave`.
 - `textDocument/didClose` → **no-op.** The preview persists until the user closes its
   window. Zed reuses one "preview tab" for single-clicked files and sends `didClose`
   whenever you browse to another file, so tearing the window down here made previews
@@ -320,6 +325,14 @@ SVG (.excalidraw.svg)" menu item (`ExportKind` `"svg-scene"`) writes a scene-emb
 via the native save dialog, giving a graceful conversion path from a JSON scene to an
 editable `.excalidraw.svg`. Equivalently, copy/paste between two preview windows works now
 that the WebView loads from a secure-context `localhost` origin (see startup step 9).
+
+**Export color mode + clipboard.** "Export Color Mode: {dark|light}" toggles
+`appState.exportWithDarkMode` (persisted scene state) via `updateScene`; every image
+export *and* the SVG clipboard copy read it. "Copy SVG to clipboard" generates the SVG
+and POSTs it to `/copy-clipboard` for a native (OS-level) clipboard write — Excalidraw's
+own right-click "Copy to clipboard as SVG" fails in the WebView because WKWebView rejects
+the page's `navigator.clipboard` write after the SVG is `await`-generated (the await drops
+the transient user-activation), so the reliable path goes through Rust.
 
 **Auto-save:** when `autoSave` prop is `true` (set from `config.autoSave`), `onChange` is wired to a debounced save (600 ms). Only fires when element hash changes (not on viewport/selection events).
 
