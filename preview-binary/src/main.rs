@@ -3589,10 +3589,13 @@ mod tests {
         assert!(!is_excalidraw_path(Path::new("/x/excalidraw")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_file_uri_to_path_posix_percent_decoded() {
         // A normal POSIX URI with a percent-encoded space must decode to the
-        // real path, not the literal `%20`.
+        // real path, not the literal `%20`. Unix-only: a driveless path like
+        // `/Users/...` has no Windows equivalent, so `Url::to_file_path` rejects
+        // it on Windows (drive-letter percent-decoding is covered separately).
         let path = file_uri_to_path("file:///Users/me/a%20b.excalidraw")
             .expect("POSIX file URI should parse");
         assert_eq!(path, std::path::Path::new("/Users/me/a b.excalidraw"));
@@ -3614,6 +3617,12 @@ mod tests {
         let path = file_uri_to_path("file:///C:/Users/me/a.excalidraw")
             .expect("Windows drive-letter URI should parse");
         assert_eq!(path, std::path::Path::new(r"C:\Users\me\a.excalidraw"));
+
+        // Percent-encoded space must decode here too (Windows counterpart of the
+        // unix-only test_file_uri_to_path_posix_percent_decoded).
+        let spaced = file_uri_to_path("file:///C:/Users/me/a%20b.excalidraw")
+            .expect("Windows drive-letter URI with space should parse");
+        assert_eq!(spaced, std::path::Path::new(r"C:\Users\me\a b.excalidraw"));
     }
 
     #[cfg(windows)]
