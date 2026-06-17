@@ -176,6 +176,26 @@ Additional flags:
    `navigator.clipboard` undefined, breaking Excalidraw copy/paste).
 10. On window close: remove lock file, shut down server.
 
+**Window title.** `{Repo Title Case}({branch}) ┃ {path-from-worktree-root}` when the file is
+inside a git repo (resolved once at launch via `gix`, `git_repo_label`), else the file's
+path rendered by `display_path` — `~/…` when under the user's home directory, otherwise the
+full absolute path. `gix::discover` is started from the file's **parent directory** (handed a
+file path it errors), which also resolves linked worktrees. The repo label is the *main*
+repo's directory name (from `common_dir`, so a linked worktree shows the project name, not the
+worktree dir) run through `title_case` (`excalidraw-zed-extension` → `Excalidraw Zed
+Extension`); the branch name is verbatim. The `┃` (U+2503 heavy vertical) separates repo info
+from the path. A trailing `*` marks unsaved scene edits — `CloseContext::window_title` appends
+it from the shared dirty state, and both event loops re-apply the title whenever that state
+flips.
+
+**Window size.** The window reopens at the last size the user left it (one global value for
+all diagrams, `window.json` in the config dir via `load_window_size`/`save_window_size`),
+clamped by `clamp_window_size` so a size saved on a larger display never opens off-screen.
+Tracked on each `Resized` event and persisted on `LoopDestroyed` (the event loop never
+returns, so saving after `run` would be dead code). `--smoke` never persists (hidden window).
+Title bars are plain text on every platform (no styling). Dev mode (`--dev`) uses
+`"Excalidraw Preview"`.
+
 ### HTTP Routes
 
 | Route | Description |
@@ -379,6 +399,8 @@ sha2       = "0.11"          # for lock file path hashing
 rust-embed = "8"             # for embedding assets/ directory
 reqwest    = { version = "0.13", features = ["json", "blocking"] }
 rfd        = "0.17"          # native save dialog
+arboard    = "3"             # native OS clipboard (POST /copy-clipboard)
+gix        = { version = "0.70", default-features = false }  # repo+branch for window title
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```

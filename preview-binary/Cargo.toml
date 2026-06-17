@@ -32,6 +32,10 @@ url = "2"
 # works reliably in WKWebView, which blocks the page's async clipboard write
 # after the SVG is generated (the await drops the user-activation).
 arboard = "3"
+# Read the enclosing git repo (name + branch) for the window title. default-
+# features off keeps the build light (pure-Rust zlib, no zlib-ng/cmake) since we
+# only resolve HEAD + workdir.
+gix = { version = "0.70", default-features = false }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rfd = "0.17"

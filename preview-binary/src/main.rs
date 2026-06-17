@@ -135,6 +135,10 @@ struct CloseContext {
     /// When true (`--smoke`), the event loop runs [`SmokeDriver`] against the real
     /// WebView, prints a report, and exits instead of waiting for the user.
     smoke: bool,
+    /// Window-title text *without* the dirty marker: `"{repo}({branch}) | {file}"`
+    /// inside a git repo, else just `"{file}"`. The live `*` marker is appended by
+    /// [`CloseContext::window_title`] from the current dirty state.
+    title_base: String,
 }
 
 impl CloseContext {
@@ -146,6 +150,19 @@ impl CloseContext {
             auto_save: false,
             lock_path: None,
             smoke: false,
+            title_base: "Excalidraw Preview".to_string(),
+        }
+    }
+
+    /// The full window title for the current dirty state: `title_base` with a
+    /// trailing `*` when the scene has unsaved edits. Called on each event-loop
+    /// tick so the marker tracks edits and saves live.
+    fn window_title(&self) -> String {
+        let dirty = self.dirty.read().map(|d| d.dirty).unwrap_or(false);
+        if dirty {
+            format!("{}*", self.title_base)
+        } else {
+            self.title_base.clone()
         }
     }
 
@@ -424,12 +441,26 @@ fn main() -> Result<()> {
         }
     }
 
+    // Title bar: "{Repo Title Case}({branch}) | {path-from-repo-root}" when the
+    // file lives in a git repo, else the file's path (home-relative via `~`, or
+    // absolute when outside home). The live "*" dirty marker is appended per-tick
+    // by CloseContext::window_title. Computed once here (branch/repo are resolved
+    // at launch; only the dirty marker updates while the window is open).
+    let title_base = match git_repo_label(&canonical_path) {
+        Some((repo_label, repo_relative_path)) => {
+            // U+2503 (heavy vertical) separates repo info from the path — a
+            // full-height rule that reads more clearly than an ASCII `|`.
+            format!("{repo_label} ┃ {repo_relative_path}")
+        }
+        None => display_path(&canonical_path),
+    };
     let close_ctx = CloseContext {
         dirty: state.dirty.clone(),
         pending_actions: state.pending_actions.clone(),
         auto_save: args.auto_save,
         lock_path: Some(lock_path.clone()),
         smoke: args.smoke,
+        title_base,
     };
     if let Err(e) = run_webview(port, focus_rx, export_rx, library_open_rx, close_ctx) {
         eprintln!(
@@ -464,6 +495,108 @@ fn detect_content_type(path: &Path) -> String {
     } else {
         "application/json".to_string()
     }
+}
+
+/// For a file inside a git repo, returns `(repo_label, repo_relative_path)` where
+/// `repo_label` is `"{Repo Title Case}({branch})"` and `repo_relative_path` is the
+/// file's path from the work-tree root (forward-slashed). Returns `None` when the
+/// file is not in a (non-bare) git repo, so the caller falls back to the display
+/// path.
+///
+/// `path` must be absolute/canonical; the working dir is canonicalized too so the
+/// relative-path strip is robust against symlinked repo roots.
+fn git_repo_label(path: &Path) -> Option<(String, String)> {
+    // `gix::discover` walks *up* from a directory; handed a file path it errors
+    // ("not a directory") and we'd fall back to the plain path. Start from the
+    // file's parent directory so discovery actually runs (this also resolves
+    // linked worktrees, whose `.git` is a gitdir-pointer file).
+    let start = path.parent().unwrap_or(path);
+    let repo = gix::discover(start).ok()?;
+
+    // The repo *name* comes from the main repository, not the work tree: for a
+    // linked worktree `work_dir()` is the worktree's own directory (e.g.
+    // `claudine`), whereas `common_dir()` points at the main repo's `.git` (e.g.
+    // `…/rusty-biscuit/.git`), whose parent is the project root. For a normal
+    // checkout the two coincide.
+    let repo_name = main_repo_name(repo.common_dir())?;
+
+    // The relative path stays anchored at the current work tree (the worktree
+    // root for a linked worktree), forward-slashed and never absolute.
+    let workdir = std::fs::canonicalize(repo.work_dir()?).ok()?;
+    let relative = path
+        .strip_prefix(&workdir)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    Some((
+        format!("{}({})", title_case(&repo_name), git_branch(&repo)),
+        relative,
+    ))
+}
+
+/// The project name for a repository, derived from its common git dir
+/// (`gix::Repository::common_dir`). For the usual `<root>/.git` layout this is
+/// `<root>`'s directory name; a bare-style `<name>.git` falls back to `<name>`.
+/// Returns `None` only if the path has no usable final component.
+fn main_repo_name(common_dir: &Path) -> Option<String> {
+    // Best-effort canonicalize: normalizes any `..`/trailing slash so the `.git`
+    // suffix check is reliable, but a non-canonicalizable path still works as-is.
+    let canon = std::fs::canonicalize(common_dir).unwrap_or_else(|_| common_dir.to_path_buf());
+    let last = canon.file_name()?.to_string_lossy().to_string();
+    if last == ".git" {
+        // `<root>/.git` → the project is the parent directory.
+        return Some(canon.parent()?.file_name()?.to_string_lossy().to_string());
+    }
+    // Bare repo like `<name>.git` → strip the suffix.
+    Some(last.strip_suffix(".git").unwrap_or(&last).to_string())
+}
+
+/// Converts a repo directory name into a Title Case label: word separators
+/// (`-`, `_`, space) collapse into single spaces and each word's first letter is
+/// uppercased, e.g. `excalidraw-zed-extension` → `Excalidraw Zed Extension`. The
+/// rest of each word is left untouched so acronyms (`my-API-tool` → `My API Tool`)
+/// survive.
+fn title_case(name: &str) -> String {
+    name.split(['-', '_', ' '])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Renders an absolute path for the title bar of a file that is *not* in a git
+/// repo: paths under the user's home directory use the `~` alias (`~` for the home
+/// dir itself, `~/rel/path` beneath it); everything else is shown in full. Output
+/// is forward-slashed for consistency with the repo-relative path.
+fn display_path(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            let rest = rest.to_string_lossy().replace('\\', "/");
+            return if rest.is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{rest}")
+            };
+        }
+    }
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Short name of the repo's current branch (e.g. `main`), or the short commit id
+/// when HEAD is detached, or `?` if it can't be determined.
+fn git_branch(repo: &gix::Repository) -> String {
+    if let Ok(Some(name)) = repo.head_name() {
+        return name.shorten().to_string();
+    }
+    repo.head_id()
+        .map(|id| id.to_hex_with_len(7).to_string())
+        .unwrap_or_else(|_| "?".to_string())
 }
 
 /// A minimal valid Excalidraw scene, written into empty `.excalidraw` files.
@@ -665,6 +798,62 @@ fn library_path() -> Option<PathBuf> {
         .ok()
         .or_else(dirs::config_dir)?;
     Some(base.join("excalidraw-zed").join("library.excalidrawlib"))
+}
+
+/// Default window size (logical px) when nothing has been remembered yet.
+const DEFAULT_WINDOW_SIZE: (f64, f64) = (1200.0, 800.0);
+/// Floor for a remembered/clamped window size so a corrupt or tiny value can
+/// never open an unusably small window.
+const MIN_WINDOW_SIZE: (f64, f64) = (400.0, 300.0);
+
+/// Path of the persisted window size: one global value shared by every diagram
+/// and session. `EXCALIDRAW_ZED_CONFIG_DIR` overrides the platform config dir.
+fn window_state_path() -> Option<PathBuf> {
+    let base = std::env::var("EXCALIDRAW_ZED_CONFIG_DIR")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(dirs::config_dir)?;
+    Some(base.join("excalidraw-zed").join("window.json"))
+}
+
+/// The last persisted window size in logical pixels, if present and sane.
+/// Corrupt, non-finite, or below-minimum values are rejected (→ `None`).
+fn load_window_size() -> Option<(f64, f64)> {
+    let text = std::fs::read_to_string(window_state_path()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let w = v.get("width")?.as_f64()?;
+    let h = v.get("height")?.as_f64()?;
+    if w.is_finite() && h.is_finite() && w >= MIN_WINDOW_SIZE.0 && h >= MIN_WINDOW_SIZE.1 {
+        Some((w, h))
+    } else {
+        None
+    }
+}
+
+/// Persists the window size (logical pixels) for next launch. Best-effort: any
+/// I/O error is ignored (a missing remembered size just falls back to default).
+fn save_window_size(width: f64, height: f64) {
+    let Some(path) = window_state_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = serde_json::json!({ "width": width, "height": height }).to_string();
+    let _ = std::fs::write(path, body);
+}
+
+/// Clamps a desired logical window size so it never exceeds the monitor's
+/// logical size (a size remembered from a larger display can't open off-screen)
+/// while staying at or above [`MIN_WINDOW_SIZE`]. `None` monitor → size unchanged
+/// (apart from the minimum floor).
+fn clamp_window_size(size: (f64, f64), monitor_logical: Option<(f64, f64)>) -> (f64, f64) {
+    let (mut w, mut h) = size;
+    if let Some((mw, mh)) = monitor_logical {
+        w = w.min(mw);
+        h = h.min(mh);
+    }
+    (w.max(MIN_WINDOW_SIZE.0), h.max(MIN_WINDOW_SIZE.1))
 }
 
 async fn serve_library() -> impl IntoResponse {
@@ -2014,7 +2203,7 @@ fn run_webview_url(
     gtk::init().map_err(|e| format!("Failed to init GTK: {}", e))?;
 
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
-    window.set_title("Excalidraw Preview");
+    window.set_title(&close_ctx.window_title());
     window.set_default_size(1200, 800);
 
     // --smoke runs as a background self-test: don't let the window grab focus when
@@ -2076,6 +2265,8 @@ fn run_webview_url(
     // --smoke: an automated self-test driven one step per tick against this real
     // WebView. `None` in normal runs.
     let mut smoke_driver = close_ctx.smoke.then(SmokeDriver::new);
+    // Last dirty value reflected in the title bar (see the tao path for rationale).
+    let mut last_title_dirty = false;
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         // --smoke: advance the self-test; print the report and exit when it ends.
         if let Some(driver) = smoke_driver.as_mut() {
@@ -2143,6 +2334,14 @@ fn run_webview_url(
             gtk::main_quit();
             return gtk::glib::ControlFlow::Break;
         }
+
+        // Refresh the title's "*" dirty marker when the scene's dirty state flips.
+        let dirty_now = close_ctx_tick.dirty.read().map(|d| d.dirty).unwrap_or(false);
+        if dirty_now != last_title_dirty {
+            last_title_dirty = dirty_now;
+            window_for_tick.set_title(&close_ctx_tick.window_title());
+        }
+
         gtk::glib::ControlFlow::Continue
     });
 
@@ -2190,9 +2389,20 @@ fn run_webview_url(
     use wry::WebViewBuilder;
 
     let event_loop = EventLoop::new();
+
+    // Reopen at the last remembered size (global, all diagrams share one), clamped
+    // so a size saved on a larger display never opens off-screen on a smaller one.
+    let monitor_logical = event_loop.primary_monitor().map(|m| {
+        let sf = m.scale_factor();
+        let phys = m.size();
+        (phys.width as f64 / sf, phys.height as f64 / sf)
+    });
+    let (win_w, win_h) =
+        clamp_window_size(load_window_size().unwrap_or(DEFAULT_WINDOW_SIZE), monitor_logical);
+
     let window = WindowBuilder::new()
-        .with_title("Excalidraw Preview")
-        .with_inner_size(tao::dpi::LogicalSize::new(1200.0, 800.0))
+        .with_title(close_ctx.window_title())
+        .with_inner_size(tao::dpi::LogicalSize::new(win_w, win_h))
         // --smoke runs headlessly as far as the user is concerned: keep the window
         // hidden and unfocused so an automated run can't pop up over — or steal
         // focus from — whatever the user is doing (which would make results flaky).
@@ -2260,6 +2470,14 @@ fn run_webview_url(
     // WebView. `None` in normal runs.
     let mut smoke_driver = close_ctx.smoke.then(SmokeDriver::new);
 
+    // Last dirty value reflected in the title bar, so the "*" marker is only
+    // re-applied when the scene's dirty state actually flips (not every tick).
+    let mut last_title_dirty = false;
+
+    // Latest logical window size, tracked on every resize and persisted on exit
+    // so the next launch reopens at this size. Seeded with the size we opened at.
+    let mut last_logical_size = (win_w, win_h);
+
     event_loop.run(move |event, _, control_flow| {
         // Keep the menu alive for the lifetime of the event loop.
         let _ = &menu;
@@ -2269,10 +2487,29 @@ fn run_webview_url(
             std::time::Instant::now() + std::time::Duration::from_millis(100),
         );
 
+        // Track resizes so the size is remembered, and persist on loop teardown.
+        // (`event_loop.run` never returns on macOS, so saving after it is dead
+        // code — `LoopDestroyed` is the one place that runs on every exit path.)
+        if let tao::event::Event::WindowEvent {
+            event: tao::event::WindowEvent::Resized(size),
+            ..
+        } = &event
+        {
+            // Ignore a zeroed size (minimize) so a restored window never reopens
+            // collapsed. Convert physical → logical with the live scale factor.
+            if size.width > 0 && size.height > 0 {
+                let sf = window.scale_factor();
+                last_logical_size = (size.width as f64 / sf, size.height as f64 / sf);
+            }
+        }
+        if matches!(&event, tao::event::Event::LoopDestroyed) && !close_ctx.smoke {
+            save_window_size(last_logical_size.0, last_logical_size.1);
+        }
+
         if let tao::event::Event::WindowEvent {
             event: tao::event::WindowEvent::CloseRequested,
             ..
-        } = event
+        } = &event
         {
             // tao has no veto: to keep the window alive we simply do NOT set
             // ControlFlow::Exit, and instead drive a query → decide → save flow,
@@ -2367,6 +2604,13 @@ fn run_webview_url(
         if focus_rx.has_changed().unwrap_or(false) {
             let _ = focus_rx.borrow_and_update();
             window.set_focus();
+        }
+
+        // Refresh the title's "*" dirty marker when the scene's dirty state flips.
+        let dirty_now = close_ctx.dirty.read().map(|d| d.dirty).unwrap_or(false);
+        if dirty_now != last_title_dirty {
+            last_title_dirty = dirty_now;
+            window.set_title(&close_ctx.window_title());
         }
 
         // --smoke: advance the self-test; print the report and exit when it ends.
@@ -3571,7 +3815,152 @@ mod tests {
 
     // ── LSP file:// URI parsing (finding 1) ─────────────────────────────────────
 
+    /// Runs `git` in `dir`, panicking on failure. Used to build hermetic repos
+    /// for the `git_repo_label` tests.
     #[cfg(unix)]
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            // Keep test repos isolated from the developer's global git config.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_git_repo_label_for_file_in_repo() {
+        // A file inside a normal checkout must resolve to
+        // "(Title Case Repo(branch), repo-relative-path)". Regression guard for the
+        // `gix::discover` file-vs-directory bug: handed the file path directly,
+        // discover errored and the label silently fell back to the bare path.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("my-cool-repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+
+        let sub = repo.join("docs");
+        std::fs::create_dir(&sub).unwrap();
+        let file = sub.join("diagram.excalidraw");
+        std::fs::write(&file, "{}").unwrap();
+        let file = std::fs::canonicalize(&file).unwrap();
+
+        let (label, relative) = git_repo_label(&file).expect("file in repo → Some");
+        // Repo dir name is Title-Cased; branch is verbatim.
+        assert_eq!(label, "My Cool Repo(main)", "label was: {label}");
+        assert_eq!(relative, "docs/diagram.excalidraw");
+        assert!(!relative.starts_with('/'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_git_repo_label_for_file_in_linked_worktree() {
+        // A file inside a *linked* worktree (its `.git` is a gitdir-pointer file,
+        // not a directory) must still resolve, with the worktree dir as the repo
+        // root — this is the real-world case that surfaced the discover bug.
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main-repo");
+        std::fs::create_dir(&main).unwrap();
+        git_in(&main, &["init", "-b", "main"]);
+        std::fs::write(main.join("seed"), "x").unwrap();
+        git_in(&main, &["add", "."]);
+        git_in(&main, &["commit", "-m", "seed"]);
+
+        // Add a linked worktree on a new branch.
+        let wt = tmp.path().join("feature-work");
+        git_in(
+            &main,
+            &["worktree", "add", "-b", "feature", wt.to_str().unwrap()],
+        );
+
+        let file = wt.join("art.excalidraw.svg");
+        std::fs::write(&file, "<svg/>").unwrap();
+        let file = std::fs::canonicalize(&file).unwrap();
+
+        let (label, relative) = git_repo_label(&file).expect("file in worktree → Some");
+        // The label is the *main* repo name ("main-repo" → "Main Repo"), NOT the
+        // worktree directory ("feature-work"); the branch is the worktree's branch.
+        // The relative path is anchored at the worktree root.
+        assert_eq!(label, "Main Repo(feature)", "label was: {label}");
+        assert_eq!(relative, "art.excalidraw.svg");
+    }
+
+    #[test]
+    fn test_title_case() {
+        assert_eq!(
+            title_case("excalidraw-zed-extension"),
+            "Excalidraw Zed Extension"
+        );
+        assert_eq!(title_case("my_cool_repo"), "My Cool Repo");
+        assert_eq!(title_case("single"), "Single");
+        // Acronyms / existing capitals in the tail are preserved.
+        assert_eq!(title_case("my-API-tool"), "My API Tool");
+        // Leading/duplicate separators don't produce empty words.
+        assert_eq!(title_case("-foo--bar-"), "Foo Bar");
+    }
+
+    #[test]
+    fn test_display_path_home_alias() {
+        let home = dirs::home_dir().expect("home dir");
+        // A file under home collapses to `~/...`.
+        let under_home = home.join("projects").join("diagram.excalidraw");
+        assert_eq!(
+            display_path(&under_home),
+            "~/projects/diagram.excalidraw".to_string()
+        );
+        // The home dir itself renders as a bare `~`.
+        assert_eq!(display_path(&home), "~".to_string());
+    }
+
+    #[test]
+    fn test_display_path_outside_home_is_absolute() {
+        // A path that cannot be under home (root-level) is shown in full.
+        let outside = std::path::Path::new("/opt/diagrams/x.excalidraw");
+        assert_eq!(display_path(outside), "/opt/diagrams/x.excalidraw");
+    }
+
+    #[test]
+    fn test_clamp_window_size() {
+        // Fits within the monitor → unchanged.
+        assert_eq!(
+            clamp_window_size((1000.0, 700.0), Some((1920.0, 1080.0))),
+            (1000.0, 700.0)
+        );
+        // Larger than the monitor → clamped down to it (never opens off-screen).
+        assert_eq!(
+            clamp_window_size((4000.0, 3000.0), Some((1920.0, 1080.0))),
+            (1920.0, 1080.0)
+        );
+        // Below the floor → raised to the minimum.
+        assert_eq!(
+            clamp_window_size((100.0, 100.0), Some((1920.0, 1080.0))),
+            MIN_WINDOW_SIZE
+        );
+        // No monitor info → only the minimum floor applies.
+        assert_eq!(clamp_window_size((1000.0, 700.0), None), (1000.0, 700.0));
+    }
+
+    #[test]
+    fn test_window_size_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("EXCALIDRAW_ZED_CONFIG_DIR", dir.path());
+        // Nothing remembered yet.
+        assert_eq!(load_window_size(), None);
+        // A saved size round-trips.
+        save_window_size(1600.0, 1000.0);
+        assert_eq!(load_window_size(), Some((1600.0, 1000.0)));
+        // A corrupt/too-small saved value is rejected (caller falls back to default).
+        save_window_size(10.0, 10.0);
+        assert_eq!(load_window_size(), None);
+    }
+
     #[test]
     fn test_is_excalidraw_path() {
         use std::path::Path;

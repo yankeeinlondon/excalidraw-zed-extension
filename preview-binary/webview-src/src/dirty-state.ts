@@ -317,10 +317,20 @@ export function initialLibraryItems(
  */
 export function seedHashFromInitialData(
   initialData: ExcalidrawInitialDataState | null | undefined,
+  name?: string,
 ): string {
+  // `<Excalidraw name={name}>` injects `appState.name`, which is a persisted key
+  // in the fingerprint. `initialData` (from loadFromBlob) carries no such name,
+  // so unless we fold the prop in here the very first `onChange` — emitted with
+  // `name` already set — hashes differently from the seed and the scene reads as
+  // dirty the instant it opens, with zero edits. Merge it so the seed matches.
+  const appState =
+    name === undefined
+      ? initialData?.appState
+      : { ...(initialData?.appState ?? {}), name };
   return computeSceneHash(
     (initialData?.elements ?? []) as readonly ExcalidrawElement[],
-    initialData?.appState,
+    appState,
     initialData?.files,
   );
 }

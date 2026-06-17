@@ -317,6 +317,25 @@ describe("seedHashFromInitialData", () => {
       computeSceneHash([], undefined, undefined),
     );
   });
+
+  it("folds the injected name prop into the seed so a just-opened scene isn't dirty", () => {
+    // The `<Excalidraw name>` prop sets appState.name (a fingerprinted key)
+    // before the first onChange. The seed must include it, or the unedited
+    // scene reads dirty on open.
+    const data = {
+      elements: els(2),
+      appState: { viewBackgroundColor: "#fff" },
+      files: {},
+    } as unknown as ExcalidrawInitialDataState;
+    // Seed with the name === the hash the first onChange produces (name applied).
+    expect(seedHashFromInitialData(data, "diagram")).toBe(
+      computeSceneHash(els(2), { viewBackgroundColor: "#fff", name: "diagram" }, {}),
+    );
+    // And it actually differs from the un-named seed (regression proof).
+    expect(seedHashFromInitialData(data, "diagram")).not.toBe(
+      seedHashFromInitialData(data),
+    );
+  });
 });
 
 describe("applyExternalReload", () => {

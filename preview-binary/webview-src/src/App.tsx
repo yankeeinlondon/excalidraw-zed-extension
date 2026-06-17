@@ -148,7 +148,10 @@ export default function App({
   // race that first onChange; finding 6.)
   const prevHashRef = useRef<string | null>(null);
   if (prevHashRef.current === null) {
-    prevHashRef.current = seedHashFromInitialData(initialData);
+    // Seed WITH the `name` prop: it lands in `appState.name` (a fingerprinted
+    // key) before the first onChange, so omitting it here would falsely mark a
+    // just-opened, unedited scene as dirty.
+    prevHashRef.current = seedHashFromInitialData(initialData, name);
   }
   // Whether the scene has unsaved edits relative to disk. Mirrored to Rust via
   // POST /dirty on every transition so native code can decide on close/save.
