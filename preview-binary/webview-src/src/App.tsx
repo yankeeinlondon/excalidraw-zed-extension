@@ -36,7 +36,6 @@ import type {
 
 interface AppProps {
   initialData: ExcalidrawInitialDataState;
-  theme: string;
   name: string;
   contentType: string;
   /** When true, saves to disk after every element change (debounced 300 ms). */
@@ -54,26 +53,6 @@ interface AppProps {
    * current viewport position and theme are never reset.
    */
   onReloadReady: (reload: (data: ExcalidrawInitialDataState) => void) => void;
-}
-
-function useOsTheme(preference: "auto" | "light" | "dark"): "light" | "dark" {
-  const [theme, setTheme] = useState<"light" | "dark">(() => {
-    if (preference !== "auto") return preference;
-    return window.matchMedia("(prefers-color-scheme: dark)").matches
-      ? "dark"
-      : "light";
-  });
-
-  useEffect(() => {
-    if (preference !== "auto") return;
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const handler = (e: MediaQueryListEvent) =>
-      setTheme(e.matches ? "dark" : "light");
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, [preference]);
-
-  return theme;
 }
 
 const SAVE_DEBOUNCE_MS = 300;
@@ -117,7 +96,6 @@ function generateRequestId(): string {
 
 export default function App({
   initialData,
-  theme,
   name,
   contentType,
   autoSave,
@@ -126,11 +104,13 @@ export default function App({
   onSaved,
   onReloadReady,
 }: AppProps) {
-  const resolvedTheme = useOsTheme(theme as "auto" | "light" | "dark");
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
-  // Mirror of appState.exportWithDarkMode so the menu toggle can show and flip
-  // the flag that image exports and the right-click "Copy to clipboard as SVG"
-  // both read. Seeded from the loaded scene; kept in sync by handleChange.
+  // The document's color mode: a single flag that drives the editor canvas
+  // theme, the baked rendering of the saved .excalidraw.svg/.png, and every
+  // export (it IS appState.exportWithDarkMode, which image exports and the
+  // right-click "Copy as SVG" already read). Seeded from the loaded scene —
+  // main.tsx resolves it from the file's baked mode / OS theme before mount —
+  // and kept in sync by handleChange and the toggle.
   const [exportDarkMode, setExportDarkMode] = useState<boolean>(() =>
     Boolean(
       (initialData.appState as { exportWithDarkMode?: boolean } | undefined)
@@ -545,10 +525,11 @@ export default function App({
   );
 
   /**
-   * Flips appState.exportWithDarkMode — the flag every image/SVG export and the
-   * right-click "Copy to clipboard as SVG" read to decide light vs dark. Applied
-   * via updateScene (a real appState edit), so it persists with the scene and the
-   * onChange it triggers updates the menu label and saves like any other edit.
+   * Flips the document's color mode (appState.exportWithDarkMode) — the single
+   * flag driving the editor canvas theme, the baked rendering of the saved
+   * .excalidraw.svg/.png, every image/SVG export, and the right-click "Copy as
+   * SVG". Applied via updateScene (a real appState edit), so it persists with the
+   * scene, re-themes the canvas, and saves like any other edit.
    */
   const toggleExportDarkMode = useCallback(() => {
     const api = apiRef.current;
@@ -556,7 +537,7 @@ export default function App({
     const next = !api.getAppState().exportWithDarkMode;
     api.updateScene({ appState: { exportWithDarkMode: next } });
     api.setToast({
-      message: `Export color mode: ${next ? "dark" : "light"}`,
+      message: `Color mode: ${next ? "Dark" : "Light"}`,
       duration: 1500,
     });
   }, []);
@@ -884,7 +865,9 @@ export default function App({
           onApiReady(api);
         }}
         initialData={{ ...initialData, scrollToContent: true }}
-        theme={resolvedTheme}
+        // Editor canvas follows the document's color mode (WYSIWYG): a dark
+        // document opens on a dark canvas, matching how the saved file renders.
+        theme={exportDarkMode ? "dark" : "light"}
         name={name}
         // Point the built-in "Browse libraries" round-trip at our server's
         // landing page instead of excalidraw.com. The libraries site opens in the
@@ -915,7 +898,7 @@ export default function App({
             Export scene (.excalidraw)
           </MainMenu.Item>
           <MainMenu.Item onSelect={toggleExportDarkMode}>
-            {`Export Color Mode: ${exportDarkMode ? "dark" : "light"}`}
+            {`Color mode: ${exportDarkMode ? "Dark" : "Light"}`}
           </MainMenu.Item>
           <MainMenu.Item onSelect={() => void handleCopySvgToClipboard()}>
             Copy SVG to clipboard

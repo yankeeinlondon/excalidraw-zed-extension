@@ -2,6 +2,7 @@ import ReactDOM from "react-dom/client";
 import { loadFromBlob } from "@excalidraw/excalidraw";
 import type { ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
 import App from "./App";
+import { svgBytesAreDarkMode } from "./color-mode";
 
 interface Config {
   contentType: string;
@@ -93,6 +94,70 @@ function renderReadonlyImage(
   }, 150);
 }
 
+/** Loads an object-URL into an HTMLImageElement, resolving once decoded. */
+function loadImage(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+/**
+ * Best-effort detection of a PNG's baked color mode by sampling its background.
+ * Excalidraw bakes dark mode into PNG pixels (a canvas filter), leaving no
+ * metadata, so we read a near-corner pixel — the export background — and treat a
+ * dark, opaque pixel as dark mode. Returns null when it can't tell (transparent
+ * background or decode failure), so the caller falls back to another signal.
+ */
+async function detectPngDarkMode(bytes: ArrayBuffer): Promise<boolean | null> {
+  try {
+    const url = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+    try {
+      const img = await loadImage(url);
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth || 1;
+      canvas.height = img.naturalHeight || 1;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(img, 0, 0);
+      const [r, g, b, a] = ctx.getImageData(1, 1, 1, 1).data;
+      if (a < 16) return null; // transparent background — mode is unknowable
+      // Rec. 709 luminance; a dark background means the scene was exported dark.
+      return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 < 0.5;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Detects the color mode baked into a viewable Excalidraw file, so reopening it
+ * restores the document's mode instead of resetting to light (excalidraw strips
+ * `exportWithDarkMode` from the embedded scene, so it can't round-trip on its
+ * own). Returns null for formats with no baked rendering (plain `.excalidraw`
+ * JSON) or when the mode can't be determined.
+ *
+ * - SVG: excalidraw marks a dark export with a root `<svg filter="invert(93%)
+ *   hue-rotate(180deg)">`, so the substring's presence is an exact signal.
+ * - PNG: sampled from pixels (see {@link detectPngDarkMode}).
+ */
+async function detectDocumentDarkMode(
+  bytes: ArrayBuffer,
+  contentType: string,
+): Promise<boolean | null> {
+  if (contentType === "image/svg+xml") {
+    return svgBytesAreDarkMode(bytes);
+  }
+  if (contentType === "image/png") {
+    return detectPngDarkMode(bytes);
+  }
+  return null;
+}
+
 async function main() {
   try {
     const configRes = await fetch(apiUrl("/config"));
@@ -161,6 +226,24 @@ async function main() {
       return;
     }
 
+    // Resolve the document's color mode and bake it into appState BEFORE mount,
+    // so the editor canvas, the toggle, and the next save all agree from frame
+    // one (and the dirty seed matches). Priority: the file's baked mode → any
+    // mode the embedded scene carried → the resolved OS/config theme. An empty
+    // (new) file has no baked mode, so it inherits the OS/config theme.
+    const detectedDark = isEmptyFile
+      ? null
+      : await detectDocumentDarkMode(bytes, config.contentType);
+    const documentDark =
+      detectedDark ??
+      (initialData.appState as { exportWithDarkMode?: boolean } | undefined)
+        ?.exportWithDarkMode ??
+      config.theme === "dark";
+    initialData = {
+      ...initialData,
+      appState: { ...initialData.appState, exportWithDarkMode: documentDark },
+    };
+
     // Shared mutable state between App callbacks and the SSE handler.
     // Timestamp after which SSE reload events are no longer suppressed.
     let ignoreSseUntil = 0;
@@ -173,7 +256,6 @@ async function main() {
     ReactDOM.createRoot(root).render(
       <App
         initialData={{ ...initialData, libraryItems: libraryItems as ExcalidrawInitialDataState["libraryItems"] }}
-        theme={config.theme}
         name={config.name}
         contentType={config.contentType}
         autoSave={config.autoSave}
