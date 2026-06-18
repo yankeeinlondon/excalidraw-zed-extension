@@ -346,13 +346,29 @@ via the native save dialog, giving a graceful conversion path from a JSON scene 
 editable `.excalidraw.svg`. Equivalently, copy/paste between two preview windows works now
 that the WebView loads from a secure-context `localhost` origin (see startup step 9).
 
-**Export color mode + clipboard.** "Export Color Mode: {dark|light}" toggles
-`appState.exportWithDarkMode` (persisted scene state) via `updateScene`; every image
-export *and* the SVG clipboard copy read it. "Copy SVG to clipboard" generates the SVG
-and POSTs it to `/copy-clipboard` for a native (OS-level) clipboard write — Excalidraw's
-own right-click "Copy to clipboard as SVG" fails in the WebView because WKWebView rejects
-the page's `navigator.clipboard` write after the SVG is `await`-generated (the await drops
-the transient user-activation), so the reliable path goes through Rust.
+**Document color mode (`appState.exportWithDarkMode`).** One flag is the document's
+color mode: the "Color mode: {Dark|Light}" menu toggle drives the **editor canvas theme**
+(WYSIWYG — a dark document opens on a dark canvas), the **baked rendering** of the saved
+`.excalidraw.svg`/`.excalidraw.png`, and every **export** + the SVG clipboard copy. The
+editor's `theme` prop is derived from it, so there is no separate OS-follow theme anymore;
+the initial mode is resolved once in `main.tsx`.
+
+*Round-trip.* Excalidraw strips `exportWithDarkMode` from the scene it embeds in an
+exported SVG/PNG (its storage config marks the key `export: false`), so the mode can't
+round-trip on its own — reopening would reset to light and the next save would revert the
+file. `main.tsx` recovers it from the file's **baked rendering** before mount
+(`detectDocumentDarkMode`): SVG is detected exactly via excalidraw's root
+`filter="invert(93%) hue-rotate(180deg)"` marker (`svgBytesAreDarkMode` in `color-mode.ts`,
+unit-tested); PNG via a near-corner background-pixel luminance (best-effort). The detected
+mode is written into `initialData.appState.exportWithDarkMode` (priority: baked mode →
+embedded-scene value → resolved OS/config theme; a new/empty file inherits the OS theme),
+so the canvas, the toggle, the dirty seed, and the next save all agree from frame one.
+
+**Clipboard.** "Copy SVG to clipboard" generates the SVG (honoring the color mode) and
+POSTs it to `/copy-clipboard` for a native (OS-level) clipboard write — Excalidraw's own
+right-click "Copy to clipboard as SVG" fails in the WebView because WKWebView rejects the
+page's `navigator.clipboard` write after the SVG is `await`-generated (the await drops the
+transient user-activation), so the reliable path goes through Rust.
 
 **Auto-save:** when `autoSave` prop is `true` (set from `config.autoSave`), `onChange` is wired to a debounced save (600 ms). Only fires when element hash changes (not on viewport/selection events).
 
