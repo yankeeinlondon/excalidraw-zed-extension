@@ -77,3 +77,30 @@ self-contained.
   is the only protection needed.
 - If the mangled commit is not HEAD, prefer leaving it (message is cosmetic)
   over rewriting history in a worktree where other agents/devs are active.
+
+---
+
+## `git commit --only` commits the WORKTREE state of the named paths
+
+- Not just the staged state: `--only` takes the "updated working tree
+  contents" of the pathspecs. If a developer has *unstaged* edits on a file
+  that is also staged, those unstaged edits ride along in the commit.
+- Pre-check with a read-only `git status --porcelain -- <paths>`: every
+  assigned path should be pure-staged (letter + space, e.g. `M ` / `A `),
+  with no second-column (worktree) letter.
+- Renames: pass BOTH sides (old and new path) in the pathspec so rename
+  detection survives the `--only` commit — observed 2026-09-06, the
+  `docs/architecture.excalidraw.svg → docs/examples/` rename committed as a
+  100% rename this way.
+
+---
+
+## fixes/ review records chain via frontmatter; the decision-log compensates for in-place rewrites
+
+- Reviews in `fixes/<date>-*/` are linked `previous:`/`next:` in frontmatter,
+  so adding a new `review-N.md` normally comes with a one-line edit to
+  `review-(N-1).md` — easy to miss in a scoped file list.
+- When a decision reverses an earlier one, corpus assertions are rewritten in
+  place (git history then shows an assertion *vanishing*, not a decision
+  *changing*). The `decision-log.md` entry (e.g. D15) is the compensating
+  record — keep it in the same change set as the rewritten assertions.
