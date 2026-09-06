@@ -136,10 +136,50 @@ shareable images written to a different filename. An image with no embedded scen
 shown read-only with a banner rather than erroring.
 
 **Document color mode round-trip.** One flag (`appState.exportWithDarkMode`) drives
-the canvas theme, the baked rendering, and exports (WYSIWYG). Excalidraw strips that
-key from the scene it embeds, so it cannot round-trip on its own: `main.tsx` recovers
-it from the baked rendering before mount (SVG exactly via excalidraw's root
-`invert(93%) hue-rotate(180deg)` filter marker; PNG best-effort via corner luminance).
+the canvas theme, the baked rendering, and exports (WYSIWYG). Excalidraw treats the
+key as per-browser state and strips it *both ways* — out of the scene it embeds, and
+out of what `loadFromBlob` returns — so it cannot round-trip unaided. Three sources,
+in priority order: `main.tsx` recovers it from the baked rendering before mount (SVG
+exactly via excalidraw's root `invert(93%) hue-rotate(180deg)` filter marker; PNG
+best-effort via corner luminance), then the appState key, then the OS/config theme.
+Plain `.excalidraw` persists the key itself: **both** plain-JSON write sites go
+through `serializeSceneForDisk`, which injects `appState.exportWithDarkMode` back
+into the serialized text (a byte-stable splice, not a re-serialize), and the load
+path re-attaches it from the raw bytes inside `parseDiskBytesWithFallbacks`. The
+OS/config theme is fallback-only, for files that state no mode. **Both baked-mode
+readers must answer `null` — never `false` — for a payload that is not actually of
+the declared format**, because the content type comes from the file *name* and the
+parse fallback chain absorbs a mismatch: an SVG reader that returns "no dark filter
+found" for scene JSON out-ranks the key that same file states, and reopens a dark
+document light (review 1, finding 1). Current
+excalidraw.com strips the key on load, so the toggle does *not* pre-seed there —
+recorded upstream behavior, not a regression of ours
+(`fixes/2026-09-05-fix-me-up/decision-log.md`, D1).
+
+**One library entry per library-item id.** The vendored `mergeLibraryItems` dedupes
+by element *content*, not by id, so a re-delivered library whose elements were
+re-stamped appends a second entry with the same id — and the vendored drag path then
+inserts every entry matching the dragged id, which is what made one drag drop two
+copies. Every flow that mutates or persists the library payload (seeding from
+`GET /library`, Browse-install, SSE re-delivery, native import, debounced panel
+persistence) therefore runs through one choke point, `dedupeLibraryItems`
+(`library-merge.ts`) — survivor is the newest element `updated` at the id's
+first-occurrence position, and a clean set is returned as the same reference. Installs
+merge and dedupe inside a *single* `updateLibrary` function-form call so the panel
+never transiently holds twins. Libraries already corrupted on disk are healed on load
+and the heal is written back by the seeding `onLibraryChange` echo. Do not scatter
+guards at the call sites; keep the invariant at that one auditable place
+(`fixes/2026-09-05-fix-me-up/decision-log.md`, D3).
+
+**A save gesture is never silent.** Explicit saves show Excalidraw's toasts or an
+error banner — but a read-only image preview (and a failed load, and the pre-mount
+window) has no React app, so the native File → Save script's old
+`window.__excalidrawSave && …` form evaluated to nothing at all. `main.tsx` registers
+`window.__excalidrawSaveUnavailable` at module scope, before any await, on every load
+path; `SAVE_MENU_SCRIPT` falls back to it, and `doSave`'s no-API early return calls
+it too. The two sides are joined only by that string, so tests pin it against the
+shipped bundle. Nothing at all in response to a save gesture is a defect, not a
+no-op.
 
 **Clipboard goes through Rust.** WKWebView rejects the page's async clipboard write
 after the SVG is `await`-generated (the await drops user activation), so "Copy SVG to
@@ -204,8 +244,15 @@ guard), queues it, and notifies the WebView over SSE.
   `didOpen`/`didSave` windowless. `--export-dir` bypasses the native save dialog.
 - Tests avoid fixed sleeps: wait for observable revisions with bounded deadlines.
   nextest's "leaky" annotation fires under parallel load here and is not a real leak
-  (decision-log D12). The Windows twins of Unix-only tests are compiled only on
-  Windows; cross-checking from macOS fails in `aws-lc-sys`, not in our code.
+  (decision-log D12). The Windows twins of Unix-only tests only *run* on Windows, but
+  they do type-check from macOS: `cargo check --target x86_64-pc-windows-gnu -p
+  excalidraw-preview-binary --all-targets` (with
+  `CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc`) is clean, covering every
+  `#[cfg(target_os = "windows")]` path including `menu.init_for_hwnd`. It is the
+  **MSVC** target that fails, in `aws-lc-sys` for want of `windows.h` — a missing
+  Windows SDK, not our code — so an MSVC artifact still has to be built on a Windows
+  host. A `-gnu` check compiles; it links nothing and runs nothing, so it can stand in
+  for a compile review and never for a Windows test result.
 
 ## Conventions
 

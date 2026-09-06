@@ -266,14 +266,22 @@ Then, in order:
    the raw image centred in the window under the banner *"Read-only preview — no
    embedded Excalidraw scene. Re-export with 'Embed scene' enabled to edit."* It still
    live-reloads on `reload`, and it handles no other event — a read-only preview has no
-   scene, so it can never conflict and never shows a conflict dialog. For
+   scene, so it can never conflict and never shows a conflict dialog. A save gesture
+   here answers with a transient notice rather than nothing (§7). For
    `application/json` there is nothing to show, so it errors.
 4. **Recover the document's colour mode** before React mounts, so the canvas, the
    toggle and the next save agree from the first frame. Excalidraw strips
-   `appState.exportWithDarkMode` from the scene it embeds, so it cannot round-trip on
-   its own: SVG is detected exactly (excalidraw marks a dark export with a root
-   `invert(93%) hue-rotate(180deg)` filter), PNG best-effort by sampling a corner
-   pixel's luminance, and plain JSON not at all — it inherits the OS/config theme.
+   `appState.exportWithDarkMode` in *both* directions — out of the scene it embeds on
+   export, and out of the scene `loadFromBlob` hands back on load — so the key cannot
+   round-trip unaided. Three sources, in priority order: SVG is detected exactly
+   (excalidraw marks a dark export with a root `invert(93%) hue-rotate(180deg)`
+   filter), PNG best-effort by sampling a corner pixel's luminance, and plain JSON
+   from the literal `appState.exportWithDarkMode` key — which this app writes on every
+   plain-JSON save by post-serialization injection (§7) and re-attaches from the raw
+   bytes inside `parseDiskBytesWithFallbacks`, because `loadFromBlob` would otherwise
+   have dropped it before the chain could read it. A file that states no mode — one
+   written before this existed, or by another tool — still falls through to the
+   OS/config theme, byte-for-byte as before.
 
 ---
 
@@ -284,9 +292,17 @@ conditional.
 
 | Format | What gets written |
 |---|---|
-| `application/json` | `serializeAsJSON(...)` |
+| `application/json` | `serializeAsJSON(...)`, then `appState.exportWithDarkMode` injected back into the serialized text (`serializeSceneForDisk`) |
 | `image/svg+xml` | `exportToSvg` with `exportEmbedScene: true` |
 | `image/png` | `exportToBlob` with `exportEmbedScene: true`, at `appState.exportScale` (default 2×) |
+
+The injection on the JSON path is not decoration: `serializeAsJSON` strips
+`exportWithDarkMode` (upstream marks it per-browser state), so without it a plain
+`.excalidraw` could not carry the document's colour mode at all, and §6 step 4 would
+have nothing to read. It is a byte-stable text splice — every byte outside the
+injected key is the serializer's own output — and it runs at the one seam both
+plain-JSON writers share, canonical save and **Export Scene**, so no plain-JSON body
+this app writes can miss it.
 
 `exportEmbedScene` is not optional for these two paths — omitting it turns the file
 into a plain image that can never be reopened for editing. The **Export PNG/SVG** menu
@@ -313,6 +329,18 @@ This is optimistic protection, **not** an atomic compare-and-swap: an uncooperat
 external writer can still land between the locked re-read and the write. That residual
 race is an accepted decision (`fixes/2026-09-05-lsp-strategy/decision-log.md`, D1). The
 ETag is opaque — the frontend echoes it byte-for-byte and never parses it.
+
+### A save gesture always answers
+
+An explicit save shows a *Saving…* / *Saved* toast, or an error banner, or a conflict
+banner. The states with no React app behind them — the read-only image preview, a
+failed load, the window between page load and mount — have no toast surface at all, so
+they get a transient in-page notice instead (*"Read-only preview — no embedded scene to
+save…"*). `main.tsx` registers `window.__excalidrawSaveUnavailable` at module scope on
+every load path; the native File → Save script calls it whenever
+`window.__excalidrawSave` is absent, and `doSave` calls it on its own no-API early
+return. **Nothing at all in response to a save gesture is a defect**, not an acceptable
+no-op (`fixes/2026-09-05-fix-me-up/decision-log.md`, D2).
 
 ---
 
@@ -357,6 +385,14 @@ A subscriber that falls behind receives a `reload` in place of the frames it mis
 idempotent invalidation, so lag can never leave the view stale. The event itself carries
 no data: the client always re-fetches bytes and ETag *together*, and re-checks live
 dirty/editing state **after** the awaits, immediately before applying.
+
+`library` is idempotent in the same spirit, but that had to be *made* true: the vendored
+merge dedupes by element content rather than by id, so re-delivering an already-installed
+library appended a second entry under the same library-item id, and dragging that item
+then dropped two copies. Every flow that touches the library payload now passes through
+one choke point that guarantees at most one entry per id, installs merge-and-dedupe
+inside a single atomic `updateLibrary`, and a library already corrupted on disk is healed
+on load (`library-merge.ts`; `fixes/2026-09-05-fix-me-up/decision-log.md`, D3).
 
 ---
 
