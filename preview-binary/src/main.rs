@@ -1932,14 +1932,40 @@ fn build_menu() -> Result<(muda::Menu, MenuIds), Box<dyn std::error::Error>> {
     Ok((menu, ids))
 }
 
+/// The JS the native File → Save item (and its `Cmd/Ctrl+S` accelerator)
+/// dispatches into the WebView.
+///
+/// Save is the one menu action that must **never** be a silent no-op: when the
+/// React app is absent (a read-only image preview has no scene, so it never
+/// mounts) the `&& ` guard used by the other items would swallow the gesture
+/// entirely. So this expression falls back to `__excalidrawSaveUnavailable`,
+/// which `main.tsx` registers at module scope on every load path — read-only
+/// preview, load error, and pre-mount — and which shows a transient in-page
+/// notice explaining why nothing was saved (spec §2.3 observability
+/// requirement; fixes/2026-09-05-fix-me-up D2).
+///
+/// The fallback global's name is pinned against the shipped webview bundle by
+/// `save_menu_script_fallback_exists_in_shipped_bundle`.
+///
+/// ## Notes
+///
+/// Linux has no native menu (`build_menu` is `#[cfg(not(target_os = "linux"))]`,
+/// the page-level keydown handler is the delivery path there), so outside the
+/// test build this constant is unreferenced on that platform.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+const SAVE_MENU_SCRIPT: &str = "window.__excalidrawSave \
+     ? window.__excalidrawSave({ reason: 'menu' }) \
+     : (window.__excalidrawSaveUnavailable && window.__excalidrawSaveUnavailable('menu'))";
+
 /// Maps a fired `MenuId` to the JS bridge expression that services it, or `None`
 /// if the id is not one of ours. The bridge globals are registered by the React
 /// app (see `native-bridge.ts`); the `&&` guard makes the call a no-op if the app
-/// has not mounted yet.
+/// has not mounted yet — except for Save, which routes to
+/// [`SAVE_MENU_SCRIPT`]'s always-present fallback instead of going silent.
 #[cfg(not(target_os = "linux"))]
 fn menu_event_script(id: &muda::MenuId, ids: &MenuIds) -> Option<&'static str> {
     if *id == ids.save {
-        Some("window.__excalidrawSave && window.__excalidrawSave({ reason: 'menu' })")
+        Some(SAVE_MENU_SCRIPT)
     } else if *id == ids.export_png {
         Some("window.__excalidrawExport && window.__excalidrawExport('png')")
     } else if *id == ids.export_png2x {
@@ -3171,6 +3197,13 @@ fn run_webview_url(
 #[derive(Parser, Debug)]
 #[command(name = "excalidraw-preview")]
 #[command(about = "Preview Excalidraw files in a native window")]
+// `--version` / `-V` prints `excalidraw-preview {CARGO_PKG_VERSION}`. It exists
+// because binary identity is the first step of every acceptance run and of the
+// stale-PATH triage (a pre-accelerator binary on PATH is silently preferred by
+// the extension): without it the identity procedure cannot run at all
+// (fixes/2026-09-05-fix-me-up, finding N1). The version tracks the crate
+// version, which `just bump` keeps equal to the extension's `BINARY_VERSION`.
+#[command(version)]
 struct CliArgs {
     /// Path to the .excalidraw, .excalidraw.svg, or .excalidraw.png file to preview.
     /// Not required when running as an LSP server (--lsp).
@@ -6143,5 +6176,72 @@ mod tests {
         // A non-file URI (or garbage) must not be coerced into a path.
         assert!(file_uri_to_path("https://example.com/a.excalidraw").is_none());
         assert!(file_uri_to_path("not a uri").is_none());
+    }
+
+    // ── Native Save dispatch (D2 observability) ──────────────────────────────
+
+    #[test]
+    fn test_save_menu_script_saves_when_the_editor_is_mounted() {
+        // The mounted case must still call the bridge with `reason: 'menu'` —
+        // the accelerator stays the authoritative macOS delivery path (§2.4,
+        // do-not-reverse-without-new-evidence).
+        assert!(SAVE_MENU_SCRIPT.contains("window.__excalidrawSave ?"));
+        assert!(SAVE_MENU_SCRIPT.contains("window.__excalidrawSave({ reason: 'menu' })"));
+    }
+
+    #[test]
+    fn test_save_menu_script_never_evaluates_to_a_silent_no_op() {
+        // The regression this pins: the script used to be
+        // `window.__excalidrawSave && window.__excalidrawSave(…)`, which in a
+        // read-only image preview (no React app, so no bridge) did nothing at
+        // all — the proven silent no-op of spec §2.2 candidate 3. The absent-
+        // bridge arm must now call the always-registered notice global.
+        assert!(
+            !SAVE_MENU_SCRIPT.starts_with("window.__excalidrawSave &&"),
+            "the `&&` guard form is the silent no-op this fix removed"
+        );
+        assert!(
+            SAVE_MENU_SCRIPT.contains("window.__excalidrawSaveUnavailable('menu')"),
+            "the no-bridge arm must show the in-page notice: {SAVE_MENU_SCRIPT}"
+        );
+        // The fallback is itself guarded, so a bundle that somehow lacks the
+        // global still cannot throw inside the dispatch closure.
+        assert!(SAVE_MENU_SCRIPT
+            .contains("window.__excalidrawSaveUnavailable && window.__excalidrawSaveUnavailable"));
+    }
+
+    #[test]
+    fn test_save_menu_script_fallback_exists_in_shipped_bundle() {
+        // End-to-end contract over the *shipped* artifact: the global this
+        // dispatch script names must actually be registered by the embedded
+        // webview bundle (`main.tsx` module scope → `save-notice.ts`). A rename
+        // on either side re-introduces the silent no-op, and nothing else would
+        // catch it — the two sides are joined only by this string.
+        //
+        // `assets/` is gitignored and embedded at compile time (`just ui` first;
+        // CI and `just build` do that, a bare `cargo nextest run` on a fresh
+        // clone does not), so a build with no bundle skips rather than fails —
+        // the same accommodation as `test_serve_index_missing_asset_returns_404`.
+        let js: Vec<String> = Assets::iter()
+            .map(|f| f.to_string())
+            .filter(|f| f.ends_with(".js"))
+            .collect();
+        if js.is_empty() {
+            eprintln!(
+                "skipping: no JS assets embedded in this build (run `just ui` to embed the webview bundle)"
+            );
+            return;
+        }
+        let found = js.iter().any(|name| {
+            Assets::get(name).is_some_and(|f| {
+                String::from_utf8_lossy(f.data.as_ref()).contains("__excalidrawSaveUnavailable")
+            })
+        });
+        assert!(
+            found,
+            "the embedded webview bundle registers no `__excalidrawSaveUnavailable`, \
+             so the native Save fallback would be a silent no-op again (searched {} JS assets)",
+            js.len()
+        );
     }
 }

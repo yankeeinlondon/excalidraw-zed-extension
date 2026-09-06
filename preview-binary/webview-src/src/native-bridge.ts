@@ -41,6 +41,16 @@ declare global {
      */
     __excalidrawSave?: (opts?: NativeSaveOptions) => Promise<NativeSaveResult>;
     /**
+     * Shows a transient in-page notice explaining why a save gesture had
+     * nothing to save. Unlike every other global here it is registered at
+     * module scope by `main.tsx` — i.e. it is present on *every* load path,
+     * including the ones where the React app never mounts (read-only image
+     * preview, load failure, pre-mount). The native File → Save script calls it
+     * when `__excalidrawSave` is absent so the gesture is never silent
+     * (spec §2.3; see `save-notice.ts`).
+     */
+    __excalidrawSaveUnavailable?: (source?: string) => void;
+    /**
      * Triggers an export (png / png2x / svg / scene) through the same native
      * save-dialog path as the in-WebView menu. Driven by the native File menu
      * on the tao path. Present only while the React app is mounted.
