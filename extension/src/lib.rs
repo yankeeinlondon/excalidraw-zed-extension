@@ -159,6 +159,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_binary_version_matches_preview_binary_crate_version() {
+        // The acceptance-run identity guard compares the companion binary's
+        // `--version` output (which prints its crate version) against
+        // BINARY_VERSION; that comparison only means something while the two
+        // agree. `just bump` writes all four version sites together — this pins
+        // the third one against the constant, as
+        // `test_binary_version_matches_manifest` pins the second
+        // (fixes/2026-09-05-fix-me-up, D2 build-identity guard).
+        let manifest = parse_shipped_toml("../preview-binary/Cargo.toml");
+        let crate_version = manifest
+            .get("package")
+            .and_then(|p| p.get("version"))
+            .and_then(|v| v.as_str())
+            .expect("preview-binary/Cargo.toml must declare [package] version");
+        assert_eq!(
+            BINARY_VERSION, crate_version,
+            "BINARY_VERSION must match preview-binary's crate version — otherwise \
+             `excalidraw-preview --version` cannot be compared against it during \
+             acceptance; use `just bump` to move every version site together"
+        );
+    }
+
     // ── Language-registration corpus tests (spec §3) ──────────────────────────
     //
     // These parse the *shipped* TOML artifacts (never copies) so the registration
