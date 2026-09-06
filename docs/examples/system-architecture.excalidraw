@@ -247,8 +247,8 @@
       "strokeColor": "#2f9e44",
       "strokeWidth": 2,
       "roughness": 1,
-      "version": 2,
-      "versionNonce": 625045973,
+      "version": 3,
+      "versionNonce": 851142834,
       "index": "a7",
       "isDeleted": false,
       "strokeStyle": "solid",
@@ -258,8 +258,13 @@
       "groupIds": [],
       "frameId": null,
       "roundness": null,
-      "boundElements": [],
-      "updated": 1775823012967,
+      "boundElements": [
+        {
+          "id": "arrow-api1-cache",
+          "type": "arrow"
+        }
+      ],
+      "updated": 1788687628260,
       "link": null,
       "locked": false
     },
@@ -377,8 +382,8 @@
       "strokeColor": "#e03131",
       "strokeWidth": 2,
       "roughness": 1,
-      "version": 2,
-      "versionNonce": 2037694613,
+      "version": 3,
+      "versionNonce": 200959026,
       "index": "aB",
       "isDeleted": false,
       "strokeStyle": "solid",
@@ -388,8 +393,13 @@
       "groupIds": [],
       "frameId": null,
       "roundness": null,
-      "boundElements": [],
-      "updated": 1775823012967,
+      "boundElements": [
+        {
+          "id": "arrow-api1-cache",
+          "type": "arrow"
+        }
+      ],
+      "updated": 1788687628260,
       "link": null,
       "locked": false
     },
@@ -780,12 +790,16 @@
       "type": "arrow",
       "x": 700,
       "y": 120,
-      "width": 0,
+      "width": 57.327867228663536,
       "height": 180,
       "points": [
         [
           0,
           0
+        ],
+        [
+          57.327867228663536,
+          87.49004161284157
         ],
         [
           0,
@@ -798,8 +812,8 @@
       "fillStyle": "solid",
       "backgroundColor": "transparent",
       "lastCommittedPoint": null,
-      "version": 2,
-      "versionNonce": 962009691,
+      "version": 265,
+      "versionNonce": 1065271410,
       "index": "aM",
       "isDeleted": false,
       "roughness": 1,
@@ -808,15 +822,26 @@
       "seed": 1,
       "groupIds": [],
       "frameId": null,
-      "roundness": null,
+      "roundness": {
+        "type": 2
+      },
       "boundElements": [],
-      "updated": 1775823012967,
+      "updated": 1788687661411,
       "link": null,
       "locked": false,
-      "startBinding": null,
-      "endBinding": null,
+      "startBinding": {
+        "elementId": "api1-box",
+        "focus": -0.6298370302229729,
+        "gap": 1
+      },
+      "endBinding": {
+        "elementId": "cache-box",
+        "focus": 0.645171911941486,
+        "gap": 1
+      },
       "startArrowhead": null,
-      "endArrowhead": "arrow"
+      "endArrowhead": "arrow",
+      "elbowed": false
     },
     {
       "id": "arrow-db-replica",

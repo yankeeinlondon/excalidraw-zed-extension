@@ -869,49 +869,6 @@
       "endBinding": null,
       "startArrowhead": null,
       "endArrowhead": "arrow"
-    },
-    {
-      "id": "arrow-error-back",
-      "type": "arrow",
-      "x": 650,
-      "y": 400,
-      "width": 250,
-      "height": 60,
-      "points": [
-        [
-          0,
-          0
-        ],
-        [
-          -250,
-          -60
-        ]
-      ],
-      "strokeColor": "#e03131",
-      "strokeWidth": 2,
-      "strokeStyle": "dashed",
-      "fillStyle": "solid",
-      "backgroundColor": "transparent",
-      "lastCommittedPoint": null,
-      "version": 2,
-      "versionNonce": 406650060,
-      "index": "aO",
-      "isDeleted": false,
-      "roughness": 1,
-      "opacity": 100,
-      "angle": 0,
-      "seed": 1,
-      "groupIds": [],
-      "frameId": null,
-      "roundness": null,
-      "boundElements": [],
-      "updated": 1775824487049,
-      "link": null,
-      "locked": false,
-      "startBinding": null,
-      "endBinding": null,
-      "startArrowhead": null,
-      "endArrowhead": "arrow"
     }
   ],
   "appState": {

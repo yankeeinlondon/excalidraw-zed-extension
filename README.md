@@ -2,10 +2,10 @@
 
 > Source Repository: <https://github.com/yankeeinlondon/excalidraw-zed-extension>
 
-![architecture](./docs/architecture.excalidraw.svg)
+![architecture](./docs/examples/architecture.excalidraw.svg)
 
 
-A Zed editor extension that previews [Excalidraw]() files in a native WebView window:
+A Zed editor extension that previews [Excalidraw](https://github.com/excalidraw/excalidraw) files in a native WebView window:
 
 - Live reloads on file save
 - No browser tabs
@@ -113,9 +113,15 @@ If you close the preview, saving the file in Zed reopens it.
 ### Language registration notes
 
 The extension registers two languages with Zed — **Excalidraw**
-(`.excalidraw` files) and a grammar-less **SVG** (`.svg` files, so that
+(`.excalidraw` files) and **SVG** (`.svg` files, so that
 `.excalidraw.svg` gets the preview; plain `.svg` files show "SVG" in the
 status bar and start an idle language server — no preview, no error).
+
+Both languages ship a bundled tree-sitter grammar, so the buffer behind a
+preview is syntax-highlighted: `.excalidraw` as JSON (its scene format) and
+`.svg`/`.excalidraw.svg` as XML. Highlighting also makes a broken hand-edit
+visible — an unparseable region is highlighted as an error — but there is no
+schema validation of the scene itself.
 
 - Selecting a different language for a file (via the status bar or a
   `file_types` override) detaches the preview's language server, which may
@@ -123,6 +129,25 @@ status bar and start an idle language server — no preview, no error).
   (`excalidraw-preview <file>`) always works regardless of language selection.
 - The extension never rewrites your `file_types` settings or any other user
   configuration.
+
+### Seeing what the extension is doing
+
+The language server logs each preview's life, and Zed shows it: click
+`excalidraw-preview` in the status bar → **View Logs**, or run
+`dev: open language server logs` from the command palette.
+
+```
+INFO excalidraw-preview 0.6.0 ready as a language server
+INFO editor opened ~/notes/architecture.excalidraw
+INFO preview window opened for ~/notes/architecture.excalidraw
+INFO preview window closed for ~/notes/architecture.excalidraw
+```
+
+Dispatch detail (a save while the preview is already open, `didClose` forwarding)
+is logged at `debug`: set `RUST_LOG=excalidraw_preview=debug` in the environment
+Zed is launched from to see it. The preview window is a separate, detached
+process — its own logging never reaches Zed, so run the binary from a terminal
+with `--debug` for that.
 
 ### Auto-save
 
@@ -179,13 +204,24 @@ then run it via `task: spawn` in the command palette.
   `<config-dir>/excalidraw-zed/library.excalidrawlib` and are shared across all diagrams;
   use **Library → Import/Export Library…** for native `.excalidrawlib` round-trips.
 - **`.excalidraw.png` opens in Zed's image viewer, not the editable preview.**
-  Zed's built-in image pane claims `*.png` before any extension can observe
-  the open, so clicking a `.excalidraw.png` renders it read-only. The file
-  format itself is still fully editable — launch the viewer with
+  Zed's built-in image pane claims `*.png` before any extension can observe the
+  open — it matches on the extension alone, it is registered ahead of the text
+  editor, and *no buffer is ever created*, so there is no file-open event for an
+  extension to receive. No language registration, `file_types` override, task, or
+  setting changes this; it would take an upstream change in Zed. If you want an
+  image format that opens from a Zed click, use `.excalidraw.svg` — SVG is
+  explicitly exempted from that check, and it embeds the scene exactly as PNG
+  does.
+
+  The PNG format itself is still fully editable — launch the viewer with
   `excalidraw-preview <file>.excalidraw.png` and it decodes the embedded
   scene, lets you edit it, and re-embeds the scene on save so the file stays a
   valid Excalidraw PNG. The same embedded-scene round-trip applies to
-  `.excalidraw.svg`.
+  `.excalidraw.svg`. Starting a *new* `.excalidraw.png` works the same way:
+  `excalidraw-preview --new diagram.excalidraw.png` opens a blank editable
+  canvas and the first save writes a real PNG with the scene embedded.
+  (Clicking an empty one in Zed only hands it to the image pane, which has
+  nothing to decode.)
 - **Plain `.svg` files show "SVG" in the status bar** and start an idle
   language server (part of how `.excalidraw.svg` gets its preview — Zed only
   delivers file-open events for single-segment suffixes). It's a no-op: no

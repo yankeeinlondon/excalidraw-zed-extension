@@ -21,7 +21,9 @@ Two components in one Cargo workspace:
   axum server, the file watcher, the LSP loop, and the WebView; `webview-src/` is the
   React/Vite UI, whose build output is embedded at compile time.
 
-Deeper records: `docs/PRD.md` (requirements), `fixes/*/` and `features/*/` (dated
+Deeper records: `docs/handling-excalidraw-files.md` (how the three formats travel from
+a click in Zed to the canvas, and how the editor pane and the viewer stay in step),
+`docs/PRD.md` (requirements), `fixes/*/` and `features/*/` (dated
 spec → plan → decision-log → reviews for each change; the newest decision-log is the
 best "why is it like this" reference), `CONTRIBUTING.md` (dev loop).
 
@@ -31,15 +33,32 @@ best "why is it like this" reference), `CONTRIBUTING.md` (dev loop).
 registered with a compound `path_suffixes` entry (`excalidraw.svg`) to the buffer but
 never routes `textDocument/didOpen` to its server; only single-segment suffixes take the
 exact-match path that delivers buffer events. So the extension claims `excalidraw`
-("Excalidraw" language) and `svg` (a grammar-less "SVG" language), and the LSP filters
-by filename (`is_excalidraw_path`) so plain `.svg` buffers are an idle no-op. Costs
-accepted: `.excalidraw.svg` opens as plain text in Zed; plain `.svg` shows an attached
-idle server. Never reintroduce compound suffixes; never attach the built-in JSON
-language (it would spawn the server for every JSON file). `.excalidraw.png` is
-CLI-only inside Zed because the image pane claims `*.png` before any buffer exists.
+("Excalidraw" language) and `svg` ("SVG" language), and the LSP filters
+by filename (`is_excalidraw_path`) so plain `.svg` buffers are an idle no-op. Cost
+accepted: plain `.svg` shows an attached idle server. Never reintroduce compound
+suffixes; never attach the built-in JSON language (it would spawn the server for
+every JSON file). `.excalidraw.png` is CLI-only inside Zed because the image pane
+claims `*.png` before any buffer exists. This is unreachability, not a gap:
+`is_image_file` (`crates/project/src/image_store.rs`) keys on the extension
+alone; `ProjectItemRegistry::open_path` resolves last-registered-first and the
+image viewer is registered after the editor, so **no buffer is created**;
+`register_project_item` is not in `zed_extension_api`; and a task cannot
+substitute because `ZED_FILE` is only populated from an active `Editor` item.
+Do not re-litigate this without an upstream Zed change — the four gates are
+recorded as finding 8 in `fixes/2026-09-05-lsp-strategy/spec.md`.
 Corpus tests in `extension/src/lib.rs` parse the shipped TOML and pin all of this.
 Evidence and repro: `fixes/2026-09-05-lsp-strategy/zed-compound-suffix-repro.md`;
 upstream issue zed-industries/zed#63831.
+
+**Highlighting comes from two bundled grammars, not from a language server.**
+Each language pins a grammar in `extension.toml` (`json` for `Excalidraw`, `xml` for
+`SVG`) with query files vendored beside its config at the same rev. Both must move
+together — the registry packager rejects a language whose grammar is undeclared, and
+it equally rejects pointing at another installed extension's grammar, which is why
+`xml` is bundled here rather than borrowed from the XML extension. This buys syntax
+colouring and visible parse errors only: nothing validates the *scene* schema, since
+no JSON language server is attached (attaching one would mean claiming the built-in
+JSON language, which the decision above forbids).
 
 **No slash commands.** Zed reserves the slash-command API for agents and rejects
 extension-provided commands (zed-industries/extensions#6468). The preview is driven
@@ -55,6 +74,23 @@ not teardown**: Zed reuses one preview tab for single-clicked files and sends
 flicker shut. The window owns its own lifecycle. The forward runs on a dedicated,
 bounded, coalescing thread so no HTTP ever sits on the stdio dispatch path, and LSP
 `shutdown`/`exit` never drains it.
+
+**LSP logging is on stderr, always at info.** Zed files a language server's
+stderr under that server's *Server Logs* (`crates/project/src/lsp_store/log_store.rs`
+maps `IoKind::StdErr` to a log entry, same store as `window/logMessage`), so stderr
+is this extension's only channel into the editor's UI — it has no notifications and
+no palette. `--lsp` therefore installs its subscriber unconditionally at `info`
+(`--debug` and `RUST_LOG` raise it), unlike the preview process where tracing is
+behind `--debug`. The writer must stay `std::io::stderr`: tracing's default fmt
+writer is *stdout*, which carries the JSON-RPC stream, so pointing it there corrupts
+the protocol. Window open/close is not observable from the LSP process, so a
+tracker thread follows the per-file locks of previews it asked for — presence means
+the window is up, removal means it is gone. It polls off the dispatch path, blocks
+entirely while nothing is tracked, and gives up after 15 s if no lock appears. A
+preview killed without lock cleanup reports no close; accepted, because pinging
+every tracked port twice a second is the worse trade. The spawned preview's own
+stderr stays discarded: piping it back would tie the detached window's lifetime to
+the editor's, which is exactly what detaching prevents.
 
 **Disk is the interchange; saves are conditional.** The viewer and external editors
 (Zed, git, CLI tools) share the file, so every write is `POST /data` with `If-Match`
