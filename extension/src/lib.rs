@@ -283,14 +283,16 @@ mod tests {
             vec!["excalidraw-preview"],
             "the Excalidraw language must attach the excalidraw-preview server"
         );
-        assert!(
-            config.get("grammar").is_none(),
-            "the Excalidraw language is grammar-less by design (see its config comment)"
+        assert_eq!(
+            config.get("grammar").and_then(|v| v.as_str()),
+            Some("json"),
+            "the Excalidraw language highlights its JSON scene format with the bundled \
+             tree-sitter-json grammar"
         );
     }
 
     #[test]
-    fn svg_language_is_registered_grammarless() {
+    fn svg_language_is_registered_grammarless_pending_retry() {
         let config = language_config("svg");
         assert_eq!(config.get("name").and_then(|v| v.as_str()), Some("SVG"));
         assert_eq!(
@@ -303,9 +305,15 @@ mod tests {
             vec!["excalidraw-preview"],
             "every .svg buffer attaches the server; the LSP guard makes plain SVGs an idle no-op"
         );
+        // Temporarily grammar-less: the xml grammar and the other config keys added
+        // in D15 coincided with .excalidraw.svg click-to-preview breaking while the
+        // json-grammar Excalidraw language kept working, so this language is reverted
+        // to its last known-working form pending a real-Zed retry. Preview routing is
+        // the contract that matters here; highlighting is not. See the config comment.
         assert!(
             config.get("grammar").is_none(),
-            "SVG ships grammar-less (XML grammar bundling is a deferred non-goal, spec §8)"
+            "SVG is grammar-less again (D15 diagnostic rollback); re-add `grammar` only \
+             once .excalidraw.svg click-to-preview is confirmed working in real Zed"
         );
     }
 
@@ -352,5 +360,62 @@ mod tests {
             BTreeSet::from(["excalidraw".to_string(), "svg".to_string()]),
             "languages/ must ship exactly the Excalidraw and SVG languages"
         );
+    }
+
+    #[test]
+    fn every_language_grammar_is_bundled_and_has_queries() {
+        // The failure this guards is a packaging one, not a runtime one: Zed's
+        // registry rejects a language whose `grammar` has no matching
+        // [grammars.<name>] entry in the manifest ("grammar not found"), and a
+        // grammar with no highlights query buys nothing over shipping none at all.
+        let manifest = parse_shipped_toml("extension.toml");
+        let grammars = manifest
+            .get("grammars")
+            .and_then(|v| v.as_table())
+            .expect("extension.toml must declare [grammars.*] for the bundled grammars");
+
+        let languages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("languages");
+        for entry in std::fs::read_dir(&languages_dir).expect("extension/languages/ must exist") {
+            let entry = entry.expect("readable languages/ entry");
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            let config = language_config(&dir_name);
+            let Some(grammar) = config.get("grammar").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let declared = grammars.get(grammar).unwrap_or_else(|| {
+                panic!(
+                    "languages/{dir_name} uses grammar {grammar:?}, which extension.toml does \
+                     not bundle; the registry packager rejects an undeclared grammar"
+                )
+            });
+            for key in ["repository", "rev"] {
+                assert!(
+                    declared.get(key).and_then(|v| v.as_str()).is_some(),
+                    "[grammars.{grammar}] must pin `{key}` so builds are reproducible"
+                );
+            }
+            // Monorepo grammars live in a subdirectory, and a wrong (or missing)
+            // `path` fails only at GUI-gated packaging — every automated gate here
+            // passes without it. tree-sitter-xml keeps its grammar in `xml/`;
+            // tree-sitter-json is at the repo root and must NOT set `path`
+            // (review-2 finding 5).
+            let subpath = declared.get("path").and_then(|v| v.as_str());
+            let expected_subpath = match grammar {
+                "xml" => Some("xml"),
+                _ => None,
+            };
+            assert_eq!(
+                subpath, expected_subpath,
+                "[grammars.{grammar}] must declare the grammar's subdirectory exactly \
+                 ({expected_subpath:?}); the registry builds the wrong directory otherwise"
+            );
+            assert!(
+                entry.path().join("highlights.scm").is_file(),
+                "languages/{dir_name} declares a grammar but ships no highlights.scm"
+            );
+        }
     }
 }

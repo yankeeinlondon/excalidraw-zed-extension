@@ -1,8 +1,16 @@
 name = "SVG"
-# No grammar: shipped grammar-less (plain text — the same rendering Zed gave .svg
-# files before this language existed). Bundling an XML grammar is a deferred non-goal
-# (spec §8): the registry packager rejects referencing another extension's grammar,
-# so one would have to be bundled with this extension first.
+# ── TEMPORARILY GRAMMAR-LESS (2026-09-06) — diagnostic rollback ───────────────
+# `grammar = "xml"` plus block_comment/brackets/tab_size/autoclose_before were
+# added earlier today (decision-log D15) and coincided with `.excalidraw.svg`
+# click-to-preview breaking, while bare `.excalidraw` (grammar = "json") kept
+# working. Reproduced with fresh never-opened files in a clean Zed session: the
+# `.excalidraw` probe spawns a preview, the `.excalidraw.svg` probe produces no
+# language match, no didOpen and no log line at all. Since both languages ship
+# from the same manifest and only this one regressed, the SVG-side additions are
+# the suspect and this file is reverted to its last known-working form. Re-add
+# them one at a time (grammar first, then block_comment — the array form here may
+# not match the current LanguageConfig schema) once the preview is confirmed
+# working again. Queries stay vendored in this directory for that retry.
 #
 # Trade-off (spec §3): claiming `svg` attaches the excalidraw-preview language
 # server to EVERY .svg buffer. The LSP's `is_excalidraw_path` filename filter makes

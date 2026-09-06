@@ -16,6 +16,21 @@ name = "Excalidraw Preview"
 # deliberately NOT listed: that would spawn our server for every JSON file.
 languages = ["Excalidraw", "SVG"]
 
+# Bundled grammars. Both are highlighting-only: `json` renders bare `.excalidraw`
+# scenes (the format is a JSON document) and `xml` renders `.excalidraw.svg` (and
+# every other `.svg`, which this extension's SVG language claims). A grammar must
+# be declared here — the registry packager rejects both an undeclared grammar and
+# a reference to another extension's grammar — and the vendored query files under
+# languages/*/ are pinned to these same revs.
+[grammars.json]
+repository = "https://github.com/tree-sitter/tree-sitter-json"
+rev = "ee35a6ebefcef0c5c416c0d1ccec7370cfca5a24"
+
+[grammars.xml]
+repository = "https://github.com/tree-sitter-grammars/tree-sitter-xml"
+rev = "5000ae8f22d11fbe93939b05c1e37cf21117162d"
+path = "xml"
+
 [[capabilities]]
 kind = "process:exec"
 command = "excalidraw-preview"

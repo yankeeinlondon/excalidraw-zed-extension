@@ -1,8 +1,12 @@
 name = "Excalidraw"
-# No grammar: this language spans JSON/SVG/PNG variants (no single grammar fits) and
-# exists to claim path_suffixes + attach the excalidraw-preview language server for
-# click-to-preview. A declared grammar must be bundled in extension.toml, and the
-# Zed registry packager rejects an undeclared one ("grammar not found").
+grammar = "json"
+# Grammar: the bare `.excalidraw` format is a JSON document, so the language
+# borrows tree-sitter-json (bundled as [grammars.json] in extension.toml — the
+# registry packager rejects an undeclared grammar, and referencing another
+# extension's grammar is not allowed either). This is highlighting only; there is
+# no JSON language server attached, so a schema-level mistake still parses fine.
+# The compound `.excalidraw.svg`/`.excalidraw.png` variants are NOT this language
+# (see below) and get XML highlighting / Zed's image pane instead.
 #
 # Single-segment suffix ONLY: Zed 1.18 attaches a compound-suffix language to the
 # buffer (the status bar shows "Excalidraw") but never routes textDocument/didOpen
@@ -15,3 +19,10 @@ name = "Excalidraw"
 # pane claims *.png before a buffer exists.
 path_suffixes = ["excalidraw"]
 language_servers = ["excalidraw-preview"]
+tab_size = 2
+autoclose_before = ",]}"
+brackets = [
+    { start = "{", end = "}", close = true, surround = true, newline = true },
+    { start = "[", end = "]", close = true, surround = true, newline = true },
+    { start = "\"", end = "\"", close = true, surround = true, newline = false },
+]

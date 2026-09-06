@@ -8,6 +8,13 @@ target/
 # only caused version drift. See https://zed.dev/blog/zed-decoded-extensions
 extension/extension.wasm
 
+# Grammar sources Zed checks out and compiles when it (re)builds this as a dev
+# extension: it clones each `[grammars.*]` repository into `extension/grammars/<name>`
+# (full working copies, each with its own .git) and caches the compiled .wasm beside
+# them. Pure build output — the pinned rev in extension.toml is the source of truth,
+# and the registry does the same checkout on its own machines.
+extension/grammars/
+
 # Node modules (webview-src)
 preview-binary/webview-src/node_modules/
 preview-binary/webview-src/dist/
