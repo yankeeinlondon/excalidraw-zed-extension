@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{broadcast, watch};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// A request from the HTTP layer to show a native save dialog and write export bytes.
 /// Processed on the platform UI thread (tao event loop / GTK main context).
@@ -465,7 +465,7 @@ fn main() -> Result<()> {
     let args = CliArgs::parse();
 
     if args.lsp {
-        return run_lsp_server();
+        return run_lsp_server(args.debug);
     }
 
     if args.debug {
@@ -3264,11 +3264,19 @@ fn enqueue_closed_path(pending: &mut std::collections::VecDeque<PathBuf>, path: 
 fn forward_editor_closed(client: &reqwest::blocking::Client, canonical: &Path) {
     let lock_path = get_lock_path(canonical);
     let Ok(port_str) = std::fs::read_to_string(&lock_path) else {
+        debug!(
+            "no live preview to notify that the editor for {} closed",
+            display_path(canonical)
+        );
         return;
     };
     let Ok(port) = port_str.trim().parse::<u16>() else {
         return;
     };
+    debug!(
+        "notifying the preview for {} on port {port} that its editor closed",
+        display_path(canonical)
+    );
     let _ = client
         .post(format!("http://127.0.0.1:{port}/editor-closed"))
         .send();
@@ -3307,6 +3315,239 @@ fn run_editor_closed_forwarder(rx: std::sync::mpsc::Receiver<PathBuf>) {
     }
 }
 
+// ── LSP preview lifecycle tracking ───────────────────────────────────────────
+
+/// How often the lifecycle tracker re-checks the previews it follows.
+///
+/// One `stat` per tracked file per tick, and the thread blocks entirely while
+/// nothing is tracked, so the idle cost is zero and the busy cost is noise.
+const PREVIEW_TRACK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a requested preview has to publish its lock file before the tracker
+/// stops waiting and reports that no window ever appeared. Generous, because a
+/// cold start pays for process spawn, port binding and window creation.
+const PREVIEW_TRACK_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A preview window the LSP server asked for and is now following.
+struct TrackedPreview {
+    /// How this file is named in the log. Tracking is keyed by the canonical
+    /// path (that is what the lock is derived from), but canonical paths are not
+    /// what the user opened — on macOS they gain a `/private` prefix — so the
+    /// label carries the spelling the editor sent.
+    label: String,
+    /// The preview's per-file lock. Its *presence* is the liveness signal: the
+    /// preview writes it once it is serving and removes it on every exit path
+    /// (window close, `/shutdown`).
+    lock: PathBuf,
+    /// When tracking began — bounds the wait for the lock to first appear.
+    since: std::time::Instant,
+    /// Whether the lock has been observed at least once.
+    opened: bool,
+}
+
+/// One observable transition in a tracked preview's life, as surfaced in the
+/// editor's language-server log. Each variant carries the file's log label (see
+/// [`TrackedPreview::label`]), not its canonical path.
+#[derive(Debug, PartialEq, Eq)]
+enum PreviewLifecycle {
+    /// A preview was requested for a file that already had a live one; the
+    /// running window is focused instead of a second being spawned.
+    AlreadyOpen(String),
+    /// The requested preview published its lock: its window is up.
+    Opened(String),
+    /// A preview that had been observed open removed its lock: its window is gone.
+    Closed(String),
+    /// No lock appeared within [`PREVIEW_TRACK_STARTUP_GRACE`]; tracking stops.
+    NeverOpened(String),
+}
+
+/// Starts following `canonical`, reporting whether a preview was already up.
+///
+/// `lock_present` is injected so the state machine can be tested without real
+/// processes; production passes a plain existence check.
+///
+/// ## Returns
+/// [`PreviewLifecycle::AlreadyOpen`] when a lock is already on disk at
+/// registration (the spawned child will focus that window and exit), or `None`
+/// when the preview is still to come — or when this path is already tracked, in
+/// which case a repeat request is not a new event.
+///
+/// ## Notes
+/// A *stale* lock left by a crashed preview reads as "already open" here. That
+/// is a cosmetic mislabel in the log only: the spawned child probes `/ping`,
+/// finds the lock stale and takes the file over regardless.
+fn track_preview(
+    tracked: &mut std::collections::BTreeMap<PathBuf, TrackedPreview>,
+    canonical: PathBuf,
+    label: String,
+    now: std::time::Instant,
+    lock_present: &impl Fn(&Path) -> bool,
+) -> Option<PreviewLifecycle> {
+    if tracked.contains_key(&canonical) {
+        return None;
+    }
+    let lock = get_lock_path(&canonical);
+    let opened = lock_present(&lock);
+    let event = opened.then(|| PreviewLifecycle::AlreadyOpen(label.clone()));
+    tracked.insert(
+        canonical,
+        TrackedPreview {
+            label,
+            lock,
+            since: now,
+            opened,
+        },
+    );
+    event
+}
+
+/// Re-checks every tracked preview and returns the transitions observed this tick.
+///
+/// Entries are dropped once they reach a terminal state ([`PreviewLifecycle::Closed`]
+/// or [`PreviewLifecycle::NeverOpened`]), so a later `didSave` re-registers a file
+/// cleanly and each transition is reported exactly once.
+///
+/// ## Notes
+/// A preview that dies *without* removing its lock (a crash, `SIGKILL`) leaves a
+/// stale lock behind, so its close goes unreported until something replaces the
+/// lock. Liveness is deliberately judged by lock presence alone — pinging every
+/// tracked port twice a second would trade that rare gap for constant traffic.
+fn poll_tracked_previews(
+    tracked: &mut std::collections::BTreeMap<PathBuf, TrackedPreview>,
+    now: std::time::Instant,
+    lock_present: &impl Fn(&Path) -> bool,
+) -> Vec<PreviewLifecycle> {
+    let mut events = Vec::new();
+    tracked.retain(|_, state| match (state.opened, lock_present(&state.lock)) {
+        (false, true) => {
+            state.opened = true;
+            events.push(PreviewLifecycle::Opened(state.label.clone()));
+            true
+        }
+        (false, false) => {
+            if now.duration_since(state.since) >= PREVIEW_TRACK_STARTUP_GRACE {
+                events.push(PreviewLifecycle::NeverOpened(state.label.clone()));
+                false
+            } else {
+                true
+            }
+        }
+        (true, false) => {
+            events.push(PreviewLifecycle::Closed(state.label.clone()));
+            false
+        }
+        (true, true) => true,
+    });
+    events
+}
+
+/// Writes one lifecycle transition to the language-server log.
+fn log_preview_lifecycle(event: &PreviewLifecycle) {
+    match event {
+        PreviewLifecycle::AlreadyOpen(file) => {
+            info!("preview already open for {file} — focusing that window");
+        }
+        PreviewLifecycle::Opened(file) => {
+            info!("preview window opened for {file}");
+        }
+        PreviewLifecycle::Closed(file) => {
+            info!("preview window closed for {file}");
+        }
+        PreviewLifecycle::NeverOpened(file) => {
+            warn!(
+                "no preview window appeared for {file} within {}s — no longer watching it",
+                PREVIEW_TRACK_STARTUP_GRACE.as_secs()
+            );
+        }
+    }
+}
+
+/// Adds one path to the tracked set, logging the registration-time transition.
+fn register_tracked_preview(
+    tracked: &mut std::collections::BTreeMap<PathBuf, TrackedPreview>,
+    path: &Path,
+) {
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        debug!(
+            "not tracking {}: path no longer resolves to a file",
+            path.display()
+        );
+        return;
+    };
+    let label = display_path(path);
+    let now = std::time::Instant::now();
+    if let Some(event) = track_preview(tracked, canonical, label, now, &|lock: &Path| lock.exists())
+    {
+        log_preview_lifecycle(&event);
+    }
+}
+
+/// Body of the preview lifecycle tracker thread.
+///
+/// The dispatch loop only pushes paths into the channel; watching for windows
+/// coming and going happens here so nothing observational ever sits on the stdio
+/// path. The thread blocks on the channel while nothing is tracked and polls at
+/// [`PREVIEW_TRACK_POLL_INTERVAL`] while something is; it exits when the senders
+/// are dropped (LSP shutdown/exit), abandoning whatever it was still watching —
+/// those previews outlive the editor by design and nobody is left to read the log.
+fn run_preview_tracker(rx: std::sync::mpsc::Receiver<PathBuf>) {
+    let mut tracked = std::collections::BTreeMap::new();
+    loop {
+        if tracked.is_empty() {
+            match rx.recv() {
+                Ok(path) => register_tracked_preview(&mut tracked, &path),
+                Err(_) => return,
+            }
+        } else {
+            match rx.recv_timeout(PREVIEW_TRACK_POLL_INTERVAL) {
+                Ok(path) => register_tracked_preview(&mut tracked, &path),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        // Drain anything that queued up behind the first message before polling.
+        while let Ok(path) = rx.try_recv() {
+            register_tracked_preview(&mut tracked, &path);
+        }
+        let now = std::time::Instant::now();
+        for event in poll_tracked_previews(&mut tracked, now, &|lock: &Path| lock.exists()) {
+            log_preview_lifecycle(&event);
+        }
+    }
+}
+
+/// Installs the language-server log sink on **stderr**.
+///
+/// Zed reads a language server's stderr and files it under that server's
+/// "Server Logs" (command palette → `dev: open language server logs`, or the
+/// status-bar server menu → "View Logs"), so this is what makes the lines below
+/// visible from inside the editor. stdout carries the JSON-RPC stream and must
+/// never be written to by anything else.
+///
+/// ## Notes
+/// Unlike the preview process — whose tracing is gated behind `--debug` — the
+/// LSP server logs at `info` unconditionally: the point of these lines is that
+/// the editor can show what the extension is doing, and one line per open, save
+/// and window transition is not noise. `--debug` raises the default filter to
+/// `debug` (per-file dispatch detail, `didClose` forwarding); `RUST_LOG` in the
+/// editor's environment overrides both. ANSI is off because the log pane renders
+/// plain text.
+fn init_lsp_logging(debug: bool) {
+    let default = if debug {
+        "excalidraw_preview=debug"
+    } else {
+        "excalidraw_preview=info"
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_target(false)
+        .try_init();
+}
+
 // ── LSP server ───────────────────────────────────────────────────────────────
 
 /// Minimal JSON-RPC LSP server.
@@ -3314,8 +3555,13 @@ fn run_editor_closed_forwarder(rx: std::sync::mpsc::Receiver<PathBuf>) {
 /// Zed starts this when a `.excalidraw` file is opened (via `language_server_command`).
 /// On `textDocument/didOpen` it spawns the preview window for that file and exits
 /// the notification without blocking the LSP loop.
-fn run_lsp_server() -> Result<()> {
+///
+/// `debug` raises the log level of the stderr sink the editor reads; see
+/// [`init_lsp_logging`].
+fn run_lsp_server(debug: bool) -> Result<()> {
     use std::io::{BufRead, BufReader, Read};
+
+    init_lsp_logging(debug);
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -3328,6 +3574,17 @@ fn run_lsp_server() -> Result<()> {
     // a channel, so the stdio dispatch loop below never blocks on the network.
     let (editor_closed_tx, editor_closed_rx) = std::sync::mpsc::channel::<PathBuf>();
     std::thread::spawn(|| run_editor_closed_forwarder(editor_closed_rx));
+
+    // Preview lifecycle watcher: reports "window opened" / "window closed" to the
+    // editor's log. Purely observational, and off the dispatch path for the same
+    // reason as the forwarder above.
+    let (track_tx, track_rx) = std::sync::mpsc::channel::<PathBuf>();
+    std::thread::spawn(|| run_preview_tracker(track_rx));
+
+    info!(
+        "excalidraw-preview {} ready as a language server",
+        env!("CARGO_PKG_VERSION")
+    );
 
     loop {
         // ── Read headers ────────────────────────────────────────────────────
@@ -3391,7 +3648,12 @@ fn run_lsp_server() -> Result<()> {
                         // Only real Excalidraw files get a preview; Zed may attach
                         // this server to plain .svg/.png too (see is_excalidraw_path).
                         if is_excalidraw_path(&path) {
-                            spawn_preview(&exe, &path);
+                            info!("editor opened {}", display_path(&path));
+                            if spawn_preview(&exe, &path) {
+                                let _ = track_tx.send(path);
+                            }
+                        } else {
+                            debug!("ignoring non-Excalidraw file {}", path.display());
                         }
                     }
                 }
@@ -3416,6 +3678,9 @@ fn run_lsp_server() -> Result<()> {
                 if let Some(uri) = msg["params"]["textDocument"]["uri"].as_str() {
                     if let Some(path) = file_uri_to_path(uri) {
                         if is_excalidraw_path(&path) {
+                            // Debug, not info: Zed reuses one preview tab, so this
+                            // fires every time the user browses to another file.
+                            debug!("editor closed {}", display_path(&path));
                             let _ = editor_closed_tx.send(path);
                         }
                     }
@@ -3429,21 +3694,39 @@ fn run_lsp_server() -> Result<()> {
                 // preview. If a live instance already exists, this is a no-op.
                 if let Some(uri) = msg["params"]["textDocument"]["uri"].as_str() {
                     if let Some(path) = file_uri_to_path(uri) {
-                        if is_excalidraw_path(&path) && !preview_is_live(&path) {
-                            spawn_preview(&exe, &path);
+                        if is_excalidraw_path(&path) {
+                            if preview_is_live(&path) {
+                                debug!(
+                                    "editor saved {} — preview already open",
+                                    display_path(&path)
+                                );
+                                // Track it anyway: this may be the first the server
+                                // hears of a preview (a didOpen it never saw, or one
+                                // started from the CLI), and its close is worth a line.
+                                let _ = track_tx.send(path);
+                            } else {
+                                info!("editor saved {} — reopening preview", display_path(&path));
+                                if spawn_preview(&exe, &path) {
+                                    let _ = track_tx.send(path);
+                                }
+                            }
                         }
                     }
                 }
             }
 
             "shutdown" => {
+                info!("shutdown requested — open previews keep running");
                 lsp_send(
                     &mut writer,
                     &serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }),
                 )?;
             }
 
-            "exit" => break,
+            "exit" => {
+                debug!("exit received; leaving the dispatch loop");
+                break;
+            }
 
             _ => {
                 // Respond to unknown *requests* with "method not found".
@@ -3476,26 +3759,36 @@ fn lsp_send(writer: &mut impl std::io::Write, msg: &serde_json::Value) -> Result
 /// Spawns `excalidraw-preview <path>` as a fully detached process so that
 /// closing the LSP server (when Zed shuts down the language server) does not
 /// kill the preview window.
-fn spawn_preview(exe: &std::path::Path, path: &std::path::Path) {
+///
+/// ## Returns
+/// `true` if the child process started. That is not the same as "a new window
+/// appeared": the child dedups through the per-file lock and may simply focus a
+/// live instance and exit. Callers use it only to decide whether there is
+/// anything worth watching — see [`run_preview_tracker`].
+///
+/// ## Notes
+/// The child's stderr is discarded rather than inherited. Piping it into this
+/// process would put the detached preview's lifetime at the mercy of the LSP
+/// server's (a closed pipe kills the writer), which is exactly what detaching
+/// exists to prevent — so preview-side logs stay off the editor's log pane and
+/// are only visible when the binary is run from a terminal.
+fn spawn_preview(exe: &std::path::Path, path: &std::path::Path) -> bool {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        let _ = std::process::Command::new(exe)
-            .arg(path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0) // new process group → immune to SIGHUP
-            .spawn();
+        cmd.process_group(0); // new process group → immune to SIGHUP
     }
-    #[cfg(not(unix))]
-    {
-        let _ = std::process::Command::new(exe)
-            .arg(path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+    match cmd.spawn() {
+        Ok(_) => true,
+        Err(e) => {
+            warn!("failed to start a preview for {}: {e}", display_path(path));
+            false
+        }
     }
 }
 
@@ -3544,15 +3837,22 @@ fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
 /// `.excalidraw.svg`, or `.excalidraw.png`.
 ///
 /// The language server is attached to two languages: the `Excalidraw` language
-/// (single-segment suffix `excalidraw`) and a grammar-less `SVG` language (suffix
-/// `svg`). Zed 1.18 never routes `didOpen` for compound suffixes, so the workaround
-/// claims the single-segment base `svg` and guards here — every plain `.svg` buffer
-/// attaches the server, and this filter makes those an idle no-op. A plain `.svg`
+/// (single-segment suffix `excalidraw`) and an `SVG` language (suffix `svg`). Zed
+/// 1.18 never routes `didOpen` for compound suffixes, so the workaround claims the
+/// single-segment base `svg` and guards here — every plain `.svg` buffer attaches
+/// the server, and this filter makes those an idle no-op. (Both languages bundle a
+/// tree-sitter grammar for highlighting — `json` and `xml` respectively — which is
+/// cosmetic and has no bearing on this guard or on routing.) A plain `.svg`
 /// is detected as `image/svg+xml`, has no embedded Excalidraw scene, and every format
 /// fallback would fail ("all format fallbacks failed"), so gating `didOpen`/`didSave`
-/// on this keeps plain images from spawning a doomed preview. Plain `.png` never
-/// reaches the LSP (Zed's image pane claims it before any buffer exists), so
-/// `.excalidraw.png` is CLI-only; the guard still includes it for the CLI/`didSave` paths.
+/// on this keeps plain images from spawning a doomed preview.
+///
+/// **No `.png` ever reaches the LSP.** Zed's image pane claims `*.png` on extension
+/// alone and is registered after the editor in a registry that resolves
+/// last-registered-first, so no buffer is created — there is no `didOpen` to filter
+/// rather than one that is filtered out, and no extension-side change can alter that
+/// (spec finding 8). `.excalidraw.png` is therefore terminal-launched only; the guard
+/// still includes it because the CLI and `didSave` paths share this function.
 fn is_excalidraw_path(path: &std::path::Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -3570,7 +3870,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tower::ServiceExt; // for `oneshot`
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -3966,6 +4266,142 @@ mod tests {
             pending.is_empty(),
             "a path that cannot be canonicalized has no lock identity; drop it"
         );
+    }
+
+    // ── LSP preview lifecycle tracking ───────────────────────────────────────
+
+    /// A stand-in for the on-disk lock check, so the lifecycle state machine can
+    /// be driven without spawning previews: `present` is the set of lock paths
+    /// the tracker should see this tick.
+    fn lock_probe(
+        present: &std::cell::RefCell<std::collections::HashSet<PathBuf>>,
+    ) -> impl Fn(&Path) -> bool + '_ {
+        move |lock: &Path| present.borrow().contains(lock)
+    }
+
+    #[test]
+    fn test_track_preview_reports_a_preview_that_is_already_open() {
+        let file = PathBuf::from("/tmp/already.excalidraw");
+        let label = display_path(&file);
+        let present = std::cell::RefCell::new(
+            std::iter::once(get_lock_path(&file)).collect::<std::collections::HashSet<_>>(),
+        );
+        let probe = lock_probe(&present);
+        let mut tracked = std::collections::BTreeMap::new();
+
+        assert_eq!(
+            track_preview(&mut tracked, file, label.clone(), Instant::now(), &probe),
+            Some(PreviewLifecycle::AlreadyOpen(label)),
+            "a lock already on disk means the spawned child will focus that window"
+        );
+        assert!(
+            poll_tracked_previews(&mut tracked, Instant::now(), &probe).is_empty(),
+            "a preview reported as already open must not also be reported as opened"
+        );
+    }
+
+    #[test]
+    fn test_poll_tracked_previews_reports_opened_then_closed_once() {
+        let file = PathBuf::from("/tmp/lifecycle.excalidraw");
+        let label = display_path(&file);
+        let lock = get_lock_path(&file);
+        let present = std::cell::RefCell::new(std::collections::HashSet::new());
+        let probe = lock_probe(&present);
+        let mut tracked = std::collections::BTreeMap::new();
+
+        assert_eq!(
+            track_preview(&mut tracked, file, label.clone(), Instant::now(), &probe),
+            None,
+            "no lock yet: the window is still coming"
+        );
+        assert!(
+            poll_tracked_previews(&mut tracked, Instant::now(), &probe).is_empty(),
+            "still waiting for the lock — nothing to report"
+        );
+
+        present.borrow_mut().insert(lock.clone());
+        assert_eq!(
+            poll_tracked_previews(&mut tracked, Instant::now(), &probe),
+            vec![PreviewLifecycle::Opened(label.clone())],
+            "the lock appearing is the window opening"
+        );
+        assert!(
+            poll_tracked_previews(&mut tracked, Instant::now(), &probe).is_empty(),
+            "an open window that stays open is not an event"
+        );
+
+        present.borrow_mut().remove(&lock);
+        assert_eq!(
+            poll_tracked_previews(&mut tracked, Instant::now(), &probe),
+            vec![PreviewLifecycle::Closed(label)],
+            "the lock disappearing is the window closing"
+        );
+        assert!(
+            tracked.is_empty(),
+            "a closed preview is dropped, so its close is reported exactly once \
+             and a later didSave re-registers it cleanly"
+        );
+    }
+
+    #[test]
+    fn test_poll_tracked_previews_gives_up_when_no_window_appears() {
+        let file = PathBuf::from("/tmp/never.excalidraw");
+        let label = display_path(&file);
+        let present = std::cell::RefCell::new(std::collections::HashSet::new());
+        let probe = lock_probe(&present);
+        let mut tracked = std::collections::BTreeMap::new();
+        let start = Instant::now();
+
+        track_preview(&mut tracked, file, label.clone(), start, &probe);
+        assert!(
+            poll_tracked_previews(
+                &mut tracked,
+                start + PREVIEW_TRACK_STARTUP_GRACE / 2,
+                &probe
+            )
+            .is_empty(),
+            "a slow start is not a failure"
+        );
+        assert_eq!(tracked.len(), 1, "still within the grace period");
+
+        assert_eq!(
+            poll_tracked_previews(&mut tracked, start + PREVIEW_TRACK_STARTUP_GRACE, &probe),
+            vec![PreviewLifecycle::NeverOpened(label)],
+            "past the grace period the preview is reported as never having appeared"
+        );
+        assert!(
+            tracked.is_empty(),
+            "giving up must also stop the polling, or the file is watched forever"
+        );
+    }
+
+    #[test]
+    fn test_track_preview_ignores_a_file_it_is_already_following() {
+        let file = PathBuf::from("/tmp/repeat.excalidraw");
+        let label = display_path(&file);
+        let lock = get_lock_path(&file);
+        let present = std::cell::RefCell::new(std::collections::HashSet::new());
+        let probe = lock_probe(&present);
+        let mut tracked = std::collections::BTreeMap::new();
+
+        track_preview(
+            &mut tracked,
+            file.clone(),
+            label.clone(),
+            Instant::now(),
+            &probe,
+        );
+        present.borrow_mut().insert(lock);
+        poll_tracked_previews(&mut tracked, Instant::now(), &probe);
+
+        // Zed re-sends didOpen/didSave for a file whose preview is already being
+        // followed; that is not a second window and must not log a second time.
+        assert_eq!(
+            track_preview(&mut tracked, file, label, Instant::now(), &probe),
+            None,
+            "re-registering a tracked file is not a new event"
+        );
+        assert_eq!(tracked.len(), 1, "and must not duplicate the entry");
     }
 
     // ── content revision & conditional save (POST /data If-Match) ─────────────

@@ -965,6 +965,106 @@ fn lsp_did_close_keeps_preview_alive() {
     let _ = child.wait();
 }
 
+/// Drives the `--lsp` server through a preview's whole life and reads its
+/// **stderr**: opening the file, the window coming up, and the window going away
+/// must each produce a log line. Zed files a language server's stderr under that
+/// server's "Server Logs", so this is the end-to-end proof that the lifecycle is
+/// visible from inside the editor — asserting on the tracker's state machine
+/// alone would not catch the sink being wired to stdout, silenced, or never
+/// installed.
+#[test]
+fn lsp_logs_preview_lifecycle_to_stderr() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("lifecycle.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+    let canonical = std::fs::canonicalize(&file).unwrap();
+    let lock = lock_path_for(&canonical);
+    let _ = std::fs::remove_file(&lock);
+
+    let mut child = std::process::Command::new(binary())
+        .arg("--lsp")
+        .env("EXCALIDRAW_PREVIEW_HEADLESS", "true")
+        // Pin the level: a RUST_LOG inherited from the developer's shell would
+        // otherwise decide whether these lines exist at all.
+        .env("RUST_LOG", "excalidraw_preview=info")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn --lsp");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Drain stderr on its own thread: a full pipe buffer would otherwise wedge
+    // the server mid-notification.
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let collector = std::sync::Arc::clone(&log);
+    let stderr = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            collector.lock().unwrap().push(line);
+        }
+    });
+
+    lsp_write(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    let _ = lsp_read(&mut stdout);
+
+    let uri = file_uri(&canonical);
+    let did_open = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"excalidraw","version":1,"text":""}}}}}}"#
+    );
+    lsp_write(&mut stdin, &did_open);
+
+    let port = wait_for_lock_port(&lock);
+    wait_for_log_line(&log, "editor opened");
+    wait_for_log_line(&log, "preview window opened");
+    assert!(
+        wait_for_log_line(&log, "lifecycle.excalidraw").contains("lifecycle.excalidraw"),
+        "log lines must name the file they are about"
+    );
+
+    // Close the window the way the user would (the preview removes its lock on
+    // every exit path) and require the tracker to notice.
+    let _ = http_get(&format!("http://127.0.0.1:{port}/shutdown"));
+    wait_for_lock_removed(&lock);
+    wait_for_log_line(&log, "preview window closed");
+
+    let _ = std::fs::remove_file(&lock);
+    let exit = r#"{"jsonrpc":"2.0","method":"exit"}"#;
+    let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", exit.len(), exit);
+    let _ = stdin.flush();
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// Waits (bounded) for a collected stderr line containing `needle` and returns
+/// it, failing with the whole log if it never arrives.
+fn wait_for_log_line(log: &std::sync::Mutex<Vec<String>>, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(line) = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|line| line.contains(needle))
+        {
+            return line.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no log line containing {needle:?}; got:\n{}",
+            log.lock().unwrap().join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 // ── LSP didClose attention-signal harness (Phase 5) ──────────────────────────
 
 /// A driven `--lsp` child: framed JSON-RPC over piped stdio. Spawned with
