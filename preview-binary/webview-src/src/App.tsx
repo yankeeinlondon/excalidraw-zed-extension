@@ -2,9 +2,11 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import {
   Excalidraw,
   MainMenu,
-  serializeAsJSON,
   exportToSvg,
   exportToBlob,
+  loadLibraryFromBlob,
+  mergeLibraryItems,
+  restoreLibraryItems,
 } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css";
 import type {
@@ -16,7 +18,12 @@ import type {
 } from "@excalidraw/excalidraw/types";
 import type { ExcalidrawElement } from "@excalidraw/excalidraw/element/types";
 import { postExport, type ExportKind } from "./export";
+import { serializeSceneForDisk } from "./serialize-scene";
 import { computeSceneHash } from "./scene-fingerprint";
+import {
+  installLibraryPayload,
+  type LibraryPipeline,
+} from "./library-merge";
 import {
   applyExternalReload,
   decideSaveOutcome,
@@ -107,6 +114,20 @@ const IS_MAC =
   typeof navigator !== "undefined" &&
   /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent);
 const SAVE_SHORTCUT = IS_MAC ? "Cmd+S" : "Ctrl+S";
+
+/**
+ * The vendored library pipeline {@link installLibraryPayload} runs against:
+ * the same parse/merge functions `updateLibrary({ merge: true })` used
+ * internally (same `"unpublished"` default status the flows relied on before),
+ * injected so the pure module stays testable without the package. The choke
+ * point wraps the merged result so the unique-id invariant holds no matter
+ * what the vendored content-equality merge appended (D3).
+ */
+const libraryPipeline: LibraryPipeline = {
+  mergeItems: mergeLibraryItems,
+  parseBlob: (blob) => loadLibraryFromBlob(blob, "unpublished"),
+  restoreItems: (items) => restoreLibraryItems(items, "unpublished"),
+};
 
 /** Best-effort unique id for correlating a native action result. */
 function generateRequestId(): string {
@@ -344,7 +365,14 @@ export default function App({
   const doSave = useCallback(
     async (opts?: NativeSaveOptions): Promise<NativeSaveResult> => {
       const api = apiRef.current;
-      if (!api) return { ok: false, error: "Editor not ready" };
+      if (!api) {
+        // No Excalidraw API means no toast surface, so this early return used
+        // to be the one save path that produced nothing at all. Route it to the
+        // module-scope notice the native menu also falls back to, keeping every
+        // non-bootstrap save gesture observable (spec §2.3; `save-notice.ts`).
+        if (opts?.reason !== "bootstrap") window.__excalidrawSaveUnavailable?.();
+        return { ok: false, error: "Editor not ready" };
+      }
       const controller = controllerRef.current!;
 
       // Tag this save so an out-of-order response can tell whether a newer save
@@ -412,7 +440,11 @@ export default function App({
                 body = await blob.arrayBuffer();
                 contentTypeHeader = "image/png";
               } else {
-                body = serializeAsJSON(elements, appState, files, "local");
+                // serializeAsJSON strips appState.exportWithDarkMode (upstream
+                // marks it per-browser), so the document's color mode is
+                // injected back into the serialized body post-hoc (D1) — every
+                // plain-JSON save carries the editor's mode at save time.
+                body = serializeSceneForDisk(elements, appState, files);
                 contentTypeHeader = "application/json";
               }
 
@@ -882,7 +914,13 @@ export default function App({
     // server fetched the raw document(s) and parked them, and we now merge each
     // into the panel. Excalidraw's updateLibrary parses a Blob in either the v1
     // (`library`) or v2 (`libraryItems`) shape, so no format handling lives here.
-    // The resulting onLibraryChange persists the merged set via handleLibraryChange.
+    // The merge runs through installLibraryPayload (D3's choke point): the
+    // vendored content-merge and the unique-id dedupe happen in one atomic
+    // updateLibrary call, so a re-delivered library whose elements were
+    // re-stamped (which the vendored merge treats as brand-new content) can
+    // never leave two panel entries sharing one library-item id — the reported
+    // twin insertion cause. The resulting onLibraryChange persists the merged
+    // set via handleLibraryChange.
     window.__excalidrawApplyPendingLibraries = async (): Promise<void> => {
       const api = apiRef.current;
       if (!api) return;
@@ -892,11 +930,12 @@ export default function App({
         const { libraries } = (await res.json()) as { libraries?: unknown };
         if (!Array.isArray(libraries) || libraries.length === 0) return;
         for (const raw of libraries as string[]) {
-          const merged = await api.updateLibrary({
-            libraryItems: new Blob([raw], { type: "application/json" }),
-            merge: true,
-            openLibraryMenu: true,
-          });
+          const merged = await installLibraryPayload(
+            libraryPipeline,
+            (opts) => api.updateLibrary(opts),
+            new Blob([raw], { type: "application/json" }),
+            { openLibraryMenu: true },
+          );
           libraryItemsRef.current = merged;
         }
       } catch {
@@ -965,14 +1004,19 @@ export default function App({
           } else if (!api) {
             result = { ok: false, error: "Editor not ready" };
           } else {
-            // updateLibrary resolves with the merged item list. Persist it
-            // immediately and await the write before reporting success, so a
-            // close within the debounce window can't drop the import (review 5,
-            // finding 1) — we don't rely on the debounced onLibraryChange echo.
-            const merged = await api.updateLibrary({
-              libraryItems: lib.libraryItems as LibraryItems,
-              merge: true,
-            });
+            // Merge through the D3 choke point: the vendored content-merge and
+            // the unique-id dedupe run in one atomic updateLibrary call, so an
+            // imported library whose items collide with existing panel entries
+            // leaves exactly one entry per library-item id. updateLibrary
+            // resolves with the merged item list; persist it immediately and
+            // await the write before reporting success, so a close within the
+            // debounce window can't drop the import (review 5, finding 1) — we
+            // don't rely on the debounced onLibraryChange echo.
+            const merged = await installLibraryPayload(
+              libraryPipeline,
+              (opts) => api.updateLibrary(opts),
+              lib.libraryItems as LibraryItems,
+            );
             libraryItemsRef.current = merged;
             // Only acknowledge the import once the write is durable. A failed
             // `/library` write must report `ok: false` (and keep the merged

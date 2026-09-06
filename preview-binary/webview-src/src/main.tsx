@@ -1,9 +1,19 @@
 import ReactDOM from "react-dom/client";
 import { loadFromBlob } from "@excalidraw/excalidraw";
-import type { ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
+import type {
+  ExcalidrawInitialDataState,
+  LibraryItems,
+} from "@excalidraw/excalidraw/types";
 import App, { type SyncHooks } from "./App";
-import { svgBytesAreDarkMode } from "./color-mode";
+import { reattachRawColorMode, svgBytesAreDarkMode } from "./color-mode";
+import { sanitizePersistedLibrary } from "./library-merge";
 import { createReadonlyImageRefresher } from "./readonly-image";
+import {
+  createSaveUnavailableNotice,
+  installSaveUnavailableBridge,
+  SAVE_NOTICE_LOAD_FAILED,
+  SAVE_NOTICE_READONLY,
+} from "./save-notice";
 import { createAppSseHandler, createReadonlySseHandler } from "./sse-events";
 
 interface Config {
@@ -13,7 +23,42 @@ interface Config {
   autoSave: boolean;
 }
 
+/**
+ * Renders one transient notice at the bottom of the window and returns the
+ * function that removes it. The DOM half of `save-notice.ts` (the routing and
+ * timing live there, unit-tested without a DOM).
+ */
+function presentNotice(message: string): () => void {
+  const el = document.createElement("div");
+  el.setAttribute("role", "status");
+  el.textContent = message;
+  el.style.cssText =
+    "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);max-width:80vw;" +
+    "padding:8px 14px;border-radius:6px;font:13px/1.4 system-ui,-apple-system,sans-serif;" +
+    "background:rgba(30,30,30,0.92);color:#fff;box-shadow:0 2px 8px rgba(0,0,0,0.3);" +
+    "z-index:2147483647;pointer-events:none;text-align:center;";
+  document.body.appendChild(el);
+  return () => el.remove();
+}
+
+/**
+ * The save fallback, registered at module scope — before any await — so it is
+ * in place on every load path, including the ones where the React app never
+ * mounts (read-only image preview, load failure) and the window between page
+ * load and mount. Without it a native File → Save / `Cmd+S` in those states is
+ * a complete silent no-op (spec §2.3; main.rs `SAVE_MENU_SCRIPT`).
+ */
+const saveNotice = createSaveUnavailableNotice({
+  present: presentNotice,
+  setTimer: (fn, ms) => window.setTimeout(fn, ms),
+  clearTimer: (id) => window.clearTimeout(id),
+});
+installSaveUnavailableBridge(window, saveNotice);
+
 function showError(message: string) {
+  // A file that could not be loaded has no scene: say so on a save gesture
+  // rather than showing the generic "still loading" wording.
+  saveNotice.setMessage(SAVE_NOTICE_LOAD_FAILED);
   const el = document.getElementById("error");
   if (el) {
     el.textContent = message;
@@ -59,7 +104,15 @@ async function parseDiskBytesWithFallbacks(
   let lastError: unknown = new Error("no fallback attempted");
   for (const type of reorderFallbacks(contentType)) {
     try {
-      return await loadFromBlob(new Blob([bytes], { type }), null, null);
+      const data = await loadFromBlob(new Blob([bytes], { type }), null, null);
+      // loadFromBlob strips appState.exportWithDarkMode (the same storage conf
+      // that strips it on save), so the color mode a plain-JSON file states
+      // would be lost before the resolution chain below could read it.
+      // Re-attach the raw key here — at the one chokepoint shared by the
+      // initial load and every reconciliation — so the chain works as
+      // documented. Keyless files (and non-JSON payloads) pass through as the
+      // same object, byte-for-byte unaffected (D1, decision-log N2).
+      return reattachRawColorMode(data, bytes);
     } catch (e) {
       lastError = e;
     }
@@ -84,6 +137,11 @@ function renderReadonlyImage(
 ): void {
   const root = document.getElementById("root");
   if (!root) return;
+
+  // No editor mounts here, so `window.__excalidrawSave` never appears and every
+  // save gesture lands on the module-scope fallback. Word it for this state so
+  // the outcome is informative rather than merely non-silent (spec §2.3).
+  saveNotice.setMessage(SAVE_NOTICE_READONLY);
 
   const dark = theme === "dark";
   const wrap = document.createElement("div");
@@ -215,12 +273,15 @@ async function main() {
     const bytes = await dataRes.arrayBuffer();
 
     // Shared shape library — failure is non-fatal (e.g. dev-mode mock has no /library).
-    let libraryItems: unknown[] = [];
+    // sanitizePersistedLibrary is D3's dedupe-on-load remedy: a persisted
+    // library corrupted by a pre-fix build (two entries sharing a
+    // library-item id) is healed in memory before it can seed the panel, so
+    // neither the panel tiles nor the drag path ever observe the twins.
+    let libraryItems: LibraryItems = [];
     try {
       const libRes = await fetch(apiUrl("/library"));
       if (libRes.ok) {
-        const lib = (await libRes.json()) as { libraryItems?: unknown[] };
-        libraryItems = lib.libraryItems ?? [];
+        libraryItems = sanitizePersistedLibrary(await libRes.json());
       }
     } catch {
       // library persistence unavailable; start with an empty panel
@@ -281,7 +342,7 @@ async function main() {
 
     ReactDOM.createRoot(root).render(
       <App
-        initialData={{ ...initialData, libraryItems: libraryItems as ExcalidrawInitialDataState["libraryItems"] }}
+        initialData={{ ...initialData, libraryItems }}
         name={config.name}
         contentType={config.contentType}
         autoSave={config.autoSave}
