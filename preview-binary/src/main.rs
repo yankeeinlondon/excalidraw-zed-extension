@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{broadcast, watch};
-use tracing::info;
+use tracing::{debug, info};
 
 /// A request from the HTTP layer to show a native save dialog and write export bytes.
 /// Processed on the platform UI thread (tao event loop / GTK main context).
@@ -78,6 +78,11 @@ enum PreviewEvent {
     /// The shared shape library changed (e.g. a "Browse libraries" install) —
     /// reload the library panel.
     Library,
+    /// The editor that opened this preview closed its buffer (`didClose`
+    /// forwarded by the LSP via `POST /editor-closed`). An attention signal
+    /// only: the viewer reconciles disk and may surface a pending conflict,
+    /// but the preview itself is never torn down by this event.
+    EditorClosed,
 }
 
 impl PreviewEvent {
@@ -86,6 +91,7 @@ impl PreviewEvent {
         match self {
             PreviewEvent::Reload => "reload",
             PreviewEvent::Library => "library",
+            PreviewEvent::EditorClosed => "editor-closed",
         }
     }
 }
@@ -114,6 +120,15 @@ struct AppState {
     /// not yet pulled into the editor. `POST /install-library` pushes; the WebView
     /// drains them via `GET /pending-library` after the `library` SSE event.
     pending_libraries: Arc<Mutex<Vec<String>>>,
+    /// Serializes conditional writes for this file (per process): the
+    /// read-compare-write in `POST /data` must never interleave with another
+    /// viewer save.
+    save_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Revision of the most recent successful viewer write, recorded before
+    /// the save mutex is released so the watcher thread can prove a subsequent
+    /// disk change is our own echo rather than an external edit. `None` until
+    /// the first successful write.
+    last_written_revision: Arc<RwLock<Option<String>>>,
 }
 
 /// Everything the WebView event loop needs to run the unsaved-changes close
@@ -135,6 +150,10 @@ struct CloseContext {
     /// When true (`--smoke`), the event loop runs [`SmokeDriver`] against the real
     /// WebView, prints a report, and exits instead of waiting for the user.
     smoke: bool,
+    /// The watched file (canonical), carried only for the `--smoke` self-test,
+    /// whose conflict check rewrites it externally to force a stale `If-Match`.
+    /// `None` in dev mode.
+    file_path: Option<PathBuf>,
     /// Window-title text *without* the dirty marker: `"{repo}({branch}) | {file}"`
     /// inside a git repo, else just `"{file}"`. The live `*` marker is appended by
     /// [`CloseContext::window_title`] from the current dirty state.
@@ -150,6 +169,7 @@ impl CloseContext {
             auto_save: false,
             lock_path: None,
             smoke: false,
+            file_path: None,
             title_base: "Excalidraw Preview".to_string(),
         }
     }
@@ -233,6 +253,180 @@ fn daemonize(file: &str, args: &CliArgs) -> Result<()> {
     Ok(())
 }
 
+// ── File watcher reconciliation ───────────────────────────────────────────────
+
+/// Quiet period that ends a write burst: a reconcile is scheduled once no
+/// matching filesystem event has arrived for this long. The timer restarts on
+/// every matching event, so the *final* event of a burst always earns its own
+/// reconcile.
+const WATCHER_QUIET: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// Maximum time from the first event of a burst to a forced reconcile, so a
+/// sustained stream of events (e.g. an external tool rewriting every few
+/// milliseconds) still produces reloads at a bounded staleness.
+const WATCHER_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Backoff between read attempts when a reconcile catches the file in an
+/// unreadable / partial state. Exhausting the list gives up silently and
+/// keeps the last good client state.
+const WATCHER_READ_BACKOFF_MS: [u64; 3] = [25, 50, 100];
+
+/// Everything the watcher reconciliation loop needs: the canonical file being
+/// watched, the channel reload events are broadcast on, and the revision of
+/// the most recent successful viewer write (used to prove echoes).
+struct WatcherContext {
+    file_path: PathBuf,
+    broadcast_tx: broadcast::Sender<PreviewEvent>,
+    last_written_revision: Arc<RwLock<Option<String>>>,
+}
+
+/// Whether a filesystem event kind can change the bytes the viewer would read:
+/// content/name/metadata modification (a rename arrives as
+/// `Modify(ModifyKind::Name(_))` with `From`/`To`/both paths, or as a
+/// `Create`/`Remove` pair depending on the backend), creation, and removal.
+/// Pure reads (`Access`) and watch meta-events are ignored.
+fn event_kind_relevant(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+    matches!(
+        kind,
+        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+    )
+}
+
+/// Whether any path of a notify event refers to the canonical target file.
+///
+/// The watcher is registered on the target's parent directory, so events for
+/// sibling files (editor temp files, exports, lock bookkeeping) arrive here
+/// too and must be filtered out. Each path is compared lexically first (the
+/// watched directory is canonical and notify joins it with the event's file
+/// name, so a live or just-deleted target matches directly); a path that
+/// exists but is spelled differently (symlink, case) is canonicalized and
+/// compared again.
+fn event_concerns_target(event: &notify::Event, target: &Path) -> bool {
+    event_kind_relevant(&event.kind)
+        && event
+            .paths
+            .iter()
+            .any(|p| p == target || std::fs::canonicalize(p).is_ok_and(|c| c == target))
+}
+
+/// Runs the watcher reconciliation loop on its own thread.
+///
+/// Matching events open a *burst*: trailing events are coalesced until the
+/// stream has been quiet for [`WATCHER_QUIET`], but never longer than
+/// [`WATCHER_MAX_WAIT`] from the burst's first event. When either bound is
+/// reached the disk state is reconciled ([`reconcile_disk_state`]) and the
+/// loop waits for the next matching event. Events arriving while a reconcile
+/// is in progress queue up in the channel and open a fresh burst, so no event
+/// — in particular not the final one of a write burst — is ever dropped.
+///
+/// The loop performs no HTTP and never panics: channel sends and lock reads
+/// are all fallible-and-ignored, and the thread lives until the process exits.
+fn run_watcher_loop(rx: std::sync::mpsc::Receiver<notify::Event>, ctx: WatcherContext) {
+    while let Ok(first) = rx.recv() {
+        if !event_concerns_target(&first, &ctx.file_path) {
+            continue;
+        }
+        let burst_start = std::time::Instant::now();
+        let mut last_matching = burst_start;
+        loop {
+            let now = std::time::Instant::now();
+            if now.duration_since(last_matching) >= WATCHER_QUIET
+                || now.duration_since(burst_start) >= WATCHER_MAX_WAIT
+            {
+                break;
+            }
+            let quiet_left = WATCHER_QUIET.saturating_sub(now.duration_since(last_matching));
+            let max_left = WATCHER_MAX_WAIT.saturating_sub(now.duration_since(burst_start));
+            match rx.recv_timeout(quiet_left.min(max_left)) {
+                Ok(event) => {
+                    if event_concerns_target(&event, &ctx.file_path) {
+                        // Restart the quiet timer; the forced-wait bound keeps
+                        // its start anchored to the burst's first event.
+                        last_matching = std::time::Instant::now();
+                    }
+                    // Non-matching events neither extend the burst nor end it.
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        reconcile_disk_state(&ctx);
+    }
+}
+
+/// Reads the watched file once and decides whether to broadcast a reload.
+///
+/// Decision order:
+///
+/// 1. A transient read error (partial write, busy file) is retried with the
+///    bounded [`WATCHER_READ_BACKOFF_MS`] backoff; on exhaustion nothing is
+///    broadcast and the client keeps its last good state — a reconcile must
+///    never blank the scene.
+/// 2. A missing file is a definitive state, not an error: deletion broadcasts
+///    [`PreviewEvent::Reload`] like any other change. The client then sees a
+///    404 from `GET /data` and shows the unavailable state. The file is never
+///    auto-recreated.
+/// 3. Bytes were read: their revision is compared against the most recent
+///    successful viewer write. Equality *proves* the change is our own echo,
+///    so the broadcast is skipped — suppression is by revision, never by
+///    elapsed time. Anything else is an external change and broadcasts a
+///    reload.
+fn reconcile_disk_state(ctx: &WatcherContext) {
+    let mut backoff = WATCHER_READ_BACKOFF_MS.iter();
+    let read = loop {
+        match std::fs::read(&ctx.file_path) {
+            Ok(bytes) => break Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break None,
+            Err(e) => {
+                let Some(delay_ms) = backoff.next() else {
+                    debug!(
+                        error = %e,
+                        "giving up reading {} after retries; keeping last good state",
+                        ctx.file_path.display()
+                    );
+                    return;
+                };
+                debug!(
+                    error = %e,
+                    "transient read of {} failed; retrying in {delay_ms} ms",
+                    ctx.file_path.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+            }
+        }
+    };
+
+    let Some(bytes) = read else {
+        debug!(
+            "scene file {} deleted; broadcasting reload (client shows unavailable state)",
+            ctx.file_path.display()
+        );
+        let _ = ctx.broadcast_tx.send(PreviewEvent::Reload);
+        return;
+    };
+
+    let revision = content_revision(&bytes);
+    let last_written = ctx
+        .last_written_revision
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone());
+    if last_written.as_deref() == Some(revision.as_str()) {
+        debug!(
+            "disk revision of {} matches the last viewer write; suppressing echo",
+            ctx.file_path.display()
+        );
+        return;
+    }
+
+    debug!(
+        "external change to {} detected (revision {revision}); broadcasting reload",
+        ctx.file_path.display()
+    );
+    let _ = ctx.broadcast_tx.send(PreviewEvent::Reload);
+}
+
 /// Entry point. Keeps the main thread free for the native event loop (required on macOS).
 fn main() -> Result<()> {
     let args = CliArgs::parse();
@@ -249,7 +443,9 @@ fn main() -> Result<()> {
 
     // --dev / --dev-server: open the WebView on the Vite dev server instead of the
     // embedded assets.  Run `npm run dev` in webview-src first.
-    let dev_url = args.dev_server.as_deref()
+    let dev_url = args
+        .dev_server
+        .as_deref()
         .or_else(|| args.dev.then_some("http://localhost:5173"));
     if let Some(dev_url) = dev_url {
         eprintln!("[dev] Opening WebView at {dev_url}");
@@ -257,9 +453,13 @@ fn main() -> Result<()> {
         let (_focus_tx, focus_rx) = watch::channel(false);
         let (_export_tx, export_rx) = std::sync::mpsc::channel();
         let (_library_open_tx, library_open_rx) = std::sync::mpsc::channel();
-        if let Err(e) =
-            run_webview_url(dev_url, focus_rx, export_rx, library_open_rx, CloseContext::dev())
-        {
+        if let Err(e) = run_webview_url(
+            dev_url,
+            focus_rx,
+            export_rx,
+            library_open_rx,
+            CloseContext::dev(),
+        ) {
             eprintln!("WebView error: {e}");
         }
         return Ok(());
@@ -354,6 +554,8 @@ fn main() -> Result<()> {
         dirty: Arc::new(RwLock::new(DirtyState::default())),
         pending_actions: Arc::new(Mutex::new(HashMap::new())),
         pending_libraries: Arc::new(Mutex::new(Vec::new())),
+        save_mutex: Arc::new(tokio::sync::Mutex::new(())),
+        last_written_revision: Arc::new(RwLock::new(None)),
     });
 
     // Only now that the port is bound and known do we publish it to the lock file.
@@ -370,6 +572,7 @@ fn main() -> Result<()> {
         .route("/copy-clipboard", axum::routing::post(copy_to_clipboard))
         .route("/events", get(serve_events))
         .route("/focus", get(handle_focus))
+        .route("/editor-closed", axum::routing::post(receive_editor_closed))
         .route("/shutdown", get(handle_shutdown))
         .route("/ping", get(ping))
         .route("/export", axum::routing::post(handle_export))
@@ -385,7 +588,13 @@ fn main() -> Result<()> {
         .route("/assets/{*path}", get(serve_assets))
         .with_state(state.clone());
 
-    // Spawn file watcher — uses a std::sync::mpsc channel so no nested async runtime is needed.
+    // Spawn the file watcher — uses a std::sync::mpsc channel so no nested async runtime is needed.
+    //
+    // The watch is registered on the file's *parent* directory (non-recursive)
+    // and events are filtered to the canonical target path inside
+    // `run_watcher_loop`: a watch on the file itself follows the original
+    // inode and cannot observe atomic replacement (temp file + rename) or
+    // delete/recreate.
     let watcher_broadcast = broadcast_tx.clone();
     let (watcher_event_tx, watcher_event_rx) = std::sync::mpsc::channel();
     let mut fs_watcher = RecommendedWatcher::new(
@@ -396,29 +605,26 @@ fn main() -> Result<()> {
         },
         Config::default(),
     )?;
-    fs_watcher.watch(canonical_path.as_path(), RecursiveMode::NonRecursive)?;
+    let watch_dir = canonical_path
+        .parent()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no parent directory to watch",
+                canonical_path.display()
+            )
+        })?
+        .to_path_buf();
+    fs_watcher.watch(&watch_dir, RecursiveMode::NonRecursive)?;
 
+    let watcher_ctx = WatcherContext {
+        file_path: canonical_path.clone(),
+        broadcast_tx: watcher_broadcast,
+        last_written_revision: state.last_written_revision.clone(),
+    };
     std::thread::spawn(move || {
         // Keep `fs_watcher` alive for the duration of this thread.
         let _watcher = fs_watcher;
-        let debounce = std::time::Duration::from_millis(80);
-        let mut last_sent = std::time::Instant::now()
-            .checked_sub(debounce * 2)
-            .unwrap_or_else(std::time::Instant::now);
-
-        for event in watcher_event_rx {
-            match event.kind {
-                notify::EventKind::Modify(_) | notify::EventKind::Create(_) => {
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_sent) >= debounce {
-                        last_sent = now;
-                        info!("File changed, sending reload event");
-                        let _ = watcher_broadcast.send(PreviewEvent::Reload);
-                    }
-                }
-                _ => {}
-            }
-        }
+        run_watcher_loop(watcher_event_rx, watcher_ctx);
     });
 
     // Spawn the HTTP server as a background task with graceful shutdown.
@@ -460,6 +666,7 @@ fn main() -> Result<()> {
         auto_save: args.auto_save,
         lock_path: Some(lock_path.clone()),
         smoke: args.smoke,
+        file_path: Some(canonical_path.clone()),
         title_base,
     };
     if let Err(e) = run_webview(port, focus_rx, export_rx, library_open_rx, close_ctx) {
@@ -700,6 +907,44 @@ async fn check_existing_instance(lock_path: &PathBuf) -> Result<u16> {
     }
 }
 
+/// Revision reported for a file that does not exist on disk. ETag-shaped so it
+/// can round-trip through `If-Match`, but syntactically distinct from every
+/// [`content_revision`] value — deletion is a disk state in its own right, not
+/// an empty drawing. A client that saw a 404 can deliberately recreate the file
+/// by sending exactly this value.
+const ABSENT_REVISION: &str = "\"absent\"";
+
+/// Computes the opaque content revision for the exact given bytes: a strong
+/// ETag value of the form `"sha256-<hex>"` (surrounding quotes included).
+///
+/// Clients must treat the value as opaque and echo it byte-for-byte in
+/// `If-Match`; they must never parse or construct it themselves.
+fn content_revision(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    format!("\"sha256-{hex}\"")
+}
+
+/// Whether any candidate in a comma-separated `If-Match` header matches the
+/// current revision.
+///
+/// The header is treated as a list of opaque ETag strings compared byte-for-byte
+/// (so weak forms like `W/"sha256-…"` never match a strong revision). The
+/// wildcard `*` is never accepted on its own — an unconditional overwrite is
+/// exactly what the conditional-save contract exists to prevent — but a `*`
+/// entry sitting next to an exact match does not invalidate that match.
+fn if_match_allows(header_value: &str, current_revision: &str) -> bool {
+    header_value.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate != "*" && candidate == current_revision
+    })
+}
+
 // ── Route handlers ──────────────────────────────────────────────────────────
 
 async fn serve_index() -> Response {
@@ -724,28 +969,126 @@ async fn serve_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     axum::Json(config)
 }
 
+/// Serves the raw scene file bytes with the file's content type.
+///
+/// ## Returns
+/// - **200** with the exact disk bytes, `Content-Type`, a strong `ETag` of
+///   those bytes ([`content_revision`]) and `Cache-Control: no-store`, so the
+///   client always pairs bytes with the revision they came from.
+/// - **404** when the file does not exist (deletion is an *unavailable* state,
+///   not an empty drawing); carries `ETag: "absent"` so a client that decides
+///   to recreate the file can say so via `If-Match`.
+/// - **500** for any other read error.
 async fn serve_data(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match std::fs::read(&state.file_path) {
-        Ok(data) => (
-            axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, state.content_type.clone())],
-            data,
+        Ok(data) => {
+            let revision = content_revision(&data);
+            (
+                axum::http::StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, state.content_type.clone()),
+                    (axum::http::header::ETAG, revision),
+                    (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                data,
+            )
+                .into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            axum::http::StatusCode::NOT_FOUND,
+            [(axum::http::header::ETAG, ABSENT_REVISION.to_string())],
+            "file not found",
         )
             .into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
-/// Receives edited scene data from the WebView and writes it back to disk.
-/// The file watcher will fire after this write; the client suppresses that SSE event.
+/// Receives edited scene data from the WebView and writes it back to disk,
+/// guarded by an `If-Match` precondition so a stale client can never silently
+/// overwrite a newer disk version.
+///
+/// The write is conditional and serialized:
+///
+/// 1. A missing `If-Match` header is **428 Precondition Required** — nothing
+///    is written. Every canonical save must state the revision it accepts.
+/// 2. The per-file `save_mutex` is acquired, the file is re-read *inside* the
+///    lock, and its current revision computed (a missing file is the distinct
+///    [`ABSENT_REVISION`]). The re-read is what turns the check into an
+///    optimistic compare-and-write against external editors.
+/// 3. If none of the comma-separated `If-Match` candidates match the current
+///    revision (the wildcard `*` never matches), the response is **412
+///    Precondition Failed** with the current `ETag`, and nothing is written.
+/// 4. On a match the body is written, and the written revision is recorded in
+///    `last_written_revision` *before* the save mutex is released, so the
+///    watcher thread can never mislabel our own write as external. The
+///    response is **200** with the new `ETag`.
+///
+/// ## Returns
+/// - **200** on a successful conditional write; `ETag` is the revision just
+///   written, which the client adopts as its new accepted revision.
+/// - **428** when `If-Match` is absent.
+/// - **412** with the current `ETag` when `If-Match` does not match disk.
+/// - **500** on any I/O error (read or write).
+///
+/// ## Errors
+/// No response above 200 ever advances a baseline: on 412/428/500 the disk
+/// bytes and `last_written_revision` are left exactly as they were, and the
+/// client keeps its previous accepted revision.
 async fn receive_data(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
-) -> impl IntoResponse {
-    match std::fs::write(&state.file_path, &body) {
-        Ok(_) => axum::http::StatusCode::OK.into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+) -> Response {
+    let Some(if_match) = headers
+        .get(axum::http::header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return (
+            axum::http::StatusCode::PRECONDITION_REQUIRED,
+            "If-Match header required: POST the revision you accepted from GET /data",
+        )
+            .into_response();
+    };
+
+    // Serialize the read-compare-write against other viewer saves for this file.
+    let _guard = state.save_mutex.lock().await;
+
+    // Re-read disk inside the lock so the comparison is against the bytes a
+    // racing external writer would also have to beat.
+    let current_revision = match std::fs::read(&state.file_path) {
+        Ok(bytes) => content_revision(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ABSENT_REVISION.to_string(),
+        Err(e) => {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    };
+
+    if !if_match_allows(if_match, &current_revision) {
+        return (
+            axum::http::StatusCode::PRECONDITION_FAILED,
+            [(axum::http::header::ETAG, current_revision)],
+            "file changed on disk: If-Match did not match the current revision",
+        )
+            .into_response();
     }
+
+    if let Err(e) = std::fs::write(&state.file_path, &body) {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    // Record the written revision while still holding the save mutex: the
+    // watcher must be able to see this value before it can observe the write.
+    let written_revision = content_revision(&body);
+    if let Ok(mut slot) = state.last_written_revision.write() {
+        *slot = Some(written_revision.clone());
+    }
+
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::ETAG, written_revision)],
+    )
+        .into_response()
 }
 
 async fn serve_events(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -771,6 +1114,22 @@ async fn serve_events(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 async fn handle_focus(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let _ = state.focus_tx.send(true);
     "OK"
+}
+
+/// `POST /editor-closed` — the LSP's `didClose` attention signal.
+///
+/// Broadcasts [`PreviewEvent::EditorClosed`] so the viewer can reconcile disk
+/// and surface a pending conflict (the editor that opened it just went away).
+/// The preview itself is never spawned, focused, shut down, or discarded by
+/// this signal; the window owns its own lifecycle.
+///
+/// ## Returns
+///
+/// `204 No Content` — the signal carries no data and expects none back. Any
+/// request body is ignored.
+async fn receive_editor_closed(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let _ = state.broadcast_tx.send(PreviewEvent::EditorClosed);
+    axum::http::StatusCode::NO_CONTENT
 }
 
 async fn handle_shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1019,7 +1378,10 @@ async fn install_library(
         Ok(resp) if resp.status().is_success() => match resp.text().await {
             Ok(t) => t,
             Err(e) => {
-                return (StatusCode::BAD_GATEWAY, format!("Could not read library: {e}"))
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Could not read library: {e}"),
+                )
                     .into_response();
             }
         },
@@ -1031,7 +1393,10 @@ async fn install_library(
                 .into_response();
         }
         Err(e) => {
-            return (StatusCode::BAD_GATEWAY, format!("Could not fetch library: {e}"))
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("Could not fetch library: {e}"),
+            )
                 .into_response();
         }
     };
@@ -1655,8 +2020,7 @@ fn begin_query_close(
     if let Ok(mut pending) = pending_actions.lock() {
         pending.insert(request_id.clone(), tx);
     }
-    let id_json =
-        serde_json::to_string(&request_id).unwrap_or_else(|_| "\"query\"".to_string());
+    let id_json = serde_json::to_string(&request_id).unwrap_or_else(|_| "\"query\"".to_string());
     let script = format!(
         "window.__excalidrawPrepareClose && window.__excalidrawPrepareClose({{ requestId: {id_json} }})"
     );
@@ -1684,8 +2048,7 @@ fn begin_save_close(
     if let Ok(mut pending) = pending_actions.lock() {
         pending.insert(request_id.clone(), tx);
     }
-    let id_json =
-        serde_json::to_string(&request_id).unwrap_or_else(|_| "\"close\"".to_string());
+    let id_json = serde_json::to_string(&request_id).unwrap_or_else(|_| "\"close\"".to_string());
     let script = format!(
         "window.__excalidrawSave && window.__excalidrawSave({{ reason: 'close', requestId: {id_json} }})"
     );
@@ -1922,17 +2285,36 @@ enum SmokeStage {
         deadline: std::time::Instant,
         request_id: String,
     },
+    /// Awaiting the save-and-close round-trip *under conflict*: the watched file
+    /// was just rewritten externally, so the save's `If-Match` is stale and the
+    /// conditional `POST /data` must refuse the overwrite (412). The bridge is
+    /// expected to report `ok:false` — the exact result [`poll_close_flow`]
+    /// maps to `CloseOutcome::Failed`, i.e. the window stays open with the
+    /// conflict surfaced instead of closing over the external edit.
+    ConflictSave {
+        rx: tokio::sync::oneshot::Receiver<NativeActionResult>,
+        deadline: std::time::Instant,
+        request_id: String,
+    },
     /// Round-trips done; run the synchronous external-link classification checks.
     Finish,
 }
 
+/// Scene bytes the smoke conflict stage writes over the watched file. They only
+/// need to be a valid, *different* scene: the on-disk revision then advances
+/// past every revision the WebView could speak for, which is what forces the
+/// conditional save to 412.
+const SMOKE_EXTERNAL_SCENE: &str = r##"{"type":"excalidraw","version":2,"source":"smoke-external-edit","elements":[],"appState":{"viewBackgroundColor":"#f8f9fa"},"files":{}}"##;
+
 /// Drives `--smoke`: an automated self-test that runs against a *real* WebView so
 /// it exercises the OS-specific shell paths unit tests cannot — actual `wry`
 /// window creation, React mount + asset/font fetch, `evaluate_script` delivery to
-/// the mounted app, the `/native-action-result` IPC round-trip, and the close
-/// state machine. Advanced one step per event-loop tick (mirroring the close
-/// flow) so it never blocks the UI thread; on completion the event loop prints a
-/// report and exits with a non-zero code if any check failed.
+/// the mounted app, the `/native-action-result` IPC round-trip, the close state
+/// machine, and a save-and-close whose conditional write races an external disk
+/// edit (it must fail cleanly with the window kept open). Advanced one step per
+/// event-loop tick (mirroring the close flow) so it never blocks the UI thread;
+/// on completion the event loop prints a report and exits with a non-zero code
+/// if any check failed.
 ///
 /// What it deliberately does *not* prove (and so stays on the manual checklist):
 /// literal AppKit `Cmd+S` key delivery, `rfd` dialog button behavior, the actual
@@ -1941,6 +2323,8 @@ enum SmokeStage {
 struct SmokeDriver {
     stage: SmokeStage,
     checks: Vec<SmokeCheck>,
+    /// The watched file, when known: the conflict stage rewrites it externally.
+    conflict_file: Option<PathBuf>,
 }
 
 /// Builds the JS that invokes a bridge global by `request_id`, falling back to a
@@ -1958,12 +2342,13 @@ fn smoke_bridge_script(global: &str, action: &str, call: &str, request_id: &str)
 }
 
 impl SmokeDriver {
-    fn new() -> Self {
+    fn new(file_path: Option<PathBuf>) -> Self {
         Self {
             stage: SmokeStage::Settle {
                 until: std::time::Instant::now() + SMOKE_SETTLE,
             },
             checks: Vec::new(),
+            conflict_file: file_path,
         }
     }
 
@@ -2056,17 +2441,62 @@ impl SmokeDriver {
                         ok: true,
                         detail: format!(
                             "window.__excalidrawPrepareClose responded (scene reported {})",
-                            if result.ok { "clean — safe to close" } else { "dirty/blocked" }
+                            if result.ok {
+                                "clean — safe to close"
+                            } else {
+                                "dirty/blocked"
+                            }
                         ),
+                    });
+                    self.begin_conflict(webview, pending)
+                }
+                ActionOutcome::Lost => {
+                    self.checks.push(SmokeCheck {
+                        name: "close-interception dirty-state query",
+                        ok: false,
+                        detail: "window.__excalidrawPrepareClose did not respond within 5s"
+                            .to_string(),
+                    });
+                    self.begin_conflict(webview, pending)
+                }
+            },
+            SmokeStage::ConflictSave {
+                rx,
+                deadline,
+                request_id,
+            } => match poll_action_result(rx, *deadline, request_id, pending) {
+                ActionOutcome::Pending => None,
+                // ok:false is the PASS: the conditional save refused to
+                // overwrite the unseen disk revision, which is precisely the
+                // result the native close flow treats as "keep the window open
+                // and show why".
+                ActionOutcome::Resolved(result) if !result.ok => {
+                    self.checks.push(SmokeCheck {
+                        name: "save-and-close under conflict fails cleanly",
+                        ok: true,
+                        detail: format!(
+                            "external disk edit raced the close-save: bridge reported failure ({}) ⇒ CloseOutcome::Failed keeps the window open with the conflict surfaced",
+                            result.error.as_deref().unwrap_or("no detail")
+                        ),
+                    });
+                    self.stage = SmokeStage::Finish;
+                    self.finish()
+                }
+                ActionOutcome::Resolved(_) => {
+                    self.checks.push(SmokeCheck {
+                        name: "save-and-close under conflict fails cleanly",
+                        ok: false,
+                        detail: "close-save reported success over an unseen disk revision — the conditional (If-Match) contract is broken".to_string(),
                     });
                     self.stage = SmokeStage::Finish;
                     self.finish()
                 }
                 ActionOutcome::Lost => {
                     self.checks.push(SmokeCheck {
-                        name: "close-interception dirty-state query",
+                        name: "save-and-close under conflict fails cleanly",
                         ok: false,
-                        detail: "window.__excalidrawPrepareClose did not respond within 5s".to_string(),
+                        detail: "no /native-action-result for the conflicting close-save within 5s"
+                            .to_string(),
                     });
                     self.stage = SmokeStage::Finish;
                     self.finish()
@@ -2074,6 +2504,51 @@ impl SmokeDriver {
             },
             SmokeStage::Finish => self.finish(),
         }
+    }
+
+    /// Rewrites the watched file externally and — in the same tick — dispatches
+    /// `__excalidrawSave({ reason: 'close' })`, then moves to `ConflictSave`.
+    ///
+    /// The rewrite and the dispatch must share one tick: the save's `If-Match`
+    /// is captured the moment the injected JS runs, so the round-trip is
+    /// guaranteed to speak the now-stale revision no matter when the watcher's
+    /// trailing reconcile later lands. Skipped (straight to `Finish`) when the
+    /// watched file is unknown, e.g. in a hypothetical dev-mode smoke run.
+    fn begin_conflict(
+        &mut self,
+        webview: &wry::WebView,
+        pending: &PendingActions,
+    ) -> Option<Vec<SmokeCheck>> {
+        let Some(path) = self.conflict_file.clone() else {
+            self.stage = SmokeStage::Finish;
+            return self.finish();
+        };
+        let request_id = "smoke-conflict".to_string();
+        if let Err(e) = std::fs::write(&path, SMOKE_EXTERNAL_SCENE) {
+            self.checks.push(SmokeCheck {
+                name: "save-and-close under conflict fails cleanly",
+                ok: false,
+                detail: format!(
+                    "could not externally rewrite {} to stage the conflict: {e}",
+                    path.display()
+                ),
+            });
+            self.stage = SmokeStage::Finish;
+            return self.finish();
+        }
+        let script = smoke_bridge_script(
+            "__excalidrawSave",
+            "save",
+            "{ reason: 'close', requestId: 'smoke-conflict' }",
+            &request_id,
+        );
+        let rx = Self::dispatch(webview, pending, &request_id, &script);
+        self.stage = SmokeStage::ConflictSave {
+            rx,
+            deadline: std::time::Instant::now() + SMOKE_ROUNDTRIP_TIMEOUT,
+            request_id,
+        };
+        None
     }
 
     /// Dispatches the close-interception dirty-state query and moves to `Query`.
@@ -2264,7 +2739,9 @@ fn run_webview_url(
     let mut focus_rx = focus_rx;
     // --smoke: an automated self-test driven one step per tick against this real
     // WebView. `None` in normal runs.
-    let mut smoke_driver = close_ctx.smoke.then(SmokeDriver::new);
+    let mut smoke_driver = close_ctx
+        .smoke
+        .then(|| SmokeDriver::new(close_ctx.file_path.clone()));
     // Last dirty value reflected in the title bar (see the tao path for rationale).
     let mut last_title_dirty = false;
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
@@ -2290,8 +2767,11 @@ fn run_webview_url(
         {
             let mut flow = close_flow_tick.borrow_mut();
             if matches!(&*flow, CloseFlow::Querying { .. }) {
-                let cached_dirty =
-                    close_ctx_tick.dirty.read().map(|d| d.dirty).unwrap_or(false);
+                let cached_dirty = close_ctx_tick
+                    .dirty
+                    .read()
+                    .map(|d| d.dirty)
+                    .unwrap_or(false);
                 if let Some(is_clean) =
                     poll_query_flow(&mut flow, &close_ctx_tick.pending_actions, cached_dirty)
                 {
@@ -2300,11 +2780,8 @@ fn run_webview_url(
                     } else if close_ctx_tick.auto_save {
                         let seq = close_counter_tick.get() + 1;
                         close_counter_tick.set(seq);
-                        *flow = begin_save_close(
-                            &webview_tick,
-                            &close_ctx_tick.pending_actions,
-                            seq,
-                        );
+                        *flow =
+                            begin_save_close(&webview_tick, &close_ctx_tick.pending_actions, seq);
                     } else {
                         // Dirty + auto-save off → async 3-way dialog (no nested loop).
                         *flow = CloseFlow::Idle;
@@ -2336,7 +2813,11 @@ fn run_webview_url(
         }
 
         // Refresh the title's "*" dirty marker when the scene's dirty state flips.
-        let dirty_now = close_ctx_tick.dirty.read().map(|d| d.dirty).unwrap_or(false);
+        let dirty_now = close_ctx_tick
+            .dirty
+            .read()
+            .map(|d| d.dirty)
+            .unwrap_or(false);
         if dirty_now != last_title_dirty {
             last_title_dirty = dirty_now;
             window_for_tick.set_title(&close_ctx_tick.window_title());
@@ -2397,8 +2878,10 @@ fn run_webview_url(
         let phys = m.size();
         (phys.width as f64 / sf, phys.height as f64 / sf)
     });
-    let (win_w, win_h) =
-        clamp_window_size(load_window_size().unwrap_or(DEFAULT_WINDOW_SIZE), monitor_logical);
+    let (win_w, win_h) = clamp_window_size(
+        load_window_size().unwrap_or(DEFAULT_WINDOW_SIZE),
+        monitor_logical,
+    );
 
     let window = WindowBuilder::new()
         .with_title(close_ctx.window_title())
@@ -2468,7 +2951,9 @@ fn run_webview_url(
 
     // --smoke: an automated self-test driven one step per tick against this real
     // WebView. `None` in normal runs.
-    let mut smoke_driver = close_ctx.smoke.then(SmokeDriver::new);
+    let mut smoke_driver = close_ctx
+        .smoke
+        .then(|| SmokeDriver::new(close_ctx.file_path.clone()));
 
     // Last dirty value reflected in the title bar, so the "*" marker is only
     // re-applied when the scene's dirty state actually flips (not every tick).
@@ -2518,8 +3003,7 @@ fn run_webview_url(
             // trusting the possibly-stale cached `POST /dirty` value.
             if matches!(close_flow, CloseFlow::Idle) {
                 close_counter += 1;
-                close_flow =
-                    begin_query_close(&webview, &close_ctx.pending_actions, close_counter);
+                close_flow = begin_query_close(&webview, &close_ctx.pending_actions, close_counter);
             }
             // else: a query or save-and-close is already in flight — ignore the repeat.
         }
@@ -2681,6 +3165,90 @@ struct CliArgs {
     smoke: bool,
 }
 
+// ── LSP didClose forwarding ──────────────────────────────────────────────────
+
+/// Maximum number of distinct files waiting for a `POST /editor-closed`
+/// forward. Bounded so a pathological burst of closes can never accumulate
+/// unbounded memory; when full, the oldest queued signal is dropped (newest
+/// attention signals win).
+const EDITOR_CLOSED_QUEUE_CAP: usize = 16;
+
+/// Per-request timeout for the `POST /editor-closed` forward. `didClose` is
+/// best-effort attention, never a guarantee — a slow or wedged preview must
+/// not stall the queue for longer than this.
+const EDITOR_CLOSED_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Adds one closed path to the forwarding queue, coalescing by canonical path.
+///
+/// A forward already queued for the same canonical path makes this close
+/// redundant (the viewer reconciles disk on receipt, so one signal per pending
+/// state is enough); a fresh path beyond [`EDITOR_CLOSED_QUEUE_CAP`] evicts the
+/// oldest entry. Canonicalization failure (the file is gone) drops the signal:
+/// there is no stable lock identity to forward to.
+fn enqueue_closed_path(pending: &mut std::collections::VecDeque<PathBuf>, path: &Path) {
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return;
+    };
+    if pending.contains(&canonical) {
+        return;
+    }
+    if pending.len() >= EDITOR_CLOSED_QUEUE_CAP {
+        pending.pop_front();
+    }
+    pending.push_back(canonical);
+}
+
+/// Sends one `POST /editor-closed` to the live preview serving `canonical`, if
+/// any. Resolves the target exactly like [`preview_is_live`]: the per-file lock
+/// file's port. A missing/stale lock, an unreadable port, or a refused/timed-out
+/// connection is a silent no-op — the signal is best-effort and idempotent, and
+/// the forwarder never touches lock-file state it does not own.
+fn forward_editor_closed(client: &reqwest::blocking::Client, canonical: &Path) {
+    let lock_path = get_lock_path(canonical);
+    let Ok(port_str) = std::fs::read_to_string(&lock_path) else {
+        return;
+    };
+    let Ok(port) = port_str.trim().parse::<u16>() else {
+        return;
+    };
+    let _ = client
+        .post(format!("http://127.0.0.1:{port}/editor-closed"))
+        .send();
+}
+
+/// Body of the dedicated didClose forwarding thread.
+///
+/// The stdio dispatch loop only pushes paths into the channel — no HTTP ever
+/// happens on the dispatch path, so a wedged preview can never delay LSP
+/// responses. The worker drains the channel into a bounded, deduplicated queue
+/// ([`enqueue_closed_path`]) and forwards one signal at a time; closes arriving
+/// while a forward is in flight are picked up by the next loop iteration and
+/// coalesce with anything still queued. When the channel's senders are gone
+/// (LSP shutdown/exit), the queue is dropped *without* being drained: the loop
+/// must exit promptly and pending best-effort signals are simply lost.
+fn run_editor_closed_forwarder(rx: std::sync::mpsc::Receiver<PathBuf>) {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(EDITOR_CLOSED_FORWARD_TIMEOUT)
+        .build()
+    else {
+        return;
+    };
+    let mut pending: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
+    while let Ok(path) = rx.recv() {
+        enqueue_closed_path(&mut pending, &path);
+        while let Ok(more) = rx.try_recv() {
+            enqueue_closed_path(&mut pending, &more);
+        }
+        while let Some(canonical) = pending.pop_front() {
+            forward_editor_closed(&client, &canonical);
+            // Coalesce closes that arrived during the in-flight POST.
+            while let Ok(more) = rx.try_recv() {
+                enqueue_closed_path(&mut pending, &more);
+            }
+        }
+    }
+}
+
 // ── LSP server ───────────────────────────────────────────────────────────────
 
 /// Minimal JSON-RPC LSP server.
@@ -2697,6 +3265,11 @@ fn run_lsp_server() -> Result<()> {
     let mut writer = stdout.lock();
 
     let exe = std::env::current_exe()?;
+
+    // didClose forwarding worker: one dedicated thread owning all HTTP, fed by
+    // a channel, so the stdio dispatch loop below never blocks on the network.
+    let (editor_closed_tx, editor_closed_rx) = std::sync::mpsc::channel::<PathBuf>();
+    std::thread::spawn(|| run_editor_closed_forwarder(editor_closed_rx));
 
     loop {
         // ── Read headers ────────────────────────────────────────────────────
@@ -2767,12 +3340,28 @@ fn run_lsp_server() -> Result<()> {
             }
 
             "textDocument/didClose" => {
-                // Intentionally a no-op: the preview window persists until the user
-                // closes it. Zed reuses one "preview tab" for single-clicked files,
-                // so it sends didClose whenever you browse to another file — tearing
-                // the window down here made previews flicker shut while navigating.
-                // The window owns its own lifecycle (close button → lock cleanup +
-                // server shutdown); reopening a closed preview is handled by didSave.
+                // Not teardown, and not a veto: LSP notifications are post-hoc
+                // (the tab is already closed), and Zed reuses one "preview tab"
+                // for single-clicked files — it sends didClose whenever you
+                // browse to another file, so tearing the window down here made
+                // previews flicker shut while navigating. The window owns its
+                // own lifecycle (close button → lock cleanup + server
+                // shutdown); reopening a closed preview is handled by didSave.
+                //
+                // New role: an *attention signal*. The guarded path is
+                // forwarded (off the dispatch loop) to the live preview's
+                // POST /editor-closed, which tells the viewer "the editor that
+                // opened you just went away" so it can reconcile disk and
+                // surface a pending conflict. Best-effort only: never spawns,
+                // focuses, shuts down, or discards anything, and a dead or
+                // missing preview makes it a silent no-op.
+                if let Some(uri) = msg["params"]["textDocument"]["uri"].as_str() {
+                    if let Some(path) = file_uri_to_path(uri) {
+                        if is_excalidraw_path(&path) {
+                            let _ = editor_closed_tx.send(path);
+                        }
+                    }
+                }
             }
 
             "textDocument/didSave" => {
@@ -2919,6 +3508,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
+    use std::time::Duration;
     use tower::ServiceExt; // for `oneshot`
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -2946,6 +3536,8 @@ mod tests {
             dirty: Arc::new(RwLock::new(DirtyState::default())),
             pending_actions: Arc::new(Mutex::new(HashMap::new())),
             pending_libraries: Arc::new(Mutex::new(Vec::new())),
+            save_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            last_written_revision: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -2955,6 +3547,13 @@ mod tests {
             .route("/data", get(serve_data))
             .route("/focus", get(handle_focus))
             .route("/ping", get(ping))
+            .with_state(state)
+    }
+
+    /// Router with the full `/data` contract (GET + conditional POST).
+    fn data_app(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/data", get(serve_data).post(receive_data))
             .with_state(state)
     }
 
@@ -2981,9 +3580,13 @@ mod tests {
         assert!(!is_allowed_library_url(
             "http://libraries.excalidraw.com/x.excalidrawlib"
         ));
-        assert!(!is_allowed_library_url("https://evil.example.com/x.excalidrawlib"));
+        assert!(!is_allowed_library_url(
+            "https://evil.example.com/x.excalidrawlib"
+        ));
         assert!(!is_allowed_library_url("file:///etc/passwd"));
-        assert!(!is_allowed_library_url("http://169.254.169.254/latest/meta-data"));
+        assert!(!is_allowed_library_url(
+            "http://169.254.169.254/latest/meta-data"
+        ));
         assert!(!is_allowed_library_url("not a url"));
     }
 
@@ -3155,8 +3758,554 @@ mod tests {
         assert_eq!(body.as_ref(), payload.as_bytes());
     }
 
+    // ── editor-closed route & didClose forwarding queue ──────────────────────
+
     #[tokio::test]
-    async fn test_serve_data_missing_file_returns_500() {
+    async fn test_editor_closed_route_returns_204_broadcasts_and_ignores_body() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let state = make_state(tmp.path(), "application/json");
+        // Subscribe before the request: the broadcast must not be missed.
+        let mut events = state.broadcast_tx.subscribe();
+        let app = Router::new()
+            .route("/editor-closed", axum::routing::post(receive_editor_closed))
+            .with_state(state);
+
+        // A body is sent even though none is required — the signal carries no
+        // data, and any sent body must be ignored.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/editor-closed")
+                    .header("content-type", "text/plain")
+                    .body(axum::body::Body::from("ignored payload"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(body.is_empty(), "204 must carry no body");
+        assert_eq!(
+            events.try_recv().unwrap(),
+            PreviewEvent::EditorClosed,
+            "POST /editor-closed must broadcast EditorClosed"
+        );
+    }
+
+    #[test]
+    fn test_preview_event_sse_data_names() {
+        // These strings are the wire protocol the WebView dispatches on;
+        // renaming one silently breaks the client. `reload` and `library`
+        // predate Phase 5 and must not change.
+        assert_eq!(PreviewEvent::Reload.as_sse_data(), "reload");
+        assert_eq!(PreviewEvent::Library.as_sse_data(), "library");
+        assert_eq!(PreviewEvent::EditorClosed.as_sse_data(), "editor-closed");
+    }
+
+    #[test]
+    fn test_enqueue_closed_path_coalesces_by_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("one.excalidraw");
+        std::fs::write(&file, BLANK_SCENE_JSON).unwrap();
+        let canonical = std::fs::canonicalize(&file).unwrap();
+
+        let mut pending = std::collections::VecDeque::new();
+        enqueue_closed_path(&mut pending, &file);
+        // A differently-spelled path to the same file (redundant `.` segment,
+        // and on macOS the /tmp → /private/tmp symlink) must coalesce with the
+        // canonical entry rather than queue a second forward.
+        let respelled = dir
+            .path()
+            .join(".")
+            .join("one.excalidraw")
+            .canonicalize()
+            .unwrap();
+        assert_ne!(respelled, file, "test needs a distinct spelling");
+        enqueue_closed_path(&mut pending, &respelled);
+        enqueue_closed_path(&mut pending, &canonical);
+
+        assert_eq!(
+            pending,
+            std::iter::once(canonical).collect::<std::collections::VecDeque<_>>(),
+            "repeated closes of one file must coalesce to a single queued forward"
+        );
+    }
+
+    #[test]
+    fn test_enqueue_closed_path_caps_queue_dropping_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<_> = (0..=EDITOR_CLOSED_QUEUE_CAP)
+            .map(|i| {
+                let f = dir.path().join(format!("{i}.excalidraw"));
+                std::fs::write(&f, BLANK_SCENE_JSON).unwrap();
+                f
+            })
+            .collect();
+
+        let mut pending = std::collections::VecDeque::new();
+        for f in &files {
+            enqueue_closed_path(&mut pending, f);
+        }
+
+        assert_eq!(
+            pending.len(),
+            EDITOR_CLOSED_QUEUE_CAP,
+            "queue must stay bounded"
+        );
+        assert_eq!(
+            pending.front(),
+            Some(&std::fs::canonicalize(&files[1]).unwrap()),
+            "at capacity the oldest entry is dropped, newest win"
+        );
+        assert_eq!(
+            pending.back(),
+            Some(&std::fs::canonicalize(files.last().unwrap()).unwrap()),
+            "the newest close is always retained"
+        );
+    }
+
+    #[test]
+    fn test_enqueue_closed_path_drops_signals_for_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghost = dir.path().join("never-existed.excalidraw");
+
+        let mut pending = std::collections::VecDeque::new();
+        enqueue_closed_path(&mut pending, &ghost);
+        assert!(
+            pending.is_empty(),
+            "a path that cannot be canonicalized has no lock identity; drop it"
+        );
+    }
+
+    // ── content revision & conditional save (POST /data If-Match) ─────────────
+
+    #[test]
+    fn test_content_revision_is_deterministic_and_sensitive() {
+        let a = content_revision(b"scene-bytes");
+        assert_eq!(
+            a,
+            content_revision(b"scene-bytes"),
+            "same bytes, same revision"
+        );
+        assert_eq!(
+            a,
+            format!("\"sha256-{}\"", {
+                let mut hasher = Sha256::new();
+                hasher.update(b"scene-bytes");
+                hasher
+                    .finalize()
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
+            })
+        );
+        // Different bytes — including an empty file, a one-byte change, and
+        // byte-equal content of different length — must produce different
+        // revisions.
+        assert_ne!(a, content_revision(b"scene-bytez"));
+        assert_ne!(a, content_revision(b""));
+        assert_ne!(a, content_revision(b"scene-bytes\0"));
+        // The absent revision must never collide with any byte-derived one.
+        assert_ne!(a, ABSENT_REVISION);
+        assert_ne!(content_revision(b"absent"), ABSENT_REVISION);
+    }
+
+    #[test]
+    fn test_if_match_allows_exact_only() {
+        let current = "\"sha256-deadbeef\"";
+        // Exact match.
+        assert!(if_match_allows(current, current));
+        // Multiple comma-separated candidates: any exact match suffices
+        // (the "Keep my changes" case sends the acknowledged overwrite
+        // revision alongside its accepted one).
+        assert!(if_match_allows(
+            &format!("\"sha256-other\", {current}"),
+            current
+        ));
+        assert!(if_match_allows(
+            &format!("{current} ,  \"sha256-other\""),
+            current
+        ));
+        // Wildcard never matches on its own — an unconditional overwrite is
+        // exactly what the conditional save exists to prevent.
+        assert!(!if_match_allows("*", current));
+        // A `*` entry does not invalidate an exact match sitting next to it.
+        assert!(if_match_allows(&format!("*, {current}"), current));
+        // Stale or malformed values never match.
+        assert!(!if_match_allows("\"sha256-other\"", current));
+        assert!(!if_match_allows("", current));
+        // Weak forms never match a strong revision (RFC 9110 §13.1.1).
+        assert!(!if_match_allows(&format!("W/{current}"), current));
+    }
+
+    /// GETs `/data` and returns `(status, ETag header, body bytes)`.
+    async fn get_data(app: &Router) -> (StatusCode, Option<String>, Vec<u8>) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/data")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, etag, body)
+    }
+
+    /// Builds a `POST /data` request, optionally with an `If-Match` header.
+    fn post_data(if_match: Option<&str>, body: Vec<u8>) -> Request<axum::body::Body> {
+        let mut builder = Request::builder().method("POST").uri("/data");
+        if let Some(value) = if_match {
+            builder = builder.header("if-match", value);
+        }
+        builder.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_serve_data_returns_etag_before_any_save_including_empty_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap(); // exists, zero bytes
+
+        let state = make_state(tmp.path(), "application/json");
+        let app = data_app(state);
+
+        let (status, etag, body) = get_data(&app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty());
+        // The revision is published before any save has ever happened, and an
+        // empty file still has a well-defined (non-absent) revision.
+        assert_eq!(etag.as_deref(), Some(content_revision(b"").as_str()));
+        assert_ne!(etag.as_deref(), Some(ABSENT_REVISION));
+    }
+
+    #[tokio::test]
+    async fn test_serve_data_sets_no_store() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"bytes").unwrap();
+
+        let state = make_state(tmp.path(), "application/json");
+        let app = data_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/data")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+    }
+
+    #[tokio::test]
+    async fn test_post_data_round_trip_get_post_get() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"v1").unwrap();
+
+        let state = make_state(tmp.path(), "application/json");
+        let app = data_app(state);
+
+        // Read: current revision.
+        let (_, etag1, _) = get_data(&app).await;
+        let etag1 = etag1.unwrap();
+
+        // Write: conditional on the revision just read.
+        let response = app
+            .clone()
+            .oneshot(post_data(Some(&etag1), b"v2".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "If-Match was fresh");
+        let etag2 = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .expect("successful write returns the written revision")
+            .to_string();
+        assert_eq!(etag2, content_revision(b"v2"));
+        assert_ne!(etag1, etag2, "a write must advance the revision");
+
+        // Read again: disk and published revision both reflect the write.
+        let (_, etag3, body) = get_data(&app).await;
+        assert_eq!(body, b"v2");
+        assert_eq!(etag3.as_deref(), Some(etag2.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_post_data_without_if_match_is_428_and_disk_unchanged() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"original").unwrap();
+
+        let state = make_state(tmp.path(), "application/json");
+        let app = data_app(state.clone());
+
+        let response = app
+            .oneshot(post_data(None, b"sneaky-overwrite".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"original");
+        assert!(state.last_written_revision.read().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_post_data_stale_if_match_is_412_with_current_etag_and_disk_unchanged() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"current").unwrap();
+
+        let state = make_state(tmp.path(), "application/json");
+        let app = data_app(state.clone());
+
+        let stale = content_revision(b"an-older-disk-state");
+        let response = app
+            .clone()
+            .oneshot(post_data(Some(&stale), b"overwrite".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        // The response names the revision the client is actually racing.
+        assert_eq!(
+            response.headers().get("etag").and_then(|v| v.to_str().ok()),
+            Some(content_revision(b"current").as_str())
+        );
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"current");
+        assert!(state.last_written_revision.read().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_post_data_wildcard_if_match_is_rejected() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"current").unwrap();
+
+        let state = make_state(tmp.path(), "application/json");
+        let app = data_app(state);
+
+        let response = app
+            .oneshot(post_data(Some("*"), b"overwrite".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"current");
+    }
+
+    #[tokio::test]
+    async fn test_post_data_external_edit_between_get_and_post_is_412() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"v1").unwrap();
+
+        let state = make_state(tmp.path(), "application/json");
+        let app = data_app(state.clone());
+
+        // Client fetches the current revision…
+        let (_, etag, _) = get_data(&app).await;
+
+        // …an external writer (Zed, git, CLI) lands a change before the save…
+        std::fs::write(tmp.path(), b"external-v2").unwrap();
+
+        // …so the client's precondition no longer holds.
+        let response = app
+            .clone()
+            .oneshot(post_data(etag.as_deref(), b"viewer-v2".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            response.headers().get("etag").and_then(|v| v.to_str().ok()),
+            Some(content_revision(b"external-v2").as_str())
+        );
+        // The external version survives untouched.
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"external-v2");
+        assert!(state.last_written_revision.read().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_post_data_accepts_acknowledged_overwrite_revision_in_list() {
+        // "Keep my changes" authorizes exactly one pending revision: the save
+        // sends both its accepted revision and the acknowledged disk revision,
+        // and the write succeeds only while the disk still holds the latter.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"pending-disk").unwrap();
+
+        let state = make_state(tmp.path(), "application/json");
+        let app = data_app(state.clone());
+
+        let accepted = content_revision(b"the-viewers-old-baseline");
+        let acknowledged = content_revision(b"pending-disk");
+        let list = format!("{accepted}, {acknowledged}");
+
+        let response = app
+            .clone()
+            .oneshot(post_data(Some(&list), b"viewer-wins".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"viewer-wins");
+        assert_eq!(
+            state.last_written_revision.read().unwrap().as_deref(),
+            Some(content_revision(b"viewer-wins").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_data_absent_file_absent_revision_recreates_but_stale_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("deleted.excalidraw"); // never created
+
+        let state = make_state(&file, "application/json");
+        let app = data_app(state.clone());
+
+        // A missing file is a distinct disk state, published via GET /data 404.
+        let (status, etag, _) = get_data(&app).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(etag.as_deref(), Some(ABSENT_REVISION));
+
+        // A client that has not acknowledged the deletion cannot write: its
+        // byte revision names a disk state that no longer exists.
+        let stale_bytes = content_revision(b"what-the-file-used-to-contain");
+        let response = app
+            .clone()
+            .oneshot(post_data(Some(&stale_bytes), b"recreate".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        assert!(!file.exists());
+
+        // A client that acknowledges absence may deliberately recreate.
+        let response = app
+            .clone()
+            .oneshot(post_data(Some(ABSENT_REVISION), b"recreate".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(&file).unwrap(), b"recreate");
+        assert_eq!(
+            state.last_written_revision.read().unwrap().as_deref(),
+            Some(content_revision(b"recreate").as_str())
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_post_data_write_failure_is_500_and_last_written_revision_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"original").unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        // Skip when this environment bypasses file permissions (e.g. root):
+        // the failure path then cannot be exercised at all.
+        if std::fs::write(tmp.path(), b"probe").is_ok() {
+            return;
+        }
+
+        let state = make_state(tmp.path(), "application/json");
+        let app = data_app(state.clone());
+
+        let (_, etag, _) = get_data(&app).await;
+        let response = app
+            .clone()
+            .oneshot(post_data(etag.as_deref(), b"doomed-write".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"original");
+        // A failed write must not advance the echo-suppression baseline.
+        assert!(state.last_written_revision.read().unwrap().is_none());
+
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_post_data_round_trip_all_three_formats() {
+        let cases: &[(&str, &[u8], &[u8])] = &[
+            (
+                "application/json",
+                br#"{"type":"excalidraw","version":2,"elements":[]}"#,
+                br#"{"type":"excalidraw","version":2,"elements":[{"id":"x"}]}"#,
+            ),
+            (
+                "image/svg+xml",
+                b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+                b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>",
+            ),
+            (
+                "image/png",
+                &[0x89, 0x50, 0x4E, 0x47, 0x0D],
+                &[0x89, 0x50, 0x4E, 0x47],
+            ),
+        ];
+
+        for &(content_type, initial, updated) in cases {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), initial).unwrap();
+
+            let state = make_state(tmp.path(), content_type);
+            let app = data_app(state.clone());
+
+            // GET publishes the content type and the revision of `initial`.
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/data")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            assert_eq!(
+                response.headers().get("content-type").unwrap(),
+                content_type
+            );
+            let etag = response
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .unwrap()
+                .to_string();
+            assert_eq!(etag, content_revision(initial));
+
+            // Conditional write of `updated` succeeds and returns its revision.
+            let response = app
+                .clone()
+                .oneshot(post_data(Some(&etag), updated.to_vec()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            let new_etag = response
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .unwrap();
+            assert_eq!(new_etag, content_revision(updated));
+
+            // Disk bytes, exactly as posted, for every format.
+            assert_eq!(std::fs::read(tmp.path()).unwrap(), updated);
+            assert_eq!(
+                state.last_written_revision.read().unwrap().as_deref(),
+                Some(content_revision(updated).as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_serve_data_missing_file_returns_404_with_absent_etag() {
         let state = make_state(
             std::path::Path::new("/nonexistent/path/that/does/not/exist.excalidraw"),
             "application/json",
@@ -3173,7 +4322,318 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Deletion is an unavailable-file state, distinct from a read failure:
+        // the client must be able to tell "file gone" apart from "read broke".
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers().get("etag").unwrap(), ABSENT_REVISION);
+    }
+
+    // ── watcher reconciliation ───────────────────────────────────────────────
+
+    /// Builds a synthetic notify event of the given kind carrying one path.
+    fn fs_event(kind: notify::EventKind, path: &Path) -> notify::Event {
+        notify::Event::new(kind).add_path(path.to_path_buf())
+    }
+
+    #[test]
+    fn test_event_kind_relevant_covers_modify_create_remove_and_rename() {
+        use notify::event::{
+            CreateKind, DataChange, EventKind, ModifyKind, RemoveKind, RenameMode,
+        };
+
+        // Content and metadata modification, including every rename shape
+        // notify reports (From / To / Both carry the target in `paths`).
+        assert!(event_kind_relevant(&EventKind::Modify(ModifyKind::Any)));
+        assert!(event_kind_relevant(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(event_kind_relevant(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::From
+        ))));
+        assert!(event_kind_relevant(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::To
+        ))));
+        assert!(event_kind_relevant(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::Both
+        ))));
+        // Creation and removal (delete/recreate, rename-over on some backends).
+        assert!(event_kind_relevant(&EventKind::Create(CreateKind::Any)));
+        assert!(event_kind_relevant(&EventKind::Remove(RemoveKind::Any)));
+        // Pure reads and watch meta-events never schedule a reconcile.
+        assert!(!event_kind_relevant(&EventKind::Access(
+            notify::event::AccessKind::Any
+        )));
+        assert!(!event_kind_relevant(&EventKind::Any));
+        assert!(!event_kind_relevant(&EventKind::Other));
+    }
+
+    #[test]
+    fn test_event_concerns_target_filters_to_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let scene = dir.path().join("diagram.excalidraw");
+        std::fs::write(&scene, "{}").unwrap();
+        let target = std::fs::canonicalize(&scene).unwrap();
+
+        // Direct lexical match — the watcher root is the canonical parent, so
+        // notify reports exactly `canonical_parent/name`.
+        let mut event = fs_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            &target,
+        );
+        assert!(event_concerns_target(&event, &target));
+        // Rename events carry the target as either their From or To path.
+        event = fs_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::To,
+            )),
+            &target,
+        );
+        assert!(event_concerns_target(&event, &target));
+
+        // A just-deleted target no longer canonicalizes, but still matches
+        // lexically (deletion must remain observable).
+        let deleted = tempfile::NamedTempFile::new().unwrap();
+        let deleted_path = deleted.path().to_path_buf();
+        drop(deleted);
+        event = fs_event(
+            notify::EventKind::Remove(notify::event::RemoveKind::Any),
+            &deleted_path,
+        );
+        assert!(!deleted_path.exists());
+        assert!(event_concerns_target(&event, &deleted_path));
+
+        // Sibling files in the watched directory are filtered out.
+        event = fs_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            &dir.path().join("diagram.excalidraw.tmp"),
+        );
+        assert!(!event_concerns_target(&event, &target));
+
+        // A differently-spelled existing path to the same file (symlink)
+        // canonicalizes to the target and matches.
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("alias.excalidraw");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            event = fs_event(
+                notify::EventKind::Create(notify::event::CreateKind::Any),
+                &link,
+            );
+            assert!(event_concerns_target(&event, &target));
+        }
+
+        // Irrelevant kinds are ignored regardless of path.
+        event = fs_event(
+            notify::EventKind::Access(notify::event::AccessKind::Any),
+            &target,
+        );
+        assert!(!event_concerns_target(&event, &target));
+    }
+
+    /// Builds a `WatcherContext` over a real file plus its broadcast receiver.
+    fn watcher_ctx(file: &Path) -> (WatcherContext, broadcast::Receiver<PreviewEvent>) {
+        let (broadcast_tx, rx) = broadcast::channel(16);
+        (
+            WatcherContext {
+                file_path: file.to_path_buf(),
+                broadcast_tx,
+                last_written_revision: Arc::new(RwLock::new(None)),
+            },
+            rx,
+        )
+    }
+
+    /// Blocks up to `timeout` for the next broadcast event — a sync bridge
+    /// over the async receiver (2 ms poll granularity) for watcher unit tests.
+    fn recv_broadcast_timeout(
+        rx: &mut broadcast::Receiver<PreviewEvent>,
+        timeout: Duration,
+    ) -> Option<PreviewEvent> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match rx.try_recv() {
+                Ok(event) => return Some(event),
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(broadcast::error::TryRecvError::Closed) => return None,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            }
+        }
+    }
+
+    #[test]
+    fn test_reconcile_broadcasts_reload_for_external_change() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"external-bytes").unwrap();
+
+        let (ctx, mut rx) = watcher_ctx(tmp.path());
+        reconcile_disk_state(&ctx);
+        assert_eq!(rx.try_recv().unwrap(), PreviewEvent::Reload);
+    }
+
+    #[test]
+    fn test_reconcile_suppresses_proven_viewer_echo_by_revision() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"viewer-wrote-these-bytes").unwrap();
+
+        let (ctx, mut rx) = watcher_ctx(tmp.path());
+        // Simulate a completed viewer write: the revision recorded under the
+        // save mutex before the watcher could observe the file.
+        *ctx.last_written_revision.write().unwrap() =
+            Some(content_revision(b"viewer-wrote-these-bytes"));
+
+        reconcile_disk_state(&ctx);
+        assert!(
+            rx.try_recv().is_err(),
+            "a disk revision equal to the last viewer write is a proven echo"
+        );
+
+        // The same bytes written *externally* after a different viewer write
+        // are still suppressed: identical bytes mean nothing to reload.
+        std::fs::write(tmp.path(), b"viewer-wrote-these-bytes").unwrap();
+        reconcile_disk_state(&ctx);
+        assert!(rx.try_recv().is_err());
+
+        // Any other external change reloads.
+        std::fs::write(tmp.path(), b"different-bytes").unwrap();
+        reconcile_disk_state(&ctx);
+        assert_eq!(rx.try_recv().unwrap(), PreviewEvent::Reload);
+    }
+
+    #[test]
+    fn test_reconcile_broadcasts_reload_for_deletion() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+        assert!(!path.exists());
+
+        let (ctx, mut rx) = watcher_ctx(&path);
+        reconcile_disk_state(&ctx);
+        // Deletion is a change like any other: the client sees 404 from
+        // GET /data and shows the unavailable state.
+        assert_eq!(rx.try_recv().unwrap(), PreviewEvent::Reload);
+    }
+
+    #[test]
+    fn test_reconcile_gives_up_on_transient_read_errors_without_broadcasting() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file should be: `fs::read` fails with a
+        // non-NotFound error on every platform, standing in for a partial or
+        // busy write. The bounded backoff (25+50+100 ms) must exhaust without
+        // broadcasting anything — the client keeps its last good state.
+        std::fs::create_dir(dir.path().join("unreadable.excalidraw")).unwrap();
+        let target = dir.path().join("unreadable.excalidraw");
+
+        let (ctx, mut rx) = watcher_ctx(&target);
+        let started = std::time::Instant::now();
+        reconcile_disk_state(&ctx);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            started.elapsed() >= Duration::from_millis(WATCHER_READ_BACKOFF_MS.iter().sum::<u64>()),
+            "all backoff delays must have been used before giving up"
+        );
+    }
+
+    #[test]
+    fn test_watcher_loop_coalesces_burst_and_never_drops_final_event() {
+        use std::sync::mpsc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"burst").unwrap();
+        let (ctx, mut rx) = watcher_ctx(tmp.path());
+        let (tx, watcher_rx) = mpsc::channel::<notify::Event>();
+        let handle = std::thread::spawn(move || run_watcher_loop(watcher_rx, ctx));
+
+        let modify =
+            |p: &Path| fs_event(notify::EventKind::Modify(notify::event::ModifyKind::Any), p);
+
+        // Burst: two matching events 40 ms apart (inside the quiet window),
+        // plus an interleaved sibling event that must be ignored. The final
+        // matching event restarts the quiet timer, so the single reload may
+        // only be broadcast once the stream has been quiet for a full window
+        // after that final event.
+        tx.send(modify(tmp.path())).unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        tx.send(modify(&tmp.path().with_extension("sibling")))
+            .unwrap();
+        tx.send(modify(tmp.path())).unwrap();
+        let final_event_at = std::time::Instant::now();
+
+        // A broadcast much before final_event_at + 80 ms proves the trailing
+        // event was dropped (the old leading-edge throttle did exactly that
+        // by firing on the first event of the burst).
+        let event = recv_broadcast_timeout(&mut rx, Duration::from_secs(2)).expect("reload");
+        assert_eq!(event, PreviewEvent::Reload);
+        assert!(
+            final_event_at.elapsed() >= Duration::from_millis(70),
+            "reconcile fired before the trailing event's quiet window elapsed"
+        );
+        // Exactly one broadcast for the whole burst.
+        assert!(rx.try_recv().is_err());
+
+        // A later matching event earns its own reload.
+        tx.send(modify(tmp.path())).unwrap();
+        assert_eq!(
+            recv_broadcast_timeout(&mut rx, Duration::from_secs(2)).expect("second reload"),
+            PreviewEvent::Reload
+        );
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_watcher_loop_forces_reconcile_within_max_wait_under_sustained_events() {
+        use std::sync::mpsc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"sustained").unwrap();
+        let (ctx, mut rx) = watcher_ctx(tmp.path());
+        let (tx, watcher_rx) = mpsc::channel::<notify::Event>();
+        let handle = std::thread::spawn(move || run_watcher_loop(watcher_rx, ctx));
+
+        // A reader thread records when each reload actually arrives while the
+        // main thread keeps the event stream sustained (one event every 40 ms
+        // — the quiet window can never elapse, so *only* the forced max-wait
+        // reconcile can fire).
+        let started = std::time::Instant::now();
+        let reader = std::thread::spawn(move || {
+            let first = recv_broadcast_timeout(&mut rx, Duration::from_secs(3))
+                .expect("forced reconcile never fired");
+            let first_at = started.elapsed();
+            let second = recv_broadcast_timeout(&mut rx, Duration::from_secs(3))
+                .expect("no second forced reconcile under sustained events");
+            (first, first_at, second, started.elapsed())
+        });
+
+        for _ in 0..20 {
+            tx.send(fs_event(
+                notify::EventKind::Modify(notify::event::ModifyKind::Any),
+                tmp.path(),
+            ))
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+        }
+
+        let (first, first_at, second, second_at) = reader.join().unwrap();
+        assert_eq!(first, PreviewEvent::Reload);
+        assert_eq!(second, PreviewEvent::Reload);
+        assert!(
+            first_at <= WATCHER_MAX_WAIT + Duration::from_millis(250),
+            "first forced reconcile came too late: {first_at:?}"
+        );
+        // The next burst's forced reconcile is again bounded by max wait.
+        assert!(
+            second_at - first_at <= WATCHER_MAX_WAIT + Duration::from_millis(250),
+            "second forced reconcile came too late: {second_at:?} after {first_at:?}"
+        );
+
+        drop(tx);
+        handle.join().unwrap();
     }
 
     #[tokio::test]
@@ -3199,6 +4659,8 @@ mod tests {
             dirty: Arc::new(RwLock::new(DirtyState::default())),
             pending_actions: Arc::new(Mutex::new(HashMap::new())),
             pending_libraries: Arc::new(Mutex::new(Vec::new())),
+            save_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            last_written_revision: Arc::new(RwLock::new(None)),
         });
 
         let app = Router::new()
@@ -3403,9 +4865,10 @@ mod tests {
         // The flow's own channel, closed by dropping its sender.
         let (tx, rx) = tokio::sync::oneshot::channel::<NativeActionResult>();
         drop(tx); // close the channel → rx.try_recv() yields Closed
-        // A still-registered correlation entry under the same id (a stray sender
-        // that no resolving result will ever remove).
-        let (placeholder_tx, _placeholder_rx) = tokio::sync::oneshot::channel::<NativeActionResult>();
+                  // A still-registered correlation entry under the same id (a stray sender
+                  // that no resolving result will ever remove).
+        let (placeholder_tx, _placeholder_rx) =
+            tokio::sync::oneshot::channel::<NativeActionResult>();
         pending
             .lock()
             .unwrap()
@@ -3447,7 +4910,11 @@ mod tests {
             matches!(outcome, CloseOutcome::Pending),
             "still within the deadline → Pending"
         );
-        assert_eq!(pending.lock().unwrap().len(), 1, "entry retained while waiting");
+        assert_eq!(
+            pending.lock().unwrap().len(),
+            1,
+            "entry retained while waiting"
+        );
     }
 
     #[test]
@@ -3502,8 +4969,14 @@ mod tests {
     #[test]
     fn test_close_error_message_uses_detail_when_present() {
         let msg = close_error_message(Some("disk full"));
-        assert!(msg.contains("disk full"), "detail must appear in the message");
-        assert!(msg.contains("kept open"), "must reassure the window stayed open");
+        assert!(
+            msg.contains("disk full"),
+            "detail must appear in the message"
+        );
+        assert!(
+            msg.contains("kept open"),
+            "must reassure the window stayed open"
+        );
     }
 
     #[test]
@@ -3511,7 +4984,10 @@ mod tests {
         // Lost round-trip (timeout / unmounted bridge) → generic timeout copy.
         for detail in [None, Some(""), Some("   ")] {
             let msg = close_error_message(detail);
-            assert!(msg.contains("did not respond"), "blank detail → timeout copy");
+            assert!(
+                msg.contains("did not respond"),
+                "blank detail → timeout copy"
+            );
             assert!(msg.contains("kept open"));
         }
     }
@@ -3537,8 +5013,10 @@ mod tests {
         // The query resolved with ok:true (no unsaved changes) → safe to close,
         // regardless of the (here, stale) cached dirty flag.
         let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
-        let (mut flow, tx) =
-            querying_flow("query-1", std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let (mut flow, tx) = querying_flow(
+            "query-1",
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
         tx.send(NativeActionResult {
             action: "prepareClose".to_string(),
             ok: true,
@@ -3554,8 +5032,10 @@ mod tests {
     #[test]
     fn test_poll_query_flow_reports_dirty_when_webview_says_dirty() {
         let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
-        let (mut flow, tx) =
-            querying_flow("query-2", std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let (mut flow, tx) = querying_flow(
+            "query-2",
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
         tx.send(NativeActionResult {
             action: "prepareClose".to_string(),
             ok: false,
@@ -3571,8 +5051,10 @@ mod tests {
     #[test]
     fn test_poll_query_flow_pending_before_deadline() {
         let pending: PendingActions = Arc::new(Mutex::new(HashMap::new()));
-        let (mut flow, _tx) =
-            querying_flow("query-3", std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let (mut flow, _tx) = querying_flow(
+            "query-3",
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
         // No result yet, deadline far off → still pending (None).
         assert_eq!(poll_query_flow(&mut flow, &pending, true), None);
     }
@@ -3647,6 +5129,8 @@ mod tests {
             dirty: Arc::new(RwLock::new(DirtyState::default())),
             pending_actions: Arc::new(Mutex::new(HashMap::new())),
             pending_libraries: Arc::new(Mutex::new(Vec::new())),
+            save_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            last_written_revision: Arc::new(RwLock::new(None)),
         });
         (state, library_open_rx)
     }
@@ -3659,9 +5143,9 @@ mod tests {
         // Stand in for the UI thread: answer the dialog with file bytes.
         std::thread::spawn(move || {
             if let Ok(req) = library_open_rx.recv() {
-                let _ = req
-                    .reply
-                    .send(Some(br#"{"type":"excalidrawlib","libraryItems":[]}"#.to_vec()));
+                let _ = req.reply.send(Some(
+                    br#"{"type":"excalidrawlib","libraryItems":[]}"#.to_vec(),
+                ));
             }
         });
 
@@ -3744,7 +5228,10 @@ mod tests {
         let path = dir.path().join("existing.excalidraw");
         std::fs::write(&path, r#"{"type":"excalidraw"}"#).unwrap();
         assert!(!bootstrap_if_empty(&path).unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"type":"excalidraw"}"#);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"type":"excalidraw"}"#
+        );
     }
 
     #[test]
@@ -3798,18 +5285,24 @@ mod tests {
         // Empty default before anything is saved.
         let resp = serve_library().await.into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["type"], "excalidrawlib");
         assert!(parsed["libraryItems"].as_array().unwrap().is_empty());
 
         // POST then GET round-trips the payload.
         let payload = r#"{"type":"excalidrawlib","version":2,"libraryItems":[{"id":"a"}]}"#;
-        let resp = receive_library(axum::body::Bytes::from(payload)).await.into_response();
+        let resp = receive_library(axum::body::Bytes::from(payload))
+            .await
+            .into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
         let resp = serve_library().await.into_response();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), payload);
     }
 

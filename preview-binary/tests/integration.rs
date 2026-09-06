@@ -6,7 +6,8 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const BLANK_SCENE: &str = r#"{"type":"excalidraw","version":2,"source":"test","elements":[],"appState":{},"files":{}}"#;
+const BLANK_SCENE: &str =
+    r#"{"type":"excalidraw","version":2,"source":"test","elements":[],"appState":{},"files":{}}"#;
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_excalidraw-preview")
@@ -55,7 +56,11 @@ impl Preview {
                     break p;
                 }
             }
-            assert!(Instant::now() < deadline, "lock file never appeared at {}", lock.display());
+            assert!(
+                Instant::now() < deadline,
+                "lock file never appeared at {}",
+                lock.display()
+            );
             std::thread::sleep(Duration::from_millis(50));
         };
         Preview { child, port, lock }
@@ -85,6 +90,78 @@ fn http_get(url: &str) -> (u16, String) {
     (status, body)
 }
 
+/// GETs `/data` and returns `(status, ETag header, body)`.
+fn http_get_data(url: &str) -> (u16, Option<String>, String) {
+    let resp = reqwest::blocking::Client::new()
+        .get(url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .expect("GET /data failed");
+    let status = resp.status().as_u16();
+    let etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = resp.text().unwrap_or_default();
+    (status, etag, body)
+}
+
+/// The strong ETag the server publishes for these exact bytes
+/// (`"sha256-<hex>"`), mirroring `content_revision` in main.rs.
+fn etag_for(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    format!("\"sha256-{hex}\"")
+}
+
+/// Subscribes to the `/events` SSE stream and returns a channel receiving
+/// every non-empty line. `send()` returning proves the server-side
+/// `broadcast_tx.subscribe()` has already run (it happens in the handler
+/// before the response starts), so events broadcast after this call cannot
+/// be missed.
+fn subscribe_events(url: &str) -> std::sync::mpsc::Receiver<String> {
+    let resp = reqwest::blocking::Client::new()
+        .get(url.to_string())
+        .timeout(Duration::from_secs(60))
+        .send()
+        .expect("SSE connect failed");
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(resp);
+        for line in reader.lines().map_while(Result::ok) {
+            if !line.trim().is_empty() {
+                let _ = line_tx.send(line);
+            }
+        }
+    });
+    line_rx
+}
+
+/// Waits for the next SSE line containing `needle`, with a bounded deadline
+/// (never a bare sleep).
+fn expect_sse(lines: &std::sync::mpsc::Receiver<String>, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        let line = lines
+            .recv_timeout(remaining.max(Duration::from_millis(1)))
+            .unwrap_or_else(|e| {
+                panic!("no SSE line within deadline while waiting for {needle:?}: {e}")
+            });
+        if line.contains(needle) {
+            return line;
+        }
+    }
+}
+
 /// POST a JSON body and return the status code.
 fn http_post_json(url: &str, body: &str) -> u16 {
     reqwest::blocking::Client::new()
@@ -112,7 +189,10 @@ fn headless_server_serves_ping_config_and_data() {
 
     let (status, body) = http_get(&preview.url("/config"));
     assert_eq!(status, 200);
-    assert!(body.contains(r#""contentType":"application/json""#), "config was: {body}");
+    assert!(
+        body.contains(r#""contentType":"application/json""#),
+        "config was: {body}"
+    );
 
     let (status, body) = http_get(&preview.url("/data"));
     assert_eq!(status, 200);
@@ -156,6 +236,163 @@ fn sse_fires_when_file_changes_on_disk() {
 }
 
 #[test]
+fn sse_fires_when_file_is_atomically_replaced_by_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+
+    let preview = Preview::spawn(&file, &[]);
+    let (status, _) = http_get(&preview.url("/ping"));
+    assert_eq!(status, 200);
+
+    let lines = subscribe_events(&preview.url("/events"));
+
+    // Atomic replacement — how editors and git save: write a sibling temp
+    // file, then rename it over the target. A watch registered on the file
+    // itself follows the *old* inode and never sees the new bytes.
+    let tmp = dir.path().join("test.excalidraw.tmp");
+    std::fs::write(&tmp, BLANK_SCENE.replace("test", "renamed-over")).unwrap();
+    std::fs::rename(&tmp, &file).unwrap();
+
+    let line = expect_sse(&lines, "reload");
+    assert!(line.contains("reload"), "unexpected SSE line: {line}");
+
+    // The replaced bytes must be what the client converges on.
+    let (status, etag, body) = http_get_data(&preview.url("/data"));
+    assert_eq!(status, 200);
+    assert_eq!(body, BLANK_SCENE.replace("test", "renamed-over"));
+    assert_eq!(etag.as_deref(), Some(etag_for(body.as_bytes()).as_str()));
+}
+
+#[test]
+fn rapid_writes_converge_on_final_version_with_trailing_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test.excalidraw");
+    let v1 = BLANK_SCENE.replace("test", "v1");
+    std::fs::write(&file, &v1).unwrap();
+
+    let preview = Preview::spawn(&file, &[]);
+    let lines = subscribe_events(&preview.url("/events"));
+
+    // First change: establishes the baseline reload event.
+    std::fs::write(&file, &v1).unwrap();
+    let first = expect_sse(&lines, "reload");
+    assert!(first.contains("reload"), "unexpected SSE line: {first}");
+    let (status, etag, body) = http_get_data(&preview.url("/data"));
+    assert_eq!((status, body.as_str()), (200, v1.as_str()));
+    assert_eq!(etag.as_deref(), Some(etag_for(v1.as_bytes()).as_str()));
+
+    // Immediately burst two more writes, both landing well inside the 80 ms
+    // debounce window of the first reload. A leading-edge throttle drops the
+    // trailing events and never re-fires; only trailing reconciliation
+    // guarantees the *final* version its own reload.
+    let v2 = BLANK_SCENE.replace("test", "v2");
+    let v3 = BLANK_SCENE.replace("test", "v3");
+    std::fs::write(&file, &v2).unwrap();
+    std::fs::write(&file, &v3).unwrap();
+
+    let second = expect_sse(&lines, "reload");
+    assert!(second.contains("reload"), "unexpected SSE line: {second}");
+
+    // The client-visible revision converges on the final bytes (bounded poll
+    // of the published ETag — no fixed sleep anywhere in the assertion).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, etag, body) = http_get_data(&preview.url("/data"));
+        if status == 200 && body == v3 && etag.as_deref() == Some(etag_for(v3.as_bytes()).as_str())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "revision never converged on the final bytes; last saw status={status} etag={etag:?} body={body}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn delete_then_recreate_yields_reload_for_each_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+
+    let preview = Preview::spawn(&file, &[]);
+    let lines = subscribe_events(&preview.url("/events"));
+
+    // Deletion is a change like any other: a reload must be broadcast (the
+    // client then sees 404 from GET /data — deletion is not an empty drawing).
+    std::fs::remove_file(&file).unwrap();
+    let deleted = expect_sse(&lines, "reload");
+    assert!(deleted.contains("reload"), "unexpected SSE line: {deleted}");
+    let (status, etag, _) = http_get_data(&preview.url("/data"));
+    assert_eq!(status, 404, "deleted file must read as unavailable");
+    assert_eq!(etag.as_deref(), Some("\"absent\""));
+
+    // Recreation with different bytes: another reload, then a 200 publishing
+    // the new revision. The server must never auto-recreate on its own.
+    let recreated = BLANK_SCENE.replace("test", "recreated");
+    std::fs::write(&file, &recreated).unwrap();
+    let recreated_line = expect_sse(&lines, "reload");
+    assert!(
+        recreated_line.contains("reload"),
+        "unexpected SSE line: {recreated_line}"
+    );
+    let (status, etag, body) = http_get_data(&preview.url("/data"));
+    assert_eq!(status, 200);
+    assert_eq!(body, recreated);
+    assert_eq!(
+        etag.as_deref(),
+        Some(etag_for(recreated.as_bytes()).as_str()),
+        "recreated file must publish a fresh revision"
+    );
+}
+
+#[test]
+fn viewer_write_is_not_echoed_as_reload_but_external_write_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("test.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+
+    let preview = Preview::spawn(&file, &[]);
+    let lines = subscribe_events(&preview.url("/events"));
+
+    // A save through the viewer's own write API (conditional POST /data).
+    let (status, etag, _) = http_get_data(&preview.url("/data"));
+    assert_eq!(status, 200);
+    let saved = BLANK_SCENE.replace("test", "viewer-save");
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(preview.url("/data"))
+        .header("Content-Type", "application/json")
+        .header("If-Match", etag.as_deref().expect("baseline revision"))
+        .body(saved.clone())
+        .timeout(Duration::from_secs(3))
+        .send()
+        .expect("POST /data failed");
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Echo suppression: our own write must NOT be broadcast back as a reload.
+    // A buggy echo would surface within the quiet window plus the forced
+    // max-wait horizon (≤ ~600 ms after the write); wait well past it. This
+    // negative wait is the bounded check itself, not a sleep before an
+    // assertion.
+    let echo = lines.recv_timeout(Duration::from_millis(1500));
+    assert!(
+        echo.is_err(),
+        "viewer save was echoed as an SSE event: {echo:?}"
+    );
+
+    // Positive control on the same file: an external write DOES reload.
+    std::fs::write(&file, BLANK_SCENE.replace("test", "external")).unwrap();
+    let external = expect_sse(&lines, "reload");
+    assert!(
+        external.contains("reload"),
+        "unexpected SSE line: {external}"
+    );
+}
+
+#[test]
 fn daemonize_parent_exits_and_child_serves() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("test.excalidraw");
@@ -180,7 +417,10 @@ fn daemonize_parent_exits_and_child_serves() {
                 break p;
             }
         }
-        assert!(Instant::now() < deadline, "daemonized child never wrote lock file");
+        assert!(
+            Instant::now() < deadline,
+            "daemonized child never wrote lock file"
+        );
         std::thread::sleep(Duration::from_millis(50));
     };
 
@@ -214,7 +454,10 @@ fn export_dir_writes_posted_bytes_without_dialog() {
     assert_eq!(resp.status().as_u16(), 200);
 
     let written = export_dir.path().join("out.png");
-    assert_eq!(std::fs::read(&written).unwrap(), vec![0x89u8, 0x50, 0x4E, 0x47]);
+    assert_eq!(
+        std::fs::read(&written).unwrap(),
+        vec![0x89u8, 0x50, 0x4E, 0x47]
+    );
 }
 
 #[test]
@@ -248,14 +491,68 @@ fn post_data_writes_scene_to_disk() {
     let preview = Preview::spawn(&file, &[]);
     let updated = BLANK_SCENE.replace(r#""elements":[]"#, r#""elements":[{"id":"x"}]"#);
 
-    let resp = reqwest::blocking::Client::new()
+    let client = reqwest::blocking::Client::new();
+
+    // Read the current revision from the running server.
+    let get = client
+        .get(preview.url("/data"))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .expect("GET /data failed");
+    assert_eq!(get.status().as_u16(), 200);
+    let etag = get
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .expect("GET /data must publish an ETag")
+        .to_string();
+    assert!(etag.starts_with("\"sha256-"), "unexpected revision: {etag}");
+
+    // A save without If-Match is refused outright and disk is untouched.
+    let refused = client
         .post(preview.url("/data"))
         .header("Content-Type", "application/json")
         .body(updated.clone())
         .timeout(Duration::from_secs(3))
         .send()
         .expect("POST /data failed");
+    assert_eq!(refused.status().as_u16(), 428);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), BLANK_SCENE);
+
+    // The conditional save with the fresh revision succeeds.
+    let resp = client
+        .post(preview.url("/data"))
+        .header("Content-Type", "application/json")
+        .header("If-Match", &etag)
+        .body(updated.clone())
+        .timeout(Duration::from_secs(3))
+        .send()
+        .expect("POST /data failed");
     assert_eq!(resp.status().as_u16(), 200);
+    let new_etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .expect("POST /data must return the written revision");
+    assert_ne!(new_etag, etag);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), updated);
+
+    // The old revision is now stale: a replayed save must be refused (412)
+    // rather than silently overwriting the newer disk version.
+    let stale = client
+        .post(preview.url("/data"))
+        .header("Content-Type", "application/json")
+        .header("If-Match", &etag)
+        .body(BLANK_SCENE)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .expect("POST /data failed");
+    assert_eq!(stale.status().as_u16(), 412);
+    assert_eq!(
+        stale.headers().get("etag").and_then(|v| v.to_str().ok()),
+        Some(new_etag),
+        "412 must name the revision the client is racing"
+    );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), updated);
 }
 
@@ -281,7 +578,11 @@ fn concurrent_previews_bind_distinct_ports_and_serve() {
         p.dedup();
         p.len()
     };
-    assert_eq!(unique, ports.len(), "previews must bind distinct ports: {ports:?}");
+    assert_eq!(
+        unique,
+        ports.len(),
+        "previews must bind distinct ports: {ports:?}"
+    );
 
     // And every instance must actually be serving.
     for preview in &previews {
@@ -316,7 +617,10 @@ fn second_instance_for_same_file_exits_and_first_keeps_serving() {
         .trim()
         .parse()
         .unwrap();
-    assert_eq!(lock_port, first_port, "second instance must not steal the lock");
+    assert_eq!(
+        lock_port, first_port,
+        "second instance must not steal the lock"
+    );
 
     let (status, _) = http_get(&preview.url("/ping"));
     assert_eq!(status, 200, "first instance must still be alive");
@@ -346,7 +650,10 @@ fn post_dirty_accepts_valid_payload_and_rejects_malformed() {
 
     // Malformed body → 4xx (axum's Json rejection).
     let status = http_post_json(&preview.url("/dirty"), r#"{"dirty":"nope"}"#);
-    assert!((400..500).contains(&status), "malformed /dirty body should be a 4xx, got {status}");
+    assert!(
+        (400..500).contains(&status),
+        "malformed /dirty body should be a 4xx, got {status}"
+    );
 }
 
 #[test]
@@ -362,7 +669,10 @@ fn post_native_action_result_accepts_valid_payload() {
         &preview.url("/native-action-result"),
         r#"{"id":"no-such-request","action":"save","ok":true,"error":null}"#,
     );
-    assert_eq!(status, 200, "valid /native-action-result payload should be accepted");
+    assert_eq!(
+        status, 200,
+        "valid /native-action-result payload should be accepted"
+    );
 
     // Malformed body → 4xx.
     let status = http_post_json(&preview.url("/native-action-result"), r#"{"id":"x"}"#);
@@ -398,7 +708,9 @@ fn lsp_initialize_advertises_save_capability() {
     let mut content_length = 0usize;
     loop {
         let mut line = String::new();
-        stdout.read_line(&mut line).expect("LSP server closed stdout early");
+        stdout
+            .read_line(&mut line)
+            .expect("LSP server closed stdout early");
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
@@ -414,7 +726,10 @@ fn lsp_initialize_advertises_save_capability() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     let sync = &json["result"]["capabilities"]["textDocumentSync"];
-    assert!(sync.is_object(), "textDocumentSync should be the object form, got: {sync}");
+    assert!(
+        sync.is_object(),
+        "textDocumentSync should be the object form, got: {sync}"
+    );
     assert_eq!(sync["openClose"], serde_json::Value::Bool(true));
     assert_eq!(sync["save"], serde_json::Value::Bool(true));
 
@@ -437,7 +752,9 @@ fn lsp_read(stdout: &mut impl std::io::BufRead) -> serde_json::Value {
     let mut content_length = 0usize;
     loop {
         let mut line = String::new();
-        stdout.read_line(&mut line).expect("LSP server closed stdout early");
+        stdout
+            .read_line(&mut line)
+            .expect("LSP server closed stdout early");
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
@@ -484,7 +801,10 @@ fn lsp_did_save_spawns_preview_then_reuses_live_instance() {
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
     // Handshake so we know the loop is running before we send notifications.
-    lsp_write(&mut stdin, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    lsp_write(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
     let _ = lsp_read(&mut stdout);
 
     // Build the URI the way a real LSP client (Zed) does: a platform-correct,
@@ -521,10 +841,20 @@ fn lsp_did_save_spawns_preview_then_reuses_live_instance() {
     // the lock port is unchanged and the same instance keeps serving.
     lsp_write(&mut stdin, &did_save);
     std::thread::sleep(Duration::from_millis(500));
-    let lock_port: u16 = std::fs::read_to_string(&lock).unwrap().trim().parse().unwrap();
-    assert_eq!(lock_port, port, "second didSave must not respawn on a new port");
+    let lock_port: u16 = std::fs::read_to_string(&lock)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        lock_port, port,
+        "second didSave must not respawn on a new port"
+    );
     let (status, _) = http_get(&format!("http://127.0.0.1:{port}/ping"));
-    assert_eq!(status, 200, "live preview must still be serving after the second didSave");
+    assert_eq!(
+        status, 200,
+        "live preview must still be serving after the second didSave"
+    );
 
     // Tear down the detached preview, then the LSP server.
     let _ = http_get(&format!("http://127.0.0.1:{port}/shutdown"));
@@ -566,7 +896,10 @@ fn lsp_did_close_keeps_preview_alive() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    lsp_write(&mut stdin, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    lsp_write(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
     let _ = lsp_read(&mut stdout);
 
     // Platform-correct file:// URI (see lsp_did_save for why format! is wrong).
@@ -601,7 +934,10 @@ fn lsp_did_close_keeps_preview_alive() {
     lsp_write(&mut stdin, &did_close);
     std::thread::sleep(Duration::from_millis(500));
     let (status, body) = http_get(&format!("http://127.0.0.1:{port}/ping"));
-    assert_eq!(status, 200, "preview must survive didClose (persist until window close)");
+    assert_eq!(
+        status, 200,
+        "preview must survive didClose (persist until window close)"
+    );
     assert_eq!(body, "OK");
     assert!(lock.exists(), "lock file must remain after didClose");
 
@@ -615,6 +951,518 @@ fn lsp_did_close_keeps_preview_alive() {
     let _ = stdin.flush();
     drop(stdin);
     let _ = child.wait();
+}
+
+// ── LSP didClose attention-signal harness (Phase 5) ──────────────────────────
+
+/// A driven `--lsp` child: framed JSON-RPC over piped stdio. Spawned with
+/// `EXCALIDRAW_PREVIEW_HEADLESS=true` so every preview it spawns comes up
+/// windowless and can be probed over HTTP.
+struct Lsp {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    next_id: u64,
+}
+
+impl Lsp {
+    /// Spawns the server and completes the `initialize` handshake.
+    fn spawn() -> Self {
+        let mut child = std::process::Command::new(binary())
+            .arg("--lsp")
+            .env("EXCALIDRAW_PREVIEW_HEADLESS", "true")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn --lsp");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut lsp = Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        };
+        let response = lsp.request("initialize", "{}");
+        assert!(
+            response["result"]["capabilities"]["textDocumentSync"].is_object(),
+            "initialize handshake failed: {response}"
+        );
+        lsp
+    }
+
+    /// Sends a request and returns the parsed response.
+    fn request(&mut self, method: &str, params: &str) -> serde_json::Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let msg = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#);
+        lsp_write(&mut self.stdin, &msg);
+        lsp_read(&mut self.stdout)
+    }
+
+    /// Sends a notification (no response is expected).
+    fn notify(&mut self, method: &str, params: &str) {
+        let msg = format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{params}}}"#);
+        lsp_write(&mut self.stdin, &msg);
+    }
+
+    /// Sends a `textDocument/*` notification carrying only a document URI.
+    fn notify_document(&mut self, method: &str, uri: &str) {
+        self.notify(method, &format!(r#"{{"textDocument":{{"uri":"{uri}"}}}}"#));
+    }
+
+    /// Proves the stdio dispatch loop is still alive: an unknown *request*
+    /// must get a `-32601` response, not silence.
+    fn assert_responsive(&mut self) {
+        let response = self.request("workspace/executeCommand", "{}");
+        assert_eq!(
+            response["error"]["code"],
+            serde_json::json!(-32601),
+            "LSP dispatch loop must still answer requests, got: {response}"
+        );
+    }
+}
+
+impl Drop for Lsp {
+    fn drop(&mut self) {
+        use std::io::Write as _;
+        // Graceful exit first, kill as a backstop so a wedged server can never
+        // hang the test binary; either way the child is reaped.
+        let exit = r#"{"jsonrpc":"2.0","method":"exit"}"#;
+        let _ = write!(self.stdin, "Content-Length: {}\r\n\r\n{}", exit.len(), exit);
+        let _ = self.stdin.flush();
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Platform-correct, percent-encoded `file://` URI — the shape a real LSP
+/// client (Zed) sends. `format!("file://{path}")` is only valid on POSIX.
+fn file_uri(path: &Path) -> String {
+    url::Url::from_file_path(path).unwrap().to_string()
+}
+
+/// Polls a preview lock file until it contains a parseable port (bounded).
+fn wait_for_lock_port(lock: &Path) -> u16 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(s) = std::fs::read_to_string(lock) {
+            if let Ok(p) = s.trim().parse::<u16>() {
+                return p;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no preview lock appeared at {}",
+            lock.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Polls until a preview lock file has been removed (bounded).
+fn wait_for_lock_removed(lock: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while lock.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "lock file {} was never removed",
+            lock.display()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Gracefully shuts down an LSP-spawned (detached) preview instance and clears
+/// its lock. Tests own this teardown — killing the LSP never touches previews.
+/// Waits until the server is verifiably gone (lock removed *and* the port stops
+/// answering) so no half-exited child outlives the test.
+fn shut_down_preview(port: u16, lock: &Path) {
+    let _ = http_get(&format!("http://127.0.0.1:{port}/shutdown"));
+    wait_for_lock_removed(lock);
+    let _ = std::fs::remove_file(lock);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let refused = reqwest::blocking::Client::new()
+            .get(format!("http://127.0.0.1:{port}/ping"))
+            .timeout(Duration::from_millis(300))
+            .send()
+            .is_err();
+        if refused {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "preview on port {port} never stopped serving after /shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// A port that is (almost certainly) served by nothing: bind an ephemeral
+/// listener, note its port, then drop it.
+fn dead_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// Binds a TCP listener that accepts connections but never reads or responds.
+/// Connections are parked forever, so any HTTP client blocks until its own
+/// timeout. Returns the port and a counter of accepted connections.
+fn slow_endpoint() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = accepted.clone();
+    std::thread::spawn(move || {
+        let mut parked: Vec<std::net::TcpStream> = Vec::new();
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    parked.push(s); // hold the socket open; never respond
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (port, accepted)
+}
+
+/// Case 1: `didOpen` for each of the three guarded suffixes spawns exactly one
+/// preview per file — lock file present, `/ping` serving, and a repeated
+/// `didOpen` neither respawns nor disturbs the live instance.
+#[test]
+fn lsp_did_open_spawns_one_instance_per_guarded_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = [
+        dir.path().join("bare.excalidraw"),
+        dir.path().join("vector.excalidraw.svg"),
+        dir.path().join("raster.excalidraw.png"),
+    ];
+    for f in &files {
+        std::fs::write(f, BLANK_SCENE).unwrap();
+    }
+    let locks: Vec<PathBuf> = files
+        .iter()
+        .map(|f| lock_path_for(&std::fs::canonicalize(f).unwrap()))
+        .collect();
+    for l in &locks {
+        let _ = std::fs::remove_file(l);
+    }
+
+    let mut lsp = Lsp::spawn();
+    let mut ports = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        lsp.notify_document("textDocument/didOpen", &file_uri(f));
+        let port = wait_for_lock_port(&locks[i]);
+        let (status, body) = http_get(&format!("http://127.0.0.1:{port}/ping"));
+        assert_eq!(
+            (status, body.as_str()),
+            (200, "OK"),
+            "preview for {} never served /ping",
+            files[i].display()
+        );
+        ports.push(port);
+    }
+
+    // Exactly one instance per file: a second didOpen finds the live lock,
+    // focuses it, and exits — the lock keeps pointing at the same serving port.
+    lsp.notify_document("textDocument/didOpen", &file_uri(&files[0]));
+    std::thread::sleep(Duration::from_millis(500));
+    let lock_port: u16 = std::fs::read_to_string(&locks[0])
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        lock_port, ports[0],
+        "repeated didOpen must not respawn on a new port"
+    );
+    let (status, _) = http_get(&format!("http://127.0.0.1:{}/ping", ports[0]));
+    assert_eq!(status, 200, "the single live instance must keep serving");
+
+    for (port, lock) in ports.iter().zip(&locks) {
+        shut_down_preview(*port, lock);
+    }
+}
+
+/// Case 2: `didSave` while a preview is live must not spawn a second instance.
+/// (Full coverage in `lsp_did_save_spawns_preview_then_reuses_live_instance`
+/// above; repeated here through the shared harness for the Phase 5 matrix.)
+#[test]
+fn lsp_did_save_while_live_spawns_no_second_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("live.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+    let lock = lock_path_for(&std::fs::canonicalize(&file).unwrap());
+    let _ = std::fs::remove_file(&lock);
+
+    let mut lsp = Lsp::spawn();
+    lsp.notify_document("textDocument/didOpen", &file_uri(&file));
+    let port = wait_for_lock_port(&lock);
+
+    lsp.notify_document("textDocument/didSave", &file_uri(&file));
+    std::thread::sleep(Duration::from_millis(500));
+    let lock_port: u16 = std::fs::read_to_string(&lock)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(lock_port, port, "didSave while live must not respawn");
+    let (status, _) = http_get(&format!("http://127.0.0.1:{port}/ping"));
+    assert_eq!(status, 200, "live preview must keep serving after didSave");
+
+    shut_down_preview(port, &lock);
+}
+
+/// Case 3: after the preview is closed (`GET /shutdown`), a `didSave` reopens
+/// it — the lock file reappears and a serving instance answers `/ping`.
+#[test]
+fn lsp_did_save_reopens_preview_after_window_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("reopen.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+    let canonical = std::fs::canonicalize(&file).unwrap();
+    let lock = lock_path_for(&canonical);
+    let _ = std::fs::remove_file(&lock);
+
+    let mut lsp = Lsp::spawn();
+    lsp.notify_document("textDocument/didOpen", &file_uri(&file));
+    let first_port = wait_for_lock_port(&lock);
+
+    // Close the preview the way its window does: graceful shutdown + lock
+    // cleanup. Wait until the old instance is verifiably gone.
+    let _ = http_get(&format!("http://127.0.0.1:{first_port}/shutdown"));
+    wait_for_lock_removed(&lock);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let refused = reqwest::blocking::Client::new()
+            .get(format!("http://127.0.0.1:{first_port}/ping"))
+            .timeout(Duration::from_millis(300))
+            .send()
+            .is_err();
+        if refused {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shut-down preview on port {first_port} is still serving"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // didSave with nothing live → the preview reopens.
+    lsp.notify_document("textDocument/didSave", &file_uri(&file));
+    let second_port = wait_for_lock_port(&lock);
+    let (status, body) = http_get(&format!("http://127.0.0.1:{second_port}/ping"));
+    assert_eq!((status, body.as_str()), (200, "OK"));
+
+    shut_down_preview(second_port, &lock);
+}
+
+/// Case 4: `didChange` never spawns — typing in Zed must not resurrect or
+/// open a viewer. (The `didChange` arm is deliberately unhandled.)
+#[test]
+fn lsp_did_change_never_spawns_a_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("typing.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+    let lock = lock_path_for(&std::fs::canonicalize(&file).unwrap());
+    let _ = std::fs::remove_file(&lock);
+
+    let mut lsp = Lsp::spawn();
+
+    // A full-text sync change with real content, then an empty change list.
+    let params = serde_json::json!({
+        "textDocument": {"uri": file_uri(&file), "version": 2},
+        "contentChanges": [{"text": BLANK_SCENE}]
+    })
+    .to_string();
+    lsp.notify("textDocument/didChange", &params);
+    lsp.notify(
+        "textDocument/didChange",
+        &format!(
+            r#"{{"textDocument":{{"uri":"{}","version":3}},"contentChanges":[]}}"#,
+            file_uri(&file)
+        ),
+    );
+
+    // Bounded negative wait: no lock may ever appear (spawns write it within
+    // ~300 ms when they do happen; well under this window).
+    std::thread::sleep(Duration::from_millis(750));
+    assert!(
+        !lock.exists(),
+        "didChange must never spawn a preview (lock appeared at {})",
+        lock.display()
+    );
+    lsp.assert_responsive();
+}
+
+/// Case 5: `didClose` forwards an attention signal to the live preview.
+/// Subscribing to `/events` *before* the close, the SSE stream must deliver an
+/// `editor-closed` frame, and the preview must still be alive afterwards — the
+/// signal never tears anything down.
+#[test]
+fn lsp_did_close_forwards_editor_closed_to_live_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("forward.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+    let canonical = std::fs::canonicalize(&file).unwrap();
+    let lock = lock_path_for(&canonical);
+    let _ = std::fs::remove_file(&lock);
+
+    let mut lsp = Lsp::spawn();
+    lsp.notify_document("textDocument/didOpen", &file_uri(&file));
+    let port = wait_for_lock_port(&lock);
+
+    // Subscribe BEFORE the close so the broadcast cannot be missed.
+    let lines = subscribe_events(&format!("http://127.0.0.1:{port}/events"));
+    lsp.notify_document("textDocument/didClose", &file_uri(&file));
+
+    let frame = expect_sse(&lines, "editor-closed");
+    assert_eq!(
+        frame, "data: editor-closed",
+        "didClose must surface as exactly one editor-closed SSE frame"
+    );
+
+    // The preview survives the signal.
+    let (status, body) = http_get(&format!("http://127.0.0.1:{port}/ping"));
+    assert_eq!((status, body.as_str()), (200, "OK"));
+    assert!(lock.exists(), "lock file must survive didClose");
+    // Duplicate closes coalesce — the frame was delivered exactly once.
+    assert!(
+        lines.recv_timeout(Duration::from_millis(400)).is_err(),
+        "duplicate editor-closed frames must not arrive for one close"
+    );
+    // And the LSP dispatch loop is unharmed.
+    lsp.assert_responsive();
+
+    shut_down_preview(port, &lock);
+}
+
+/// Case 6: plain `.svg` files and malformed / non-`file:` URIs are no-ops —
+/// no spawn, no forward, no crash; the dispatch loop keeps answering.
+#[test]
+fn lsp_ignores_plain_svg_and_malformed_uris() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain.svg");
+    std::fs::write(&plain, "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>").unwrap();
+    let lock = lock_path_for(&std::fs::canonicalize(&plain).unwrap());
+    let _ = std::fs::remove_file(&lock);
+
+    let mut lsp = Lsp::spawn();
+
+    // Plain .svg: the is_excalidraw_path guard must skip spawn and forward.
+    lsp.notify_document("textDocument/didOpen", &file_uri(&plain));
+    lsp.notify_document("textDocument/didClose", &file_uri(&plain));
+
+    // Non-file schemes never decode to a filesystem path.
+    lsp.notify_document(
+        "textDocument/didOpen",
+        "https://example.com/diagram.excalidraw",
+    );
+    lsp.notify_document(
+        "textDocument/didClose",
+        "https://example.com/diagram.excalidraw",
+    );
+
+    // Malformed URIs (not parseable as URLs at all).
+    lsp.notify_document("textDocument/didOpen", "not a valid uri");
+    lsp.notify_document("textDocument/didClose", "::%zz");
+
+    // A file:// URI whose path does not exist: no preview instance can come
+    // up for it (the spawned binary refuses a missing file before binding).
+    lsp.notify_document(
+        "textDocument/didClose",
+        &file_uri(&dir.path().join("ghost.excalidraw")),
+    );
+
+    // Bounded negative wait: nothing above may have produced a preview.
+    std::thread::sleep(Duration::from_millis(750));
+    assert!(
+        !lock.exists(),
+        "plain .svg must never spawn a preview (lock appeared at {})",
+        lock.display()
+    );
+    lsp.assert_responsive();
+}
+
+/// Case 7: a stale lock file pointing at a dead port makes `didClose` a
+/// harmless no-op — the refused connection resolves fast, the lock is left
+/// exactly as found, and the LSP keeps answering.
+#[test]
+fn lsp_did_close_with_stale_lock_is_harmless_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("stale.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+    let canonical = std::fs::canonicalize(&file).unwrap();
+    let lock = lock_path_for(&canonical);
+
+    let dead = dead_port();
+    std::fs::write(&lock, dead.to_string()).unwrap();
+
+    let mut lsp = Lsp::spawn();
+    lsp.notify_document("textDocument/didClose", &file_uri(&file));
+
+    // The forward attempt (connection refused) resolves well inside this
+    // window; afterwards the lock must be untouched.
+    std::thread::sleep(Duration::from_millis(750));
+    let still_there = std::fs::read_to_string(&lock).unwrap();
+    assert_eq!(
+        still_there.trim(),
+        dead.to_string(),
+        "the forwarder must never rewrite or remove a lock it does not own"
+    );
+    lsp.assert_responsive();
+
+    let _ = std::fs::remove_file(&lock);
+}
+
+/// Case 8: with a deliberately slow `/editor-closed` endpoint wedged in front
+/// of the forwarding worker, the LSP still answers `shutdown` promptly —
+/// proving the HTTP never sits on the stdio dispatch path. If it did, the
+/// response could not arrive before the ~500 ms forwarding timeout.
+#[test]
+fn lsp_shutdown_stays_prompt_behind_slow_forward_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("slow.excalidraw");
+    std::fs::write(&file, BLANK_SCENE).unwrap();
+    let canonical = std::fs::canonicalize(&file).unwrap();
+    let lock = lock_path_for(&canonical);
+
+    let (slow_port, accepted) = slow_endpoint();
+    std::fs::write(&lock, slow_port.to_string()).unwrap();
+
+    let mut lsp = Lsp::spawn();
+    lsp.notify_document("textDocument/didClose", &file_uri(&file));
+
+    // The forward really was attempted and is now wedged on the endpoint.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while accepted.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "forwarder never contacted the slow endpoint"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let started = Instant::now();
+    let response = lsp.request("shutdown", "null");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        response["result"],
+        serde_json::Value::Null,
+        "shutdown must succeed: {response}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "shutdown took {elapsed:?} — the in-flight forward blocked the dispatch path"
+    );
+
+    let _ = std::fs::remove_file(&lock);
 }
 
 /// Walks `preview-binary/assets/fonts` and returns every embedded drawing-font
@@ -679,7 +1527,10 @@ fn embedded_assets_serve_index_bundle_and_drawing_fonts() {
         .filter_map(|(i, _)| index[i..].split(['"', '\'']).next())
     {
         let (status, body) = http_get(&preview.url(asset));
-        assert_eq!(status, 200, "bundle asset {asset} must serve (got {status})");
+        assert_eq!(
+            status, 200,
+            "bundle asset {asset} must serve (got {status})"
+        );
         assert!(!body.is_empty(), "bundle asset {asset} was empty");
     }
 
@@ -704,7 +1555,11 @@ fn embedded_assets_serve_index_bundle_and_drawing_fonts() {
             .timeout(Duration::from_secs(3))
             .send()
             .expect("font request failed");
-        assert_eq!(resp.status().as_u16(), 200, "font {route} must serve, not 404");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "font {route} must serve, not 404"
+        );
         let ct = resp
             .headers()
             .get("content-type")
