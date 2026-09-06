@@ -3,6 +3,7 @@ import { loadFromBlob } from "@excalidraw/excalidraw";
 import type { ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
 import App, { type SyncHooks } from "./App";
 import { svgBytesAreDarkMode } from "./color-mode";
+import { createReadonlyImageRefresher } from "./readonly-image";
 import { createAppSseHandler, createReadonlySseHandler } from "./sse-events";
 
 interface Config {
@@ -91,7 +92,7 @@ function renderReadonlyImage(
   const img = document.createElement("img");
   img.alt = "Excalidraw image preview (read-only)";
   img.style.cssText = "max-width:100%;max-height:100%;object-fit:contain;display:block;";
-  let currentUrl = URL.createObjectURL(new Blob([bytes], { type }));
+  const currentUrl = URL.createObjectURL(new Blob([bytes], { type }));
   img.src = currentUrl;
   wrap.appendChild(img);
   root.appendChild(wrap);
@@ -102,22 +103,24 @@ function renderReadonlyImage(
   banner.style.cssText = `position:fixed;top:0;left:0;right:0;padding:6px 12px;font:13px/1.4 system-ui,-apple-system,sans-serif;background:${dark ? "#3a3413" : "#fff8c5"};color:${dark ? "#e8d98a" : "#4d3800"};border-bottom:1px solid ${dark ? "#5c5320" : "#e6d27a"};z-index:10;`;
   document.body.appendChild(banner);
 
-  // Live-reload the image on external file changes.
+  // Live-reload the image on external file changes. The object-URL swap and
+  // failure handling live in `readonly-image.ts` (unit-tested; DOM injected).
+  const refresher = createReadonlyImageRefresher({
+    fetchBytes: async () => {
+      const res = await fetch(dataUrl);
+      return res.ok ? res.arrayBuffer() : null;
+    },
+    createObjectUrl: (blob) => URL.createObjectURL(blob),
+    revokeObjectUrl: (url) => URL.revokeObjectURL(url),
+    setSrc: (url) => {
+      img.src = url;
+    },
+    type,
+    initialUrl: currentUrl,
+  });
   const es = new EventSource(eventsUrl);
   const readonlyHandler = createReadonlySseHandler({
-    onReload: debounce(async () => {
-      try {
-        const res = await fetch(dataUrl);
-        if (!res.ok) return;
-        const next = await res.arrayBuffer();
-        const nextUrl = URL.createObjectURL(new Blob([next], { type }));
-        img.src = nextUrl;
-        URL.revokeObjectURL(currentUrl);
-        currentUrl = nextUrl;
-      } catch {
-        // transient fetch failure; keep showing the last good image
-      }
-    }, 150),
+    onReload: debounce(() => refresher.refresh(), 150),
   });
   es.onmessage = (event: MessageEvent<string>) => readonlyHandler(event.data);
 }

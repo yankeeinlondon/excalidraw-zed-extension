@@ -271,13 +271,23 @@ const WATCHER_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(5
 /// keeps the last good client state.
 const WATCHER_READ_BACKOFF_MS: [u64; 3] = [25, 50, 100];
 
+/// Capacity of the bounded channel between the notify callback and the watcher
+/// loop. Events beyond this are dropped, but the overflow flag guarantees at
+/// least one reconcile after any drop.
+const WATCHER_QUEUE_CAPACITY: usize = 256;
+
 /// Everything the watcher reconciliation loop needs: the canonical file being
-/// watched, the channel reload events are broadcast on, and the revision of
-/// the most recent successful viewer write (used to prove echoes).
+/// watched, the channel reload events are broadcast on, the revision of the
+/// most recent successful viewer write (used to prove echoes), and an overflow
+/// flag set when the notify callback's channel is full.
 struct WatcherContext {
     file_path: PathBuf,
     broadcast_tx: broadcast::Sender<PreviewEvent>,
     last_written_revision: Arc<RwLock<Option<String>>>,
+    /// Set by the notify callback when `try_send` returns `Full`; reset by the
+    /// watcher loop after a forced reconcile. Ensures no event is dropped without
+    /// triggering a reload.
+    overflow: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Whether a filesystem event kind can change the bytes the viewer would read:
@@ -320,10 +330,24 @@ fn event_concerns_target(event: &notify::Event, target: &Path) -> bool {
 /// is in progress queue up in the channel and open a fresh burst, so no event
 /// — in particular not the final one of a write burst — is ever dropped.
 ///
+/// The channel is bounded ([`WATCHER_QUEUE_CAPACITY`]); events dropped when
+/// the queue is full set the overflow flag, which forces a reconcile on the
+/// next iteration. This is correct because reconciliation is hint-driven: an
+/// overflow guarantees at least one reconcile after any drop.
+///
 /// The loop performs no HTTP and never panics: channel sends and lock reads
 /// are all fallible-and-ignored, and the thread lives until the process exits.
 fn run_watcher_loop(rx: std::sync::mpsc::Receiver<notify::Event>, ctx: WatcherContext) {
     while let Ok(first) = rx.recv() {
+        // If the overflow flag is set, reconcile immediately (a dropped event
+        // occurred) and reset the flag, then continue to process the current event.
+        if ctx
+            .overflow
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            reconcile_disk_state(&ctx);
+        }
+
         if !event_concerns_target(&first, &ctx.file_path) {
             continue;
         }
@@ -352,6 +376,15 @@ fn run_watcher_loop(rx: std::sync::mpsc::Receiver<notify::Event>, ctx: WatcherCo
             }
         }
         reconcile_disk_state(&ctx);
+
+        // After draining a burst, check overflow again in case it was set
+        // during the reconcile.
+        if ctx
+            .overflow
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            reconcile_disk_state(&ctx);
+        }
     }
 }
 
@@ -588,19 +621,29 @@ fn main() -> Result<()> {
         .route("/assets/{*path}", get(serve_assets))
         .with_state(state.clone());
 
-    // Spawn the file watcher — uses a std::sync::mpsc channel so no nested async runtime is needed.
+    // Spawn the file watcher — uses a bounded std::sync::mpsc channel so no nested async runtime is needed.
     //
     // The watch is registered on the file's *parent* directory (non-recursive)
     // and events are filtered to the canonical target path inside
     // `run_watcher_loop`: a watch on the file itself follows the original
     // inode and cannot observe atomic replacement (temp file + rename) or
     // delete/recreate.
+    //
+    // The channel is bounded (WATCHER_QUEUE_CAPACITY); the overflow flag ensures
+    // that any dropped event still triggers a reconcile.
     let watcher_broadcast = broadcast_tx.clone();
-    let (watcher_event_tx, watcher_event_rx) = std::sync::mpsc::channel();
+    let watcher_overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let overflow_flag = watcher_overflow.clone();
+    let (watcher_event_tx, watcher_event_rx) =
+        std::sync::mpsc::sync_channel(WATCHER_QUEUE_CAPACITY);
     let mut fs_watcher = RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
-                let _ = watcher_event_tx.send(event);
+                if watcher_event_tx.try_send(event).is_err() {
+                    // Queue full — set the overflow flag so the loop reconciles
+                    // even though this event was dropped.
+                    overflow_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         },
         Config::default(),
@@ -620,6 +663,7 @@ fn main() -> Result<()> {
         file_path: canonical_path.clone(),
         broadcast_tx: watcher_broadcast,
         last_written_revision: state.last_written_revision.clone(),
+        overflow: watcher_overflow,
     };
     std::thread::spawn(move || {
         // Keep `fs_watcher` alive for the duration of this thread.
@@ -1091,20 +1135,34 @@ async fn receive_data(
         .into_response()
 }
 
+/// Reads the next SSE payload from a broadcast receiver, mapping recv outcomes
+/// to the data strings the WebView dispatches on.
+///
+/// ## Returns
+///
+/// - `Some("reload" | "library" | "editor-closed")` for successful events.
+/// - `Some("reload")` on `Lagged` — an invalidation hint is idempotent (a clean
+///   client no-ops on a known revision), so this ensures a missed event cannot
+///   leave the view silently stale.
+/// - `None` on `Closed`.
+async fn next_sse_payload(rx: &mut broadcast::Receiver<PreviewEvent>) -> Option<String> {
+    match rx.recv().await {
+        Ok(event) => Some(event.as_sse_data().to_string()),
+        Err(broadcast::error::RecvError::Closed) => None,
+        Err(broadcast::error::RecvError::Lagged(_)) => {
+            Some(PreviewEvent::Reload.as_sse_data().to_string())
+        }
+    }
+}
+
 async fn serve_events(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     use axum::response::sse::{Event, Sse};
 
     let mut rx = state.broadcast_tx.subscribe();
 
     let stream = async_stream::stream! {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    yield Ok::<Event, Infallible>(Event::default().data(event.as_sse_data()))
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            }
+        while let Some(data) = next_sse_payload(&mut rx).await {
+            yield Ok::<Event, Infallible>(Event::default().data(data));
         }
     };
 
@@ -3319,7 +3377,7 @@ fn run_lsp_server() -> Result<()> {
                                 "save": true
                             }
                         },
-                        "serverInfo": { "name": "excalidraw-preview", "version": "0.1.0" }
+                        "serverInfo": { "name": "excalidraw-preview", "version": env!("CARGO_PKG_VERSION") }
                     }
                 });
                 lsp_send(&mut writer, &response)?;
@@ -3485,12 +3543,16 @@ fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
 /// Whether `path` is a file the preview actually handles: `.excalidraw`,
 /// `.excalidraw.svg`, or `.excalidraw.png`.
 ///
-/// The language server is attached to the "Excalidraw" language (path suffixes
-/// `excalidraw`, `excalidraw.svg`, `excalidraw.png`), but Zed's suffix matching
-/// also fires the server for plain `.svg`/`.png` files. Gating `didOpen`/`didSave`
-/// on this keeps a plain image from spawning a preview that can only fail — a
-/// plain `.svg`/`.png` has no embedded Excalidraw scene and is MIME-detected as
-/// JSON, so every format fallback errors out ("all format fallbacks failed").
+/// The language server is attached to two languages: the `Excalidraw` language
+/// (single-segment suffix `excalidraw`) and a grammar-less `SVG` language (suffix
+/// `svg`). Zed 1.18 never routes `didOpen` for compound suffixes, so the workaround
+/// claims the single-segment base `svg` and guards here — every plain `.svg` buffer
+/// attaches the server, and this filter makes those an idle no-op. A plain `.svg`
+/// is detected as `image/svg+xml`, has no embedded Excalidraw scene, and every format
+/// fallback would fail ("all format fallbacks failed"), so gating `didOpen`/`didSave`
+/// on this keeps plain images from spawning a doomed preview. Plain `.png` never
+/// reaches the LSP (Zed's image pane claims it before any buffer exists), so
+/// `.excalidraw.png` is CLI-only; the guard still includes it for the CLI/`didSave` paths.
 fn is_excalidraw_path(path: &std::path::Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -3802,6 +3864,33 @@ mod tests {
         assert_eq!(PreviewEvent::Reload.as_sse_data(), "reload");
         assert_eq!(PreviewEvent::Library.as_sse_data(), "library");
         assert_eq!(PreviewEvent::EditorClosed.as_sse_data(), "editor-closed");
+    }
+
+    #[tokio::test]
+    async fn test_next_sse_payload_yields_reload_on_lag() {
+        let (tx, mut rx) = broadcast::channel::<PreviewEvent>(16);
+
+        // Fill the channel beyond capacity without receiving — the 17th send
+        // completes (the channel discards the oldest event), but the receiver
+        // is now 16 events behind and the next recv will yield `Lagged`.
+        for _ in 0..17 {
+            let _ = tx.send(PreviewEvent::Library);
+        }
+
+        // The lag hint is "reload" (an invalidation; idempotent).
+        let payload = next_sse_payload(&mut rx).await;
+        assert_eq!(payload, Some("reload".to_string()), "lag must yield reload");
+
+        // Surviving events (the most recent 16 Library frames) can still be received.
+        let next = next_sse_payload(&mut rx).await;
+        assert_eq!(next, Some("library".to_string()));
+
+        // Once the channel is drained, `Closed` yields None.
+        drop(tx);
+        for _ in 0..15 {
+            let _ = next_sse_payload(&mut rx).await;
+        }
+        assert_eq!(next_sse_payload(&mut rx).await, None, "Closed → None");
     }
 
     #[test]
@@ -4231,6 +4320,50 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(windows)]
+    // Restoring a test fixture is not a security decision, so the lint is safe to disable.
+    #[allow(clippy::permissions_set_readonly_false)]
+    async fn test_post_data_write_failure_is_500_and_last_written_revision_unchanged() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"original").unwrap();
+
+        // Make the file read-only via Windows permissions.
+        let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(tmp.path(), perms).unwrap();
+
+        // Skip when this environment bypasses file permissions (e.g. admin):
+        // the failure path then cannot be exercised at all.
+        if std::fs::write(tmp.path(), b"probe").is_ok() {
+            // Restore writability before returning so cleanup can succeed.
+            let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+            perms.set_readonly(false);
+            std::fs::set_permissions(tmp.path(), perms).unwrap();
+            return;
+        }
+
+        let state = make_state(tmp.path(), "application/json");
+        let app = data_app(state.clone());
+
+        let (_, etag, _) = get_data(&app).await;
+        let response = app
+            .clone()
+            .oneshot(post_data(etag.as_deref(), b"doomed-write".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"original");
+        // A failed write must not advance the echo-suppression baseline.
+        assert!(state.last_written_revision.read().unwrap().is_none());
+
+        // Restore writability before the NamedTempFile drops, otherwise deletion
+        // of a read-only file fails on Windows.
+        let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(tmp.path(), perms).unwrap();
+    }
+
+    #[tokio::test]
     async fn test_post_data_round_trip_all_three_formats() {
         let cases: &[(&str, &[u8], &[u8])] = &[
             (
@@ -4438,6 +4571,7 @@ mod tests {
                 file_path: file.to_path_buf(),
                 broadcast_tx,
                 last_written_revision: Arc::new(RwLock::new(None)),
+                overflow: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             rx,
         )
@@ -4630,6 +4764,58 @@ mod tests {
         assert!(
             second_at - first_at <= WATCHER_MAX_WAIT + Duration::from_millis(250),
             "second forced reconcile came too late: {second_at:?} after {first_at:?}"
+        );
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_watcher_overflow_flag_forces_reconcile() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"overflow").unwrap();
+        let (ctx, mut rx) = watcher_ctx(tmp.path());
+
+        // Create a small bounded channel that can be easily filled.
+        let (tx, watcher_rx) = std::sync::mpsc::sync_channel::<notify::Event>(4);
+        let handle = std::thread::spawn({
+            let ctx = WatcherContext {
+                file_path: ctx.file_path.clone(),
+                broadcast_tx: ctx.broadcast_tx.clone(),
+                last_written_revision: ctx.last_written_revision.clone(),
+                overflow: ctx.overflow.clone(),
+            };
+            move || run_watcher_loop(watcher_rx, ctx)
+        });
+
+        // Fill the channel beyond capacity with non-matching events (so the loop
+        // never drains them) and simulate the overflow flag being set.
+        let sibling = tmp.path().with_extension("sibling");
+        let sibling_event =
+            |p: &Path| fs_event(notify::EventKind::Modify(notify::event::ModifyKind::Any), p);
+        for _ in 0..5 {
+            let _ = tx.try_send(sibling_event(&sibling));
+        }
+        ctx.overflow
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Wake the loop with another NON-matching event. No event for the
+        // target was ever queued, so the only thing that can produce a reload
+        // here is the overflow flag forcing a reconcile.
+        tx.send(sibling_event(&sibling)).unwrap();
+
+        let event = recv_broadcast_timeout(&mut rx, Duration::from_secs(2))
+            .expect("overflow flag must force a reload");
+        assert_eq!(
+            event,
+            PreviewEvent::Reload,
+            "overflow must trigger a reconcile"
+        );
+        // The flag is consumed: a further non-matching event reconciles nothing.
+        tx.send(sibling_event(&sibling)).unwrap();
+        assert!(
+            recv_broadcast_timeout(&mut rx, Duration::from_millis(300)).is_none(),
+            "a consumed overflow flag must not keep forcing reconciles"
         );
 
         drop(tx);

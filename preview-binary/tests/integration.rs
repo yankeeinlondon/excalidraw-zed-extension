@@ -733,6 +733,18 @@ fn lsp_initialize_advertises_save_capability() {
     assert_eq!(sync["openClose"], serde_json::Value::Bool(true));
     assert_eq!(sync["save"], serde_json::Value::Bool(true));
 
+    // serverInfo must reflect the crate version, not a hardcoded string.
+    let server_info = &json["result"]["serverInfo"];
+    assert_eq!(
+        server_info["name"],
+        serde_json::Value::String("excalidraw-preview".to_string())
+    );
+    assert_eq!(
+        server_info["version"],
+        serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+        "serverInfo.version must match CARGO_PKG_VERSION"
+    );
+
     // Tell the server to exit, then reap it.
     let exit = r#"{"jsonrpc":"2.0","method":"exit"}"#;
     let _ = write!(stdin, "Content-Length: {}\r\n\r\n{}", exit.len(), exit);
@@ -1328,15 +1340,25 @@ fn lsp_did_close_forwards_editor_closed_to_live_preview() {
         "didClose must surface as exactly one editor-closed SSE frame"
     );
 
-    // The preview survives the signal.
+    // No spurious duplicate frames for one close.
+    assert!(
+        lines.recv_timeout(Duration::from_millis(400)).is_err(),
+        "spurious duplicate editor-closed frames must not arrive for one close"
+    );
+
+    // Sequential closes each produce a frame (not deduplicated).
+    lsp.notify_document("textDocument/didClose", &file_uri(&file));
+    let second_frame = expect_sse(&lines, "editor-closed");
+    assert_eq!(
+        second_frame, "data: editor-closed",
+        "sequential didClose must each produce a frame"
+    );
+
+    // The preview survives both signals.
     let (status, body) = http_get(&format!("http://127.0.0.1:{port}/ping"));
     assert_eq!((status, body.as_str()), (200, "OK"));
     assert!(lock.exists(), "lock file must survive didClose");
-    // Duplicate closes coalesce — the frame was delivered exactly once.
-    assert!(
-        lines.recv_timeout(Duration::from_millis(400)).is_err(),
-        "duplicate editor-closed frames must not arrive for one close"
-    );
+
     // And the LSP dispatch loop is unharmed.
     lsp.assert_responsive();
 
