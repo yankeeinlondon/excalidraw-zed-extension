@@ -220,10 +220,13 @@ attention signal:
 2. **Coalescing unit.** The queue dedupes by **canonical** path
    (`enqueue_closed_path` canonicalizes in the worker, so differently-spelled
    URIs of one file coalesce and a deleted file — whose canonicalize fails —
-   is dropped: no lock identity, no forward). Cap 16, drop-oldest. Duplicate
-   closes arriving while a forward is in flight are re-coalesced afterwards,
-   which is what the "exactly one SSE frame per close, none for a duplicate"
-   integration assertion pins.
+   is dropped: no lock identity, no forward). Cap 16, drop-oldest. Closes that
+   arrive while a forward is in flight (or are queued) coalesce, which is pinned
+   by the `enqueue_closed_path` unit test; the integration test pins that one
+   close yields exactly one SSE frame with no spurious duplicates and that
+   sequential closes (with an empty queue between) each produce a frame.
+   Client-side, duplicate escalations never stack prompts (modal dedupe is
+   revision-based, covered by vitest).
 3. **Lock neutrality.** `forward_editor_closed` only *reads* the lock file
    (port lookup identical to `preview_is_live`); it never removes or rewrites
    a stale lock — lock lifecycle belongs solely to the preview process.
@@ -483,3 +486,65 @@ Decided/verified 2026-09-05 (Phase 9 of 9):
    script's `/shutdown` hit the dying parent); stopped gracefully via its live
    `/shutdown`, lock removed by the binary itself — measurement-script user
    error, not a product defect.
+
+## D14 — Review 1 follow-ups (findings 2–8 implemented; finding 1 left open)
+
+Decided/verified 2026-09-06, responding to `review-1.md`. Finding 1 (the
+real-Zed acceptance BLOCKER) is a process gate, not a code change, and remains
+open exactly as `acceptance-checklist.md` records it.
+
+1. **Finding 2 — broadcast lag now yields a `reload` hint.** `serve_events`
+   loops over a new `next_sse_payload(rx)` helper that maps
+   `RecvError::Lagged` to `PreviewEvent::Reload.as_sse_data()` instead of
+   `continue`. A reload is an idempotent invalidation hint (a clean client
+   no-ops on a known revision), so a lagged subscriber reconciles instead of
+   going silently stale — the literal spec §5 wording. Pinned by
+   `test_next_sse_payload_yields_reload_on_lag` (17 sends into the 16-slot
+   channel → first payload is `reload`, survivors follow, `Closed` → `None`).
+2. **Finding 3 — `is_excalidraw_path` doc rewritten** to describe the shipped
+   model (`Excalidraw`/`excalidraw` + grammar-less `SVG`/`svg`, plain `.svg`
+   detected as `image/svg+xml`, plain `.png` never reaching the LSP,
+   `.excalidraw.png` CLI-only) instead of the removed compound-suffix
+   registration.
+3. **Finding 4 — `serverInfo.version` is `env!("CARGO_PKG_VERSION")`**;
+   `lsp_initialize_advertises_save_capability` now asserts name + version so
+   it cannot drift again.
+4. **Finding 5 — didClose wire behavior pinned as it actually is.** The
+   integration test now sends a *second* sequential `didClose` and asserts a
+   second `editor-closed` frame (plus liveness after both). Rapid duplicates
+   cannot be pinned deterministically end-to-end (the worker may dequeue the
+   first before the second lands), so queued-duplicate coalescing stays pinned
+   by the `enqueue_closed_path` unit test; D9.2's wording was softened to
+   match. Client-side prompt dedupe remains revision-based (vitest).
+5. **Finding 6 — Windows twin of the 500 write-failure test** using
+   `Permissions::set_readonly(true)` with the same root/admin-bypass probe and
+   assertions; writability is restored before the `NamedTempFile` drops
+   (Windows cannot delete a read-only file). `#[allow(clippy::permissions_set_readonly_false)]`
+   is scoped to that test with a justification. **Not executed here**: a
+   `cargo check --tests --target x86_64-pc-windows-msvc` cross-check failed in
+   the transitive `aws-lc-sys` C build (jitterentropy sources need a Windows C
+   toolchain), unrelated to the test; it runs for real only on a Windows host
+   (milestone M7).
+6. **Finding 7 — bounded notify→watcher queue with an overflow flag.**
+   `sync_channel(WATCHER_QUEUE_CAPACITY = 256)` + `try_send`; a `Full` result
+   sets `WatcherContext::overflow`, which `run_watcher_loop` swaps-and-clears
+   at the top of each iteration and after each burst, forcing a
+   `reconcile_disk_state`. Drop-on-full alone would be *incorrect* (the
+   dropped event could be the last hint of a change); the flag is what makes
+   it safe, and because the flag can only be set while the queue is full the
+   loop is guaranteed to observe it on a subsequent iteration.
+   `test_watcher_overflow_flag_forces_reconcile` proves a reload with **no**
+   target event ever queued, and that the consumed flag does not keep firing.
+7. **Finding 8 — read-only image reload is unit-tested.** The refetch /
+   object-URL swap / revoke-previous / keep-last-good-on-failure logic moved
+   verbatim into `readonly-image.ts` (`createReadonlyImageRefresher`, all I/O
+   injected, node vitest environment) with 7 tests; `main.tsx` keeps the
+   150 ms debounce and `createReadonlySseHandler` dispatch unchanged.
+8. **Gates after the changes**: `just ui` → `just build` (bundle rebuilt and
+   embedded; note `preview-binary/assets/` is gitignored, so it never shows
+   in `git status`); `just test` → nextest **118 passed / 1 skipped** (the
+   display-gated smoke; one "leaky" annotation, the known D12 heuristic),
+   typecheck clean, vitest **144 passed**; `cargo clippy --workspace
+   --all-targets -- -D warnings` and `cargo fmt --check` clean. Nothing
+   committed (commit remains a separate step); finding 1 still gates
+   `ready: true`.

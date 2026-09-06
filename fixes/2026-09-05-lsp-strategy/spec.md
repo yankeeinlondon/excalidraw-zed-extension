@@ -2,6 +2,7 @@
 reviewed: true
 reviewed_by: "codex/default"
 reviewed_on: "2026-09-05"
+review_iterations: 1
 ---
 
 # Spec: LSP event strategy & language restructure

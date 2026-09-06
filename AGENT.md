@@ -205,7 +205,10 @@ Additional flags:
    delete/recreate observable. Events coalesce with **trailing reconciliation**:
    ~80 ms of quiet restarts on each matching event, with a ~500 ms forced
    reconcile from the burst's first event, so the final event of a write burst
-   is never dropped. On reconcile, the disk revision is compared against
+   is never dropped. The notify callback uses a **bounded channel** (capacity 256)
+   with `try_send`; when the queue is full, the dropped event sets an overflow flag
+   that forces a reconcile on the next loop iteration, so any drop still triggers
+   a reload. On reconcile, the disk revision is compared against
    `last_written_revision` (our own echo → suppressed) and anything else
    broadcasts `Reload`; transient read errors retry with bounded backoff
    (25/50/100 ms) and never blank the scene; deletion broadcasts immediately.
