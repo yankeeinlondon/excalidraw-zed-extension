@@ -10,6 +10,7 @@ import type {
 } from "@excalidraw/excalidraw/types";
 import type { ExcalidrawElement } from "@excalidraw/excalidraw/element/types";
 import { computeSceneHash, pickPersistedAppState } from "./scene-fingerprint";
+import { dedupeLibraryItems } from "./library-merge";
 
 /** What the caller should do with dirty state once a `POST /data` resolves. */
 export interface SaveDecision {
@@ -193,6 +194,12 @@ export function flushPendingLibrary(
  * retried by a later flush rather than acknowledged and lost (review 6,
  * finding 1).
  *
+ * The body passes through `dedupeLibraryItems` (D3's choke point) so **every
+ * payload this app persists satisfies the unique-id invariant**, whatever the
+ * calling flow handed in — panel edits, install echoes, or close/unmount
+ * flushes. An already-clean set is serialized byte-identically (the dedupe
+ * returns it untouched).
+ *
  * Extracted (and parameterised on `fetchFn`) so the failure paths are unit
  * testable without a DOM or a live server.
  *
@@ -212,7 +219,7 @@ export async function persistLibraryItems(
       body: JSON.stringify({
         type: "excalidrawlib",
         version: 2,
-        libraryItems: items,
+        libraryItems: dedupeLibraryItems(items),
       }),
     });
     if (res.ok) {
