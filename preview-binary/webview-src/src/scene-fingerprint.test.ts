@@ -118,6 +118,7 @@ describe("pickPersistedAppState", () => {
         viewBackgroundColor: "#abcdef",
         gridSize: 20,
         exportScale: 2,
+        exportWithDarkMode: true,
         // none of these are persisted — must not leak into the reload patch:
         scrollX: 999,
         scrollY: -12,
@@ -131,6 +132,10 @@ describe("pickPersistedAppState", () => {
       viewBackgroundColor: "#abcdef",
       gridSize: 20,
       exportScale: 2,
+      // The document color mode travels with an external reload's appState —
+      // with D1's load-side repair a key-carrying file's mode re-themes the
+      // live editor through exactly this path.
+      exportWithDarkMode: true,
     });
   });
 

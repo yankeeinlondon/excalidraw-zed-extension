@@ -1,5 +1,6 @@
-import { exportToSvg, exportToBlob, serializeAsJSON } from "@excalidraw/excalidraw";
+import { exportToSvg, exportToBlob } from "@excalidraw/excalidraw";
 import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
+import { serializeSceneForDisk } from "./serialize-scene";
 
 export type ExportKind = "png" | "png2x" | "svg" | "svg-scene" | "scene";
 
@@ -68,7 +69,10 @@ async function buildExportPayload(
       return { body: await blob.arrayBuffer(), mime: "image/png" };
     }
     case "scene":
-      return { body: serializeAsJSON(elements, appState, files, "local"), mime: "application/json" };
+      // serializeSceneForDisk injects appState.exportWithDarkMode back into the
+      // serialized body (D1): upstream strips the key, and a plain `.excalidraw`
+      // export must carry the document's color mode like every other save.
+      return { body: serializeSceneForDisk(elements, appState, files), mime: "application/json" };
   }
 }
 

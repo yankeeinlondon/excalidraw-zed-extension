@@ -714,3 +714,51 @@ describe("AutoSaveScheduler", () => {
     expect(saves).toEqual(["autosave"]);
   });
 });
+
+describe("color-mode toggle dirty pin (D1 regression guard)", () => {
+  // Pins the existing behavior the D1 save injection relies on: because
+  // `exportWithDarkMode` is a fingerprinted appState key, toggling the
+  // document color mode is a real edit (marks the scene dirty), and a
+  // successful save of the toggled scene clears it. Hashes are computed with
+  // the real fingerprint (hashElementsVersion stubbed to element count, per
+  // this file's mock).
+  const files = {} as BinaryFiles;
+  const elements = [] as readonly ExcalidrawElement[];
+  const lightAppState = { viewBackgroundColor: "#ffffff", exportWithDarkMode: false } as Partial<ExcalidrawAppState>;
+  const darkAppState = { viewBackgroundColor: "#ffffff", exportWithDarkMode: true } as Partial<ExcalidrawAppState>;
+
+  it("toggling exportWithDarkMode changes the scene hash (a dirtying edit)", () => {
+    const light = computeSceneHash(elements, lightAppState, files);
+    const dark = computeSceneHash(elements, darkAppState, files);
+    expect(dark).not.toBe(light);
+  });
+
+  it("a save started before the toggle does not clear the toggled scene's dirty state", () => {
+    const light = computeSceneHash(elements, lightAppState, files);
+    const dark = computeSceneHash(elements, darkAppState, files);
+    // The save POST resolved after the toggle landed: the live scene (dark) no
+    // longer matches the saved snapshot (light) — stay dirty, reschedule.
+    const decision = decideSaveOutcome({
+      savedHash: light,
+      currentHash: dark,
+      autoSave: true,
+      mySeq: 1,
+      lastCompletedSeq: 0,
+    });
+    expect(decision.clearDirty).toBe(false);
+    expect(decision.rescheduleSave).toBe(true);
+  });
+
+  it("a successful save of the toggled scene clears the dirty flag", () => {
+    const dark = computeSceneHash(elements, darkAppState, files);
+    const decision = decideSaveOutcome({
+      savedHash: dark,
+      currentHash: dark,
+      autoSave: true,
+      mySeq: 1,
+      lastCompletedSeq: 0,
+    });
+    expect(decision.clearDirty).toBe(true);
+    expect(decision.isClean).toBe(true);
+  });
+});
