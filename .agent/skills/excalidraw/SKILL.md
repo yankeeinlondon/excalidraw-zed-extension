@@ -1,4 +1,6 @@
 ---
+name: excalidraw
+description: provides rich details into the functionality, technical architecture, file structure, export formats, clipboard functionality, element properties, and version history for Excalidraw.
 prompt: |-
     Do deep research into the [Excalidraw](https://docs.excalidraw.com/) drawing solution.
 
