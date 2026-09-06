@@ -1,6 +1,17 @@
-binary  := "excalidraw-preview"
+bold := '\033[1m'
+dim := '\033[2m'
+reset := '\033[0m'
+italic := '\033[3m'
+red := '\033[31m'
+green := '\033[32m'
+yellow := '\033[33m'
+blue := '\033[34m'
+magenta := '\033[35m'
+underline := '\033[4m'
+
+binary := "excalidraw-preview"
 release := "target/release/" + binary
-debug   := "target/debug/" + binary
+debug := "target/debug/" + binary
 webview := justfile_directory() / "preview-binary/webview-src"
 dev_file := env_var_or_default("DEV_FILE", "preview-binary/test.excalidraw")
 
@@ -30,7 +41,7 @@ commit:
 
 # Build the webview (npm install + vite build → assets/)
 ui:
-    cd {{webview}} && npm install && npm run build
+    cd {{ webview }} && npm install && npm run build
 
 # Full release: UI + binary + extension WASM. `build` already depends on `ui`
 # (just runs each dependency once per invocation), so listing it here would be
@@ -51,7 +62,7 @@ bump version:
     green=$(tput setaf 2 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
     die() { echo "${red}✗ $1${reset}" >&2; exit 1; }
 
-    version="{{version}}"
+    version="{{ version }}"
     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || die "'$version' is not a valid version (expected X.Y.Z)"
 
     # A release commit must contain *only* the version bump, so require a clean tree.
@@ -166,7 +177,7 @@ install-locally:
 
     step "Building the webview UI + release binary (npm install + vite build, then cargo)"
     just build
-    ok "UI built → preview-binary/assets/ and binary built → {{release}}"
+    ok "UI built → preview-binary/assets/ and binary built → {{ release }}"
 
     step "Linking the binary onto your PATH"
     just symlink
@@ -192,7 +203,30 @@ feature name:
 # Run all tests (nextest + webview typecheck + vitest)
 test:
     cargo nextest run
-    cd {{webview}} && npm run typecheck && npm test --if-present
+    cd {{ webview }} && npm run typecheck && npm test --if-present
+
+lint:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    SECONDS=0
+
+    echo
+    echo -e "Linting "
+    echo
+
+    exit_code=0
+    cargo clippy --all-targets -- -D warnings || exit_code=$?
+
+    duration=$SECONDS
+    commit_hash=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+
+
+    if [[ $exit_code -ne 0 ]]; then
+        just _speak "The are failing lints in excalidraw zed extension"
+        echo -e "\n❌ There are failing lints!"
+        exit 1
+    fi
 
 # Automated real-WebView self-test: opens a window, drives the native↔JS bridge
 # (save + close-interception query) and external-link routing, prints a PASS/FAIL
@@ -201,31 +235,36 @@ test:
 smoke: build-debug
     #!/usr/bin/env bash
     set -euo pipefail
-    file="$(mktemp -t excalidraw-smoke).excalidraw"
+    # mktemp creates the bare file; rename it so the trap's `rm -f "$file"`
+    # removes the only artifact (appending a suffix to $(mktemp …) would leak
+    # the bare file in $TMPDIR forever).
+    tmp="$(mktemp -t excalidraw-smoke)"
+    file="${tmp}.excalidraw"
+    mv "$tmp" "$file"
     printf '{"type":"excalidraw","version":2,"source":"smoke","elements":[],"appState":{"viewBackgroundColor":"#ffffff"},"files":{}}' > "$file"
     trap 'rm -f "$file"' EXIT
-    {{debug}} "$file" --smoke
+    {{ debug }} "$file" --smoke
 
 # Symlink ~/.local/bin/excalidraw-preview → target/release (one-time setup)
 symlink:
-    mkdir -p {{home_directory()}}/.local/bin
-    ln -sf {{justfile_directory()}}/{{release}} {{home_directory()}}/.local/bin/{{binary}}
-    @echo "Symlinked ~/.local/bin/{{binary}} → {{justfile_directory()}}/{{release}}"
+    mkdir -p {{ home_directory() }}/.local/bin
+    ln -sf {{ justfile_directory() }}/{{ release }} {{ home_directory() }}/.local/bin/{{ binary }}
+    @echo "Symlinked ~/.local/bin/{{ binary }} → {{ justfile_directory() }}/{{ release }}"
 
 # Start Vite dev server (set DEV_FILE=path/to/file.excalidraw to change target)
 dev-ui:
-    cd {{webview}} && DEV_FILE={{justfile_directory()}}/{{dev_file}} npm run dev
+    cd {{ webview }} && DEV_FILE={{ justfile_directory() }}/{{ dev_file }} npm run dev
 
 # Open WebView pointed at the Vite dev server (run `just dev-ui` first)
 dev-window:
-    GDK_BACKEND=wayland {{debug}} --dev
+    GDK_BACKEND=wayland {{ debug }} --dev
 
 # Full dev mode: Vite server + WebView in parallel
 dev: build-debug
     #!/usr/bin/env bash
     trap 'kill 0' INT
     just dev-ui &
-    sleep 2 && GDK_BACKEND=wayland {{debug}} --dev
+    sleep 2 && GDK_BACKEND=wayland {{ debug }} --dev
     wait
 
 # Clean build artifacts (keeps assets/ so the extension still works)
@@ -238,3 +277,7 @@ _choose_feature_or_fix feat="":
     set -euo pipefail
     file="$(fd -g '*{spec,design}*\.md' --exclude '_completed' | {{ if feat == "" { "cat" } else { "rg " + feat } }} |  fzf --height=15 --border --border-label 'Choose a spec or design file')"
     echo "${file}"
+
+# Run `just _colors` if you want to exercise this (it does nothing).
+_colors:
+    @: {{ bold }} {{ italic }} {{ reset }} {{ red }} {{ green }} {{ yellow }} {{ blue }} {{ magenta }}  {{ dim }} {{ underline }} >/dev/null || true
