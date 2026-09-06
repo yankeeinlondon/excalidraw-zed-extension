@@ -35,18 +35,16 @@ success:
                 staging all files from phase **#{{phase}}** in preparation for the git commit:
 
                 {{ as_unordered_list(ctx.dirty_files) }}
-            - shell: git add ..
+            - shell: git add .
             - shell: just commit
-            - shell: gitnexus analyze --force
         - when: "ctx.dirty_files && commit_message"
           action:
             - message: |-
                 staging all files from phase **#{{phase}}** in preparation for the git commit:
 
                 {{ as_unordered_list(ctx.dirty_files) }}
-            - shell: git add ..
+            - shell: git add .
             - shell: git commit -m "{{commit_message}}"
-            - shell: gitnexus analyze --force
         - when: "!ctx.dirty_files"
           action:
               - message: phase {{phase}} of the plan made no file changes!
@@ -151,7 +149,7 @@ You are done when:
 **IMPORTANT:** 
 
 ::block when="area"
-- use the '{{area}}' skill during the implementation
+- use the '{{ctx.area}}' skill during the implementation
 ::block when="phase == total_phases"
 - do NOT move the spec directory into the `_completed` folder when the final phase is complete (that is done as a separate step which you are not responsible for)
 ::end-block
