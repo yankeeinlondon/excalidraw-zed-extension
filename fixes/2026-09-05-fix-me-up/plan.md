@@ -1,9 +1,49 @@
 ---
 total_phases: 9
 created: 2026-09-06
-phase: 4
+phase: 9
 agent: "opencode/zai-coding-plan/glm-5.3"
 yolo: "true"
+source_code:
+  - preview-binary/src/main.rs
+  - preview-binary/tests/integration.rs
+  - preview-binary/webview-src/src/App.tsx
+  - preview-binary/webview-src/src/color-mode.ts
+  - preview-binary/webview-src/src/color-mode.test.ts
+  - preview-binary/webview-src/src/color-mode-vendored.test.ts
+  - preview-binary/webview-src/src/dirty-state.ts
+  - preview-binary/webview-src/src/dirty-state.test.ts
+  - preview-binary/webview-src/src/export.ts
+  - preview-binary/webview-src/src/export.test.ts
+  - preview-binary/webview-src/src/fixtures/corrupted-library.excalidrawlib
+  - preview-binary/webview-src/src/library-merge.ts
+  - preview-binary/webview-src/src/library-merge.test.ts
+  - preview-binary/webview-src/src/library-vendored.test.ts
+  - preview-binary/webview-src/src/main.tsx
+  - preview-binary/webview-src/src/native-bridge.ts
+  - preview-binary/webview-src/src/save-notice.ts
+  - preview-binary/webview-src/src/save-notice.test.ts
+  - preview-binary/webview-src/src/scene-fingerprint.test.ts
+  - preview-binary/webview-src/src/serialize-scene.ts
+  - preview-binary/webview-src/src/serialize-scene.test.ts
+  - preview-binary/webview-src/src/vendored-chunk.d.ts
+  - preview-binary/webview-src/tsconfig.json
+  - preview-binary/webview-src/vitest.config.ts
+documentation:
+  - AGENT.md
+  - docs/handling-excalidraw-files.md
+  - fixes/2026-09-05-fix-me-up/spec.md
+  - fixes/2026-09-05-fix-me-up/plan.md
+  - fixes/2026-09-05-fix-me-up/decision-log.md
+  - fixes/2026-09-05-fix-me-up/acceptance-checklist.md
+  - fixes/2026-09-05-fix-me-up/library-repro-appendix.md
+  - fixes/2026-09-05-fix-me-up/cmd-s-triage.md
+  - fixes/2026-09-05-fix-me-up/review-1.md
+  - fixes/2026-09-05-fix-me-up/evidence/trackc-excalidraw-com/excalidraw-com-preverify.mjs
+  - fixes/2026-09-05-fix-me-up/evidence/trackc-excalidraw-com/results.json
+  - fixes/2026-09-05-fix-me-up/evidence/phase7-library-precondition/twin-library.py
+  - fixes/2026-09-05-fix-me-up/evidence/phase8-windows-host/reachability.md
+  - fixes/2026-09-05-fix-me-up/evidence/phase8-windows-host/win-preflight.sh
 source_files_during_phase_1: []
 docs_updated_during_phase_1: []
 docs_created_during_phase_1:
@@ -54,6 +94,69 @@ docs_updated_during_phase_4:
   - fixes/2026-09-05-fix-me-up/acceptance-checklist.md
 docs_created_during_phase_4: []
 skills_files_updated_during_phase_4: []
+source_files_during_phase_5:
+  - preview-binary/src/main.rs
+  - preview-binary/tests/integration.rs
+  - preview-binary/webview-src/src/save-notice.ts
+  - preview-binary/webview-src/src/save-notice.test.ts
+  - preview-binary/webview-src/src/native-bridge.ts
+  - preview-binary/webview-src/src/main.tsx
+  - preview-binary/webview-src/src/App.tsx
+docs_updated_during_phase_5:
+  - fixes/2026-09-05-fix-me-up/decision-log.md
+  - fixes/2026-09-05-fix-me-up/acceptance-checklist.md
+  - fixes/2026-09-05-fix-me-up/cmd-s-triage.md
+  - fixes/2026-09-05-fix-me-up/plan.md
+docs_created_during_phase_5: []
+skills_files_updated_during_phase_5: []
+source_files_during_phase_6: []
+docs_updated_during_phase_6:
+  - fixes/2026-09-05-fix-me-up/decision-log.md
+  - fixes/2026-09-05-fix-me-up/acceptance-checklist.md
+  - fixes/2026-09-05-fix-me-up/plan.md
+docs_created_during_phase_6: []
+skills_files_updated_during_phase_6: []
+packages_during_phase_6:
+  - excalidraw-preview-binary
+  - excalidraw-webview
+source_files_during_phase_7: []
+docs_updated_during_phase_7:
+  - fixes/2026-09-05-fix-me-up/acceptance-checklist.md
+  - fixes/2026-09-05-fix-me-up/decision-log.md
+  - fixes/2026-09-05-fix-me-up/library-repro-appendix.md
+  - fixes/2026-09-05-fix-me-up/plan.md
+docs_created_during_phase_7:
+  - fixes/2026-09-05-fix-me-up/evidence/phase7-library-precondition/twin-library.py
+skills_files_updated_during_phase_7: []
+packages_during_phase_7: []
+source_files_during_phase_8: []
+docs_updated_during_phase_8:
+  - fixes/2026-09-05-fix-me-up/acceptance-checklist.md
+  - fixes/2026-09-05-fix-me-up/decision-log.md
+  - fixes/2026-09-05-fix-me-up/plan.md
+docs_created_during_phase_8:
+  - fixes/2026-09-05-fix-me-up/evidence/phase8-windows-host/reachability.md
+  - fixes/2026-09-05-fix-me-up/evidence/phase8-windows-host/win-preflight.sh
+skills_files_updated_during_phase_8: []
+packages_during_phase_8: []
+source_files_during_phase_9:
+  - preview-binary/webview-src/src/color-mode.ts
+  - preview-binary/webview-src/src/color-mode.test.ts
+  - preview-binary/webview-src/src/main.tsx
+  - preview-binary/webview-src/src/vendored-chunk.d.ts
+docs_updated_during_phase_9:
+  - AGENT.md
+  - docs/handling-excalidraw-files.md
+  - fixes/2026-09-05-fix-me-up/spec.md
+  - fixes/2026-09-05-fix-me-up/plan.md
+  - fixes/2026-09-05-fix-me-up/decision-log.md
+  - fixes/2026-09-05-fix-me-up/acceptance-checklist.md
+docs_created_during_phase_9:
+  - fixes/2026-09-05-fix-me-up/review-1.md
+skills_files_updated_during_phase_9: []
+packages_during_phase_9:
+  - excalidraw-preview-binary
+  - excalidraw-webview
 ---
 
 # Plan: Cmd+S silence, library drag twins, plain-JSON color-mode loss
@@ -175,61 +278,95 @@ data-layer fix proceeded.)*
 
 Depends: Phase 2 Track B classification. Parallelizable with Phases 3–4 (native side is `main.rs`-only unless the classification says otherwise). Do **not** add requirements beyond the matrix + observability definition (spec §2.5.4).
 
-- [ ] Apply the branch matched by the classification, and record which branch ran in the decision log's D2 entry:
+*(Phase 5 note, 2026-09-06: Track B classified candidate 1, so the **stale-PATH
+/ environment-hygiene** branch ran. The environment was already clean (one PATH
+entry, the `just symlink` target — nothing to restore or remove), so the branch
+proper produced the checklist identity guard rather than code; the two
+separately-mandated deliverables it may not absorb — finding N1's missing
+`--version` and the proven read-only silent no-op — were executed alongside it.
+No accelerator change; `App.tsx`'s keydown handler is byte-identical.)*
+
+- [x] Apply the branch matched by the classification, and record which branch ran in the decision log's D2 entry:
   - **Stale PATH binary** (§2.2.1): fix the reporting/development environment (restore the `just symlink` target, remove stale wrappers — the house precedent is lsp-strategy D4), and add the build-identity guard to the checklist so every future acceptance run records `--version` first. No product code change expected.
   - **muda accelerator→MenuEvent delivery failure** (§2.2.2): fix the native menu dispatch in `main.rs` (registration/delivery path around `build_menu` / the dispatch closure) while keeping the `CmdOrCtrl+S` accelerator authoritative (§2.4). Verify with the `--debug` log trail from Track B Stage 2.
   - **Dispatched but silent** (§2.2.3): fix the silent outcome path so the gesture produces a visible result (toast / notice / banner).
-  - **New finding**: write it up in the triage record's follow-through before choosing the remedy; if it implies a change outside this plan's scope, record it and stop for re-planning rather than expanding scope unilaterally.
-- [ ] Close the proven silent no-op: a save gesture in a read-only image preview (no React bridge; today the `window.__excalidrawSave && …` guard at `main.rs:1940-1942` makes menu Save a complete no-op) must produce a distinguishable outcome — e.g. a transient in-page notice when the bridge is absent — never silence.
-- [ ] Verify the observability requirement holds for every gesture type implemented on the webview side: explicit saves show the "Saving…"/"Saved" toasts (`App.tsx:362-368`, `App.tsx:539-541`) or an error banner, and any newly added "No changes to save" style notice has vitest coverage (injected I/O, `doSave` toast behavior stays covered per spec §2.6).
-- [ ] Keep the page-level keydown handler (`App.tsx:609-624`) exactly as the Linux delivery path and the pre-bridge fallback — not promoted to the authoritative macOS path (§2.4 rejection).
-- [ ] If `main.rs` changed: run `cargo nextest run`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check` for the workspace.
+  - **New finding**: write it up in the triage record's follow-through before choosing the remedy; if it implies a change outside this plan's scope, record it and stop for re-planning rather than expanding scope unilaterally. *(Finding N1 — no `--version` flag — written up in `cmd-s-triage.md`'s follow-through and remedied in place: `#[command(version)]` on `CliArgs`. It implies no change outside this plan's scope; it is the precondition of the branch's own identity guard.)*
+- [x] Close the proven silent no-op: a save gesture in a read-only image preview (no React bridge; today the `window.__excalidrawSave && …` guard at `main.rs:1940-1942` makes menu Save a complete no-op) must produce a distinguishable outcome — e.g. a transient in-page notice when the bridge is absent — never silence. *(`SAVE_MENU_SCRIPT` now dispatches `__excalidrawSave` when mounted and `__excalidrawSaveUnavailable('menu')` otherwise; `save-notice.ts` (injected I/O, 19 vitest cases) owns the routing and `main.tsx` registers it at module scope — before any await — so it covers read-only preview, load failure, and pre-mount alike. It also installs a deferring `Ctrl/Cmd+S` listener, which is the Linux read-only delivery path.)*
+- [x] Verify the observability requirement holds for every gesture type implemented on the webview side: explicit saves show the "Saving…"/"Saved" toasts (`App.tsx:362-368`, `App.tsx:539-541`) or an error banner, and any newly added "No changes to save" style notice has vitest coverage (injected I/O, `doSave` toast behavior stays covered per spec §2.6). *(Full gesture-by-gesture audit table in the decision log's D2 entry. The audit found one remaining silent return — `doSave`'s `if (!api)` early exit has no toast surface — now routed to the same notice for every non-bootstrap reason. `doSave`'s toast behavior is unchanged and `decideSaveOutcome` keeps its existing coverage.)*
+- [x] Keep the page-level keydown handler (`App.tsx:609-624`) exactly as the Linux delivery path and the pre-bridge fallback — not promoted to the authoritative macOS path (§2.4 rejection). *(Byte-identical — the only `App.tsx` change in this phase is the `!api` branch. The new module-scope listener is not a promotion: it returns before `preventDefault` whenever `__excalidrawSave` exists, so with an editor mounted only `App.tsx`'s handler acts and the macOS accelerator remains the delivery path.)*
+- [x] If `main.rs` changed: run `cargo nextest run`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check` for the workspace. *(131 passed / 1 by-design skip, clippy and fmt clean; the read-only served-page integration test landed after that run and passes on its own — Phase 6 re-runs the full sweep.)*
 
-**Validation checkpoint:** triage-record classification maps 1:1 to an executed branch in the decision log; no accelerator removal/demotion in the diff; read-only save gesture observably non-silent (demonstrable via `EXCALIDRAW_PREVIEW_HEADLESS=true` + `/export-dir` harness or a screenshot); webview tests green.
+**Validation checkpoint:** triage-record classification maps 1:1 to an executed branch in the decision log; no accelerator removal/demotion in the diff; read-only save gesture observably non-silent (demonstrable via `EXCALIDRAW_PREVIEW_HEADLESS=true` + `/export-dir` harness or a screenshot); webview tests green. *(1:1 mapping recorded (D2 "Executed remedy branch"); the diff removes no accelerator and demotes nothing. The read-only gesture is proven non-silent at four levels — dispatch-script tests, 19 notice-routing unit tests, the embedded-bundle contract test, and a headless end-to-end that spawns the real binary on a scene-less `.excalidraw.svg` and asserts the **served** bundle registers the fallback. A GUI screenshot was attempted and abandoned: two captures framed the user's unrelated desktop (active session, second display) and were deleted unsaved; the human observation stays a Phase 7 cell, where the house rules put it. 252 vitest passed / 0 failed, `tsc --noEmit` clean.)*
 
 ## Phase 6 — Full automated verification sweep
 
 Depends: Phases 3, 4, 5 complete. Mirrors CI order — assets embed at compile time.
 
-- [ ] `just ui && just build` (never a bare `cargo build` after `cargo clean` — the webview bundle would be stale).
-- [ ] `just test` (cargo nextest + `tsc --noEmit` + vitest) and compare every suite against the Phase 1 baseline; any new failure/skip is a regression from this work.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check` clean.
-- [ ] `just smoke` if a display is available (CI runs it under Xvfb); note nextest "leaky" under parallel load is a known non-leak.
-- [ ] Record the sweep results (commands, counts, delta vs. baseline) in the decision log; tick only *automated-proxy* rows in the acceptance checklist, never GUI cells.
+- [x] `just ui && just build` (never a bare `cargo build` after `cargo clean` — the webview bundle would be stale). *(Both green; the release binary reports `excalidraw-preview 0.6.0` and embeds the fresh bundle — the served `index.html` points at `assets/index-CZBLqo1K.js`, the same name the `just ui` run just emitted, and the binary carries that name plus this entry's new strings (`__excalidrawSaveUnavailable`, "Nothing to save — this file could not be loaded").)*
+- [x] `just test` (cargo nextest + `tsc --noEmit` + vitest) and compare every suite against the Phase 1 baseline; any new failure/skip is a regression from this work. *(**132 nextest passed / 0 failed / 1 skipped**, `tsc --noEmit` clean, **252 vitest passed / 0 failed (14 files)**. Delta vs. baseline: +8 nextest, +108 vitest, zero new failures and zero new skips — the one skip is the same by-design `#[ignore]`d `smoke_self_test_reports_all_checks_passing`. No "leaky" annotation. Full delta table in the decision log's Phase 6 entry.)*
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check` clean. *(Both clean — zero warnings, zero diagnostics; `just lint` (the repo recipe) also exits 0.)*
+- [x] `just smoke` if a display is available (CI runs it under Xvfb); note nextest "leaky" under parallel load is a known non-leak. *(Display available (macOS desktop); **5/5 checks passed** — webview mount + native save round-trip, close-interception dirty query, save-and-close under conflict, external-link routing, loopback navigation. It runs as an AppKit `Accessory` app so it cannot steal the user's foreground focus. No "leaky" annotation appeared anywhere in the sweep.)*
+- [x] Record the sweep results (commands, counts, delta vs. baseline) in the decision log; tick only *automated-proxy* rows in the acceptance checklist, never GUI cells. *(Decision log gained a "Phase 6 — full automated verification sweep" entry: command/result table, baseline delta table, per-suite composition of the +8 nextest tests, the three-way bundle-embedding proof, and the `rust-embed` debug-vs-release note. In the checklist only the **Automated proxies** section changed — sweep numbers, the smoke result, and the identity of the build Phase 7 should test. Zero GUI cells touched: every D2 matrix cell and every §3.6/§4.6 criterion is still `not performed` / `n/a (reason)`.)*
 
-**Validation checkpoint:** all automated gates green or explicitly explained by a recorded pre-existing baseline entry; the built binary embeds the new webview bundle.
+**Validation checkpoint:** all automated gates green or explicitly explained by a recorded pre-existing baseline entry; the built binary embeds the new webview bundle. *(Both hold. Every gate is green — 132/0/1 nextest, tsc clean, 252/0 vitest, clippy + fmt clean, smoke 5/5 — and the single skip is the baseline's own by-design `#[ignore]`d smoke test, which `just smoke` then covered. Embedding is proven, not assumed: the fresh `index-CZBLqo1K.js` name appears 67× in the release binary alongside this entry's new strings, and the three bundle-dependent tests were re-run with `--no-capture` to confirm they took their asserting path rather than their silent skip path.)*
 
 ## Phase 7 — macOS manual GUI acceptance
 
 Depends: Phase 6 build. All items run by a human against the real GUI; every cell starts from the Phase 1 instantiation.
 
-- [ ] Fill the build-identity table: binary `--version`, extension version, Zed version/build, macOS version, date.
-- [ ] Run the D2 matrix macOS column — 4 entry points × 3 scene states — recording `pass` / `fail` / `n/a (reason)` per cell with the observed outcome (saved toast, "No changes to save" notice, error banner). The clean-editable cells settle the §2.2 unconfirmed clean-scene-silence sub-claim with evidence.
-- [ ] Run the §3.6 library criteria: drag one item → exactly one copy at the drop point; multi-select N distinct → exactly N; repeat each after Browse-install, SSE re-delivery, and a panel edit; library panel shows one tile per item before and after; replay the original twin repro per the appendix answers → no duplication.
-- [ ] Run the §4.6 color-mode criteria: toggle dark → save plain `.excalidraw` → close → reopen: canvas, toggle, and (on next save) the file agree from frame one; re-open after an external edit of the key respects the edited value.
-- [ ] Perform the one-time excalidraw.com app-artifact round-trip on a file saved by the new build (the §6.3c pre-release gate): toggle pre-seeds, file opens cleanly, no data loss. *(Re-scoped by the D1 re-litigation — run the criterion as re-worded in the acceptance checklist §4.6: opens cleanly, zero page errors, no data loss; the toggle is NOT expected to pre-seed on current excalidraw.com.)*
+*(Phase 7 note, 2026-09-06: **partially executed — the phase remains open.** Task
+1 is non-interactive and ran to completion; tasks 2–5 are pixel observations and
+Phase 7 ran in an automated session with **no human at the GUI**, so they are
+recorded `not performed — no human operator in the Phase 7 automated session`
+(one of the four honest values). Nothing was ticked from a synthetic test and no
+input was synthesized: Phase 5 already demonstrated why not on this host — a
+synthesized `Cmd+S` reached an unrelated app's prompt and two screenshots framed
+unrelated content on a second display. Everything preparable was prepared:
+identity captured, an operator runbook added to the checklist, and one expired
+precondition found and made runnable again (see task 3). Gates re-run and
+unchanged from Phase 6: 132 nextest / 0 failed / 1 skipped, `tsc` clean, 252
+vitest, `just lint` 0. Full record in the decision log's Phase 7 entry.)*
 
-**Validation checkpoint:** every macOS matrix cell has an honest value (none left blank; `not performed` only with a reason); any `fail` cell spawns a loop back to the owning phase (3/4/5) before Phase 8.
+- [x] Fill the build-identity table: binary `--version`, extension version, Zed version/build, macOS version, date. *(Executed — every row now holds a verified value: `excalidraw-preview 0.6.0` from both the PATH binary and `target/release`; `which -a` finds **one** distinct candidate (`~/.local/bin/excalidraw-preview`, printed 3× because `PATH` lists that directory three times) resolving to the `just symlink` target, so **D2 §2.2 candidate 1 is dead on this host**; that binary embeds `assets/index-CZBLqo1K.js`, proving the GUI will launch **the Phase 6 sweep build** and not a Release download cache; extension `0.6.0` / `BINARY_VERSION` `0.6.0`; Zed 1.18.1 (`20260904.150309`); macOS 27.0 (`26A5425a`). The checklist still tells the operator to re-run the guard at the sitting — that is the point of the guard.)*
+- [ ] Run the D2 matrix macOS column — 4 entry points × 3 scene states — recording `pass` / `fail` / `n/a (reason)` per cell with the observed outcome (saved toast, "No changes to save" notice, error banner). The clean-editable cells settle the §2.2 unconfirmed clean-scene-silence sub-claim with evidence. *(**Not performed** — no human operator; 8 live cells + 4 structural `n/a`. Runbook step 3 names the file and gesture for every cell.)*
+- [ ] Run the §3.6 library criteria: drag one item → exactly one copy at the drop point; multi-select N distinct → exactly N; repeat each after Browse-install, SSE re-delivery, and a panel edit; library panel shows one tile per item before and after; replay the original twin repro per the appendix answers → no duplication. *(**Not performed** — no human operator. **New finding:** re-measuring the reporting setup's persisted library for these criteria showed it has **already self-healed** — 216 entries / 29 duplicated ids → **187 / 0**, all 187 ids surviving, survivors at the appendix's first-occurrence positions 114–142 carrying the **newer** element stamp: D3's survivor rule, applied to the real reported data by the real binary during the Phase 5/6 window. Strong field evidence for D3, but a filesystem observation cannot tick a GUI cell. It also **expired the precondition** of the Phase 4-added criterion (panel renders one tile per item *from load* against a still-corrupted file), so Phase 7 restored its runnability rather than dropping it: `evidence/phase7-library-precondition/twin-library.py` re-appends the 29-item block with the appendix's older second-copy stamps, reproducing the 216/187/29 signature. Verified against a `/tmp` copy — install reproduces the signature exactly, double-install refuses, `--restore` is byte-identical, double-restore refuses; **the live library was never written to** (mtime unchanged).)*
+- [ ] Run the §4.6 color-mode criteria: toggle dark → save plain `.excalidraw` → close → reopen: canvas, toggle, and (on next save) the file agree from frame one; re-open after an external edit of the key respects the edited value. *(**Not performed** — no human operator.)*
+- [ ] Perform the one-time excalidraw.com app-artifact round-trip on a file saved by the new build (the §6.3c pre-release gate): toggle pre-seeds, file opens cleanly, no data loss. *(Re-scoped by the D1 re-litigation — run the criterion as re-worded in the acceptance checklist §4.6: opens cleanly, zero page errors, no data loss; the toggle is NOT expected to pre-seed on current excalidraw.com.)* *(**Not performed** — no human operator. The Track C pre-verify already exercised the load half of this against the live site headlessly, but the artifact this gate needs is a file saved by **the new build**, and the "no data loss / fully editable" judgement is a human one.)*
+
+**Validation checkpoint:** every macOS matrix cell has an honest value (none left blank; `not performed` only with a reason); any `fail` cell spawns a loop back to the owning phase (3/4/5) before Phase 8. *(**Met in form, not in substance.** Every cell holds an honest value — `not performed` with its reason stated once per section, or `n/a` with its structural reason; zero blanks; zero cells ticked from a synthetic test. No `fail` cell exists to loop back, because no cell was observed. The checkpoint's substance — a human having run the matrix — is **not** met, so Phase 7 stays open and Phase 8, which spec §6.4 sequences after it, stays blocked. Phase 9's release-readiness statement is where this gap must be declared.)*
 
 ## Phase 8 — Windows matrix on build-win-native
 
 Depends: Phase 7 (spec §6.4 sequencing — after macOS; a clean macOS accelerator result de-risks the shared muda menu path). SSH covers deployment and identity capture only; GUI cells need an interactive session (RDP or physical console).
 
-- [ ] Deploy the current release binary to `build-win-native` over SSH (PowerShell, port 2222; `build-win` is the WSL side and is **not** the target) and capture `--version` identity there into the checklist's build-identity table.
-- [ ] In an interactive session on that host, run the D2 matrix Windows column (accelerator, menu click, in-canvas Save, close-flow × dirty/clean/read-only), recording per-cell honest results and any remote-session input caveat alongside them.
-- [ ] Escalation rule from the spec: if the macOS triage (Track B) found a muda delivery failure, these Windows cells are **required before release**; if macOS was clean, a `not performed` Windows column remains an honest recorded gap until a session is available.
+*(Phase 8 note, 2026-09-06: **partially executed — the phase remains open.** Task
+3 is a judgement on recorded evidence and ran to completion; tasks 1 and 2 did
+not, because **the Windows host is powered off** — `build-win-native`
+(`192.168.100.64:2222`) does not answer, a neighbour on the same L2 segment
+cannot ARP it, guest `build-win` (VMID 701) is `stopped`, and `qm start` is
+refused by a hypervisor without cluster quorum (`Quorate: No`, 2 of 4 votes).
+Starting it was in scope and was attempted; forcing quorum was not, being a
+change to the user's cluster configuration. Everything else touched on that
+infrastructure was read-only. Diagnosis and one-command re-probe:
+`evidence/phase8-windows-host/`. Gates re-run and unchanged from Phases 6–7:
+132 nextest / 0 failed / 1 skipped, `tsc` clean, 252 vitest, `just lint` 0. Full
+record in the decision log's Phase 8 entry.)*
 
-**Validation checkpoint:** Windows column either fully valued, or `not performed` with the availability reason recorded — never silently skipped; identity capture (SSH) complete either way.
+- [ ] Deploy the current release binary to `build-win-native` over SSH (PowerShell, port 2222; `build-win` is the WSL side and is **not** the target) and capture `--version` identity there into the checklist's build-identity table. *(**Not performed** — nothing answers at that address; see the phase note. Two blockers were found and recorded rather than assumed: the host is off, *and* no Windows artifact for this build can be produced from macOS — `cargo check --target x86_64-pc-windows-msvc` fails in `aws-lc-sys` (`windows.h` absent, AGENT.md's trap re-verified) and the entry's work is uncommitted, so no tag or Release asset is this build. The runbook therefore deploys source (`git bundle` + working-tree patch) and builds on the host. Everything preparable was prepared: `evidence/phase8-windows-host/win-preflight.sh` re-runs the whole probe chain and captures the identity rows by itself once the host answers, and the checklist gained a Windows operator runbook. **New finding:** the same check against `x86_64-pc-windows-gnu` with mingw's C toolchain **passes** — `--all-targets`, zero warnings — so bin, unit-test unit and `tests/integration.rs` all type-check for Windows, including the `#[cfg(target_os = "windows")]` `menu.init_for_hwnd` attachment. Compile level only; recorded as an automated proxy, never beside a cell.)*
+- [ ] In an interactive session on that host, run the D2 matrix Windows column (accelerator, menu click, in-canvas Save, close-flow × dirty/clean/read-only), recording per-cell honest results and any remote-session input caveat alongside them. *(**Not performed** — 8 live cells + 4 structural `n/a`, each carrying the two-part reason stated once in the table: the host was down, and these cells need an interactive Windows desktop plus a human even when it is up. The runbook's step 6 carries the remote-session input caveat the spec asks for.)*
+- [x] Escalation rule from the spec: if the macOS triage (Track B) found a muda delivery failure, these Windows cells are **required before release**; if macOS was clean, a `not performed` Windows column remains an honest recorded gap until a session is available. *(Evaluated: Track B classified **candidate 1 — stale PATH** and eliminated candidate 2 for the current build with positive proof (two synthesized-but-real, osascript-injected `Cmd+S` key equivalents → two complete, watcher-logged save round-trips through the shared accelerator → `MenuEvent` → dispatch path, on a clean scene). **The escalation arm does not fire**: the Windows column is an honest recorded gap, not a release blocker. Recorded in the decision log's D2 and Phase 8 entries and beside the checklist's Windows table, with the two caveats that keep the premise honest — the shared-path evidence is the triage's rather than a human-run macOS matrix, and the Windows-only parts (`init_for_hwnd`, WebView2) are exercised by nothing but the compile check.)*
+
+**Validation checkpoint:** Windows column either fully valued, or `not performed` with the availability reason recorded — never silently skipped; identity capture (SSH) complete either way. *(**First clause met, second not.** Every Windows cell holds an honest value with its reason, and nothing was silently skipped. Identity capture is **not** complete and could not be — there was no host to capture it from; that is stated as the outcome rather than papered over, with the exact operator remediation (restore cluster quorum → `qm start 701` → `win-preflight.sh`). Phase 8 therefore stays open alongside Phase 7, and both belong in Phase 9's release-readiness statement as declared gaps.)*
 
 ## Phase 9 — Docs, closure review, release readiness
 
 Depends: Phases 3–8 (docs gated on D1 implementation being complete and verified).
 
-- [ ] Update `docs/handling-excalidraw-files.md`: §6 step 4 — plain JSON now persists the mode via post-serialization injection (replacing "plain JSON not at all — it inherits the OS/config theme"); §7's `application/json` row — the written payload now carries `appState.exportWithDarkMode`.
-- [ ] Update AGENT.md's "Document color mode round-trip" bullet: plain `.excalidraw` persists the key by post-serialization injection at both save sites; the OS/config theme is fallback-only for keyless files; the excalidraw.com toggle pre-seed is accepted WYSIWYG propagation.
-- [ ] Decision-log completeness audit: D1 (reversal of record + mechanism + pre-verify + restore() proxy results), D2 (classification + branch executed + §2.4 do-not-reverse marker), D3 (invariant + interleaving coverage + corrupted-library remedy + any vendored-package boundary outcome), and every §6 resolution approach traceable to its evidence file.
-- [ ] Acceptance-checklist completeness audit: every cell across all three platforms is `pass`/`fail`/`n/a (reason)`/`not performed`; zero cells ticked from synthetic tests; the excalidraw.com round-trip recorded.
-- [ ] Run a defect-first review pass over the full diff of this entry (house `review-N.md` pattern) and resolve or explicitly accept-and-record every finding.
-- [ ] Write the release-readiness statement at the top of the acceptance checklist: what is verified, on which platforms/build identity, and the honest outstanding gaps (e.g. Windows `not performed`) that gate publishing, mirroring the lsp-strategy closure format.
+- [x] Update `docs/handling-excalidraw-files.md`: §6 step 4 — plain JSON now persists the mode via post-serialization injection (replacing "plain JSON not at all — it inherits the OS/config theme"); §7's `application/json` row — the written payload now carries `appState.exportWithDarkMode`. *(Both done, plus three consistency edits the checkpoint requires — §6 step 3 (a read-only save gesture answers), §7's new "A save gesture always answers" subsection (D2), and §9's library-idempotence paragraph (D3) — because the checkpoint is "docs consistent with the shipped behavior", not just the D1 lines. §6 step 4 also records the load-side half (finding N2: `loadFromBlob` strips the key too), which the original wording could not have predicted.)*
+- [x] Update AGENT.md's "Document color mode round-trip" bullet: plain `.excalidraw` persists the key by post-serialization injection at both save sites; the OS/config theme is fallback-only for keyless files; the excalidraw.com toggle pre-seed is accepted WYSIWYG propagation. *(Rewritten — both-directions stripping, the three-source priority chain, `serializeSceneForDisk` at both write sites, `reattachRawColorMode` on load, OS/config as fallback-only. The excalidraw.com line is recorded as the **D1 re-litigation settled it**, not as the plan's original prediction: current excalidraw.com strips the key on load, so the toggle does not pre-seed there — upstream behavior, not our regression. Two further decision bullets added under the same checkpoint: the D3 one-entry-per-library-item-id invariant and the D2 never-silent save gesture, both being decisions a future agent must not silently reverse.)*
+- [x] Decision-log completeness audit: D1 (reversal of record + mechanism + pre-verify + restore() proxy results), D2 (classification + branch executed + §2.4 do-not-reverse marker), D3 (invariant + interleaving coverage + corrupted-library remedy + any vendored-package boundary outcome), and every §6 resolution approach traceable to its evidence file. *(Done as a 15-row verification table in the decision log's Phase 9 entry — every required item located in a named entry, not assumed. All four §6 items trace to their evidence: §6.1 → `library-repro-appendix.md`, §6.2 → `cmd-s-triage.md`, §6.3 → `evidence/trackc-excalidraw-com/` + the vendored proxy suite + checklist §4.6 as re-scoped, §6.4 → `evidence/phase8-windows-host/`. Two corrections of record named explicitly so the log is not read as monotone: the Phase 2 raw-key claim (superseded by finding N2) and the sense in which the extension diff is "empty again" (verified: `git diff 4543cab -- extension/` is empty). No unrecorded choices.)*
+- [x] Acceptance-checklist completeness audit: every cell across all three platforms is `pass`/`fail`/`n/a (reason)`/`not performed`; zero cells ticked from synthetic tests; the excalidraw.com round-trip recorded. *(Audited mechanically, not by eye: an awk scan over every table found **zero empty cells**; all 36 D2 matrix cells and all 11 §3.6/§4.6 criteria carry an honest value; zero are ticked. The excalidraw.com round-trip is recorded in §4.6 as its re-scoped criterion. One row corrected rather than left stale — the build-identity bundle name, superseded by the review fix below.)*
+- [x] Run a defect-first review pass over the full diff of this entry (house `review-N.md` pattern) and resolve or explicitly accept-and-record every finding. *([`review-1.md`](./review-1.md) over `4543cab..HEAD` + working tree. **Two real defects found and fixed with regression coverage:** (1) the SVG baked-mode reader answered `false` for a scene-JSON payload declared `image/svg+xml`, out-ranking the `appState.exportWithDarkMode` key D1 had just made meaningful — a dark scene reopened light and the next save baked light in; fixed by `svgBytesColorMode` returning `null` (the contract the PNG reader already had) plus the chain extracted into the pure, tested `resolveDocumentColorMode`; **+11 vitest**, including the failing input exactly. (2) `declare module "*.js"` typed *every* unresolved `.js` import in the project; narrowed to the vendored dev-dist paths and probe-verified (a stray `.js` import now fails `TS2307`). One NIT **accepted** with rationale (the no-API notice denylist errs toward more observability, which is what D2 protects), one provenance question **cleared** by auditing the user-library fixture's contents, and the Phase 8-deferred AGENT.md doc decision **taken**.)*
+- [x] Write the release-readiness statement at the top of the acceptance checklist: what is verified, on which platforms/build identity, and the honest outstanding gaps (e.g. Windows `not performed`) that gate publishing, mirroring the lsp-strategy closure format. *(Written at the very top: a per-defect fix/evidence table, the build identity, this build's gate numbers with the baseline delta, then the four outstanding gaps in priority order — no human macOS matrix, the unreachable Windows column (escalation rule evaluated: does not fire), the un-run excalidraw.com round-trip, and the uncommitted work. **Verdict: not ready to publish, and not because of a known defect** — no cell of this entry's acceptance matrix has been observed by a person on any platform, stated in those words rather than softened.)*
 
-**Validation checkpoint (final gate):** docs and AGENT.md consistent with the shipped behavior; decision log closed with no unrecorded choices; checklist states exactly what a release reviewer must believe on evidence; spec frontmatter `reviewed` updated per house convention.
+**Validation checkpoint (final gate):** docs and AGENT.md consistent with the shipped behavior; decision log closed with no unrecorded choices; checklist states exactly what a release reviewer must believe on evidence; spec frontmatter `reviewed` updated per house convention. *(All four met — per-item status in the decision log's "Phase 9 checkpoint status". Gates after the review fixes: **132 nextest passed / 0 failed / 1 by-design skip**, `tsc --noEmit` clean, **263 vitest passed (14 files) / 0 failed**, `just lint` exit 0; `just ui && just build` re-run, so the release binary embeds the current bundle `assets/index-BzutzBzW.js` — the rename from Phase 6/7's `index-CZBLqo1K.js` is recorded in the checklist's build-identity table, because the sitting must test this build. **Phases 7 and 8 remain open by design**, and the entry closes saying so.)*

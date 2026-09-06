@@ -1,13 +1,20 @@
 ---
-reviewed: false
+reviewed: true
+reviewed_by: "claude/opus-5"
+reviewed_on: "2026-09-06"
+review_iterations: 1
 clarified: "opencode/glm-5.3"
 ---
 
 # Spec: Cmd+S silence, library drag twins, plain-JSON color-mode loss
 
 Date: 2026-09-06
-Status: draft — decisions ratified; open-item resolution approaches decided
-(§6), executions pending
+Status: implemented and reviewed — D1/D2/D3 ratified and shipped; §6 items 1, 2
+and 3(a)(b) executed with evidence on file; §6 items 3(c) and 4 and the whole
+manual-GUI acceptance matrix **not performed** (no human operator; Windows host
+down). See [`review-1.md`](./review-1.md) and the release-readiness statement at
+the top of [`acceptance-checklist.md`](./acceptance-checklist.md) — those gaps,
+not any known defect, are what gate publishing.
 Scope: `preview-binary/webview-src/` (save serialization, library merge/persist),
 `preview-binary/src/main.rs` (save-path diagnosis; native changes only as D2
 outcomes require), `docs/` + this directory's records. No `extension/` changes.

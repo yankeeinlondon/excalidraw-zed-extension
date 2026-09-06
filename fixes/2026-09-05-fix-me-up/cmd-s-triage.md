@@ -123,3 +123,30 @@ Phase 7 manual-GUI item.
 - Dev-loop caveat discovered: `--debug` output is capturable only with
   `--foreground` (daemonize nulls the child's streams). Worth remembering for
   future triage sessions; not a defect (by design for detached windows).
+
+## Follow-through (Phase 5, 2026-09-06)
+
+The classification above was executed as the §2.2.1 branch. Recorded in full in
+the decision log's D2 entry ("Executed remedy branch"); in summary:
+
+- **Environment hygiene:** re-checked — one PATH entry only
+  (`~/.local/bin/excalidraw-preview` → `<repo>/target/release/…`, the
+  `just symlink` target), no other `excalidraw-preview` anywhere on PATH, no
+  stale wrapper to remove. Nothing to restore; the remedy that remains is the
+  identity **guard** in the acceptance checklist. No product code change was
+  needed for the delivery defect itself.
+- **N1 closed:** the binary now has `--version` (`#[command(version)]`), so the
+  identity procedure this record could not run as written is executable:
+  `excalidraw-preview --version` → `excalidraw-preview 0.6.0`. Pinned by four
+  integration tests against the real binary, one of which compares the printed
+  version against the extension's `BINARY_VERSION` — the comparison the guard
+  makes is only meaningful while those two agree.
+- **Stage 3's read-only row:** the source-proven silent no-op is fixed (the
+  native Save script now falls back to an in-page notice registered on every
+  load path). The row itself stays a **Phase 7 manual-GUI cell** — this record
+  does not tick it.
+- **Stage 3's dirty row** remains not observed here for the same reason as in
+  Stage 2 (synthesized edits do not reach the WKWebView); Phase 7 owns it.
+- No further synthesized-input triage was run in Phase 5, and no screenshots
+  were kept: two capture attempts framed the user's unrelated desktop and were
+  deleted (decision log D2 §6).
