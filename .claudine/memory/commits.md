@@ -61,3 +61,19 @@ self-contained.
 - For very small sets (≤ ~5 files), listing the files explicitly is still
   preferred because the resulting `git show --stat` is more readable and
   reviews can quickly eyeball the inclusion set.
+
+---
+
+## In a single-quoted heredoc, do NOT backslash-escape `$` or backticks
+
+- The `'COMMIT_MSG'` delimiter being single-quoted **already** disables all
+  shell expansion — command substitution, parameter expansion, everything.
+- Adding defensive backslashes anyway (`\$schema`, `` \`- [ ]\` ``) does not
+  get stripped: the backslashes are written **literally** into the commit
+  message body. Observed on a 2026-09-05 commit: bullets read `\$schema` and
+  `` \`- [ ]\` `` instead of `$schema` and `` `- [ ]` ``.
+- Rule: inside the heredoc body, type the message exactly as it should appear
+  — plain `$`, plain backticks, no escapes. The quoting of the *delimiter*
+  is the only protection needed.
+- If the mangled commit is not HEAD, prefer leaving it (message is cosmetic)
+  over rewriting history in a worktree where other agents/devs are active.
