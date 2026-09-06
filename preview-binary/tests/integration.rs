@@ -1733,3 +1733,66 @@ fn smoke_self_test_reports_all_checks_passing() {
         status.code()
     );
 }
+
+// ── Build identity (`--version`) ─────────────────────────────────────────────
+
+/// `--version` is the first step of every acceptance run and of the stale-PATH
+/// triage (the extension prefers a PATH binary, so an old one is silently
+/// preferred). It did not exist before this entry — the mandated identity
+/// procedure could not run at all (fixes/2026-09-05-fix-me-up, finding N1).
+/// Exercised through the real binary, the normal invocation path.
+#[test]
+fn version_flag_prints_the_crate_version_and_exits_zero() {
+    let out = std::process::Command::new(binary())
+        .arg("--version")
+        .output()
+        .expect("failed to spawn preview binary with --version");
+
+    assert!(
+        out.status.success(),
+        "--version must exit 0, got {:?} (stderr: {})",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        format!("excalidraw-preview {}", env!("CARGO_PKG_VERSION")),
+        "--version output is the value an acceptance run records and compares \
+         against BINARY_VERSION"
+    );
+}
+
+/// `-V` is clap's short form; acceptance runs and scripts may use either.
+#[test]
+fn version_short_flag_matches_the_long_form() {
+    let long = std::process::Command::new(binary())
+        .arg("--version")
+        .output()
+        .expect("failed to spawn preview binary with --version");
+    let short = std::process::Command::new(binary())
+        .arg("-V")
+        .output()
+        .expect("failed to spawn preview binary with -V");
+
+    assert!(short.status.success(), "-V must exit 0");
+    assert_eq!(short.stdout, long.stdout);
+}
+
+/// A file argument must not be required for the identity check: the triage runs
+/// `--version` with nothing else, and a binary that demanded a path (or opened
+/// a window) would make the guard unusable.
+#[test]
+fn version_flag_needs_no_file_argument_and_opens_nothing() {
+    let out = std::process::Command::new(binary())
+        .arg("--version")
+        .output()
+        .expect("failed to spawn preview binary with --version");
+
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "--version must not warn or error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
