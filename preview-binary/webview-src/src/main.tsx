@@ -5,7 +5,11 @@ import type {
   LibraryItems,
 } from "@excalidraw/excalidraw/types";
 import App, { type SyncHooks } from "./App";
-import { reattachRawColorMode, svgBytesAreDarkMode } from "./color-mode";
+import {
+  reattachRawColorMode,
+  resolveDocumentColorMode,
+  svgBytesColorMode,
+} from "./color-mode";
 import { sanitizePersistedLibrary } from "./library-merge";
 import { createReadonlyImageRefresher } from "./readonly-image";
 import {
@@ -233,13 +237,18 @@ async function detectPngDarkMode(bytes: ArrayBuffer): Promise<boolean | null> {
  * - SVG: excalidraw marks a dark export with a root `<svg filter="invert(93%)
  *   hue-rotate(180deg)">`, so the substring's presence is an exact signal.
  * - PNG: sampled from pixels (see {@link detectPngDarkMode}).
+ *
+ * Both readers answer `null` for a payload that is not actually of the declared
+ * format — the content type comes from the file *name*, and the parse fallback
+ * chain absorbs a mismatch — so a scene-JSON payload never out-ranks the
+ * `appState.exportWithDarkMode` key it carries.
  */
 async function detectDocumentDarkMode(
   bytes: ArrayBuffer,
   contentType: string,
 ): Promise<boolean | null> {
   if (contentType === "image/svg+xml") {
-    return svgBytesAreDarkMode(bytes);
+    return svgBytesColorMode(bytes);
   }
   if (contentType === "image/png") {
     return detectPngDarkMode(bytes);
@@ -323,11 +332,11 @@ async function main() {
     const detectedDark = isEmptyFile
       ? null
       : await detectDocumentDarkMode(bytes, config.contentType);
-    const documentDark =
-      detectedDark ??
-      (initialData.appState as { exportWithDarkMode?: boolean } | undefined)
-        ?.exportWithDarkMode ??
-      config.theme === "dark";
+    const documentDark = resolveDocumentColorMode(
+      detectedDark,
+      initialData.appState,
+      config.theme === "dark",
+    );
     initialData = {
       ...initialData,
       appState: { ...initialData.appState, exportWithDarkMode: documentDark },

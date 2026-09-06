@@ -24,12 +24,58 @@ import type { ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
 export const EXCALIDRAW_DARK_SVG_FILTER = "invert(93%) hue-rotate(180deg)";
 
 /**
- * Whether an exported `.excalidraw.svg`'s raw bytes carry excalidraw's dark-mode
- * marker. Decodes as UTF-8 and checks for {@link EXCALIDRAW_DARK_SVG_FILTER};
- * a light-mode export omits the filter entirely.
+ * The colour mode baked into an exported `.excalidraw.svg`'s raw bytes, or
+ * `null` when the payload carries no baked rendering to read. Decodes as UTF-8
+ * and checks for {@link EXCALIDRAW_DARK_SVG_FILTER}; a light-mode export omits
+ * the filter entirely.
+ *
+ * ## Notes
+ *
+ * The `null` case is load-bearing, not defensive. The declared content type
+ * comes from the file *name* and the client's fallback chain absorbs a
+ * mismatch, so bytes handed here may be scene JSON in a file called
+ * `.excalidraw.svg`. Those bytes have no baked rendering, and answering
+ * `false` for them would out-rank — and silently discard — the
+ * `appState.exportWithDarkMode` key the same bytes state, forcing a dark
+ * document to reopen light. `null` instead lets the resolution chain fall
+ * through to that key, exactly as it already does for a non-PNG payload
+ * declared `image/png` (`detectPngDarkMode` returns `null` when it cannot
+ * decode). Empty bytes — a brand-new file — are likewise no rendering.
  */
-export function svgBytesAreDarkMode(bytes: ArrayBuffer): boolean {
-  return new TextDecoder().decode(bytes).includes(EXCALIDRAW_DARK_SVG_FILTER);
+export function svgBytesColorMode(bytes: ArrayBuffer): boolean | null {
+  const text = new TextDecoder().decode(bytes);
+  if (!text.includes("<svg")) return null;
+  return text.includes(EXCALIDRAW_DARK_SVG_FILTER);
+}
+
+/**
+ * Resolves the document colour mode a file should open in, from the three
+ * sources in their documented priority order: the file's baked rendering, then
+ * the `appState.exportWithDarkMode` key the scene states, then the resolved
+ * OS/config theme.
+ *
+ * Each source yields only when it has nothing to say — `null` for a payload
+ * with no readable baked rendering, an absent (or non-boolean) key for a scene
+ * that states no mode — so a file written by an older build, or by another
+ * tool, still lands on the theme fallback.
+ *
+ * ## Examples
+ *
+ * ```ts
+ * resolveDocumentColorMode(true, { exportWithDarkMode: false }, false); // true
+ * resolveDocumentColorMode(null, { exportWithDarkMode: true }, false); // true
+ * resolveDocumentColorMode(null, {}, true); // true — theme fallback
+ * ```
+ */
+export function resolveDocumentColorMode(
+  bakedMode: boolean | null,
+  sceneAppState: { exportWithDarkMode?: unknown } | undefined | null,
+  themeIsDark: boolean,
+): boolean {
+  if (bakedMode !== null) return bakedMode;
+  const stated = sceneAppState?.exportWithDarkMode;
+  if (typeof stated === "boolean") return stated;
+  return themeIsDark;
 }
 
 /**

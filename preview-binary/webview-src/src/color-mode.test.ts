@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   EXCALIDRAW_DARK_SVG_FILTER,
-  svgBytesAreDarkMode,
+  svgBytesColorMode,
+  resolveDocumentColorMode,
   rawJsonExportWithDarkMode,
   reattachRawColorMode,
 } from "./color-mode";
@@ -9,19 +10,146 @@ import type { ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
 
 const encode = (s: string) => new TextEncoder().encode(s).buffer;
 
-describe("svgBytesAreDarkMode", () => {
+describe("svgBytesColorMode", () => {
   it("detects a dark-mode export by excalidraw's root filter", () => {
     const dark = `<svg version="1.1" filter="${EXCALIDRAW_DARK_SVG_FILTER}"><!-- svg-source:excalidraw --></svg>`;
-    expect(svgBytesAreDarkMode(encode(dark))).toBe(true);
+    expect(svgBytesColorMode(encode(dark))).toBe(true);
   });
 
   it("treats a light-mode export (no filter) as not dark", () => {
     const light = `<svg version="1.1"><!-- svg-source:excalidraw --><rect/></svg>`;
-    expect(svgBytesAreDarkMode(encode(light))).toBe(false);
+    expect(svgBytesColorMode(encode(light))).toBe(false);
   });
 
-  it("is false for empty bytes (a brand-new file)", () => {
-    expect(svgBytesAreDarkMode(new ArrayBuffer(0))).toBe(false);
+  it("is null for empty bytes (a brand-new file has no baked rendering)", () => {
+    expect(svgBytesColorMode(new ArrayBuffer(0))).toBe(null);
+  });
+
+  // Review-1 finding 1: the declared content type comes from the file *name*,
+  // so a `.excalidraw.svg` may actually hold scene JSON (the fallback chain
+  // documents and supports this). Answering `false` there out-ranked the
+  // appState key the same bytes state and reopened a dark document light.
+  it("is null for scene-JSON bytes declared as SVG (no baked rendering)", () => {
+    const sceneJson = JSON.stringify({
+      type: "excalidraw",
+      version: 2,
+      elements: [],
+      appState: { exportWithDarkMode: true },
+      files: {},
+    });
+    expect(svgBytesColorMode(encode(sceneJson))).toBe(null);
+  });
+
+  it("is null for a PNG-ish binary payload and for arbitrary garbage", () => {
+    expect(svgBytesColorMode(new Uint8Array([0x89, 0x50, 0x4e, 0x47]).buffer)).toBe(
+      null,
+    );
+    expect(svgBytesColorMode(encode("not markup at all"))).toBe(null);
+  });
+
+  it("still reads an SVG that only names the filter in a nested element", () => {
+    // The marker is on the root in practice, but the check is a substring one:
+    // pin that an SVG payload always answers a boolean, never null.
+    const svg = `<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"><g filter="${EXCALIDRAW_DARK_SVG_FILTER}"/></svg>`;
+    expect(svgBytesColorMode(encode(svg))).toBe(true);
+  });
+});
+
+describe("resolveDocumentColorMode (the documented priority chain)", () => {
+  it("takes the baked rendering first, even against a contrary scene key", () => {
+    expect(resolveDocumentColorMode(true, { exportWithDarkMode: false }, false)).toBe(
+      true,
+    );
+    expect(resolveDocumentColorMode(false, { exportWithDarkMode: true }, true)).toBe(
+      false,
+    );
+  });
+
+  it("falls to the scene's appState key when there is no baked rendering", () => {
+    expect(resolveDocumentColorMode(null, { exportWithDarkMode: true }, false)).toBe(
+      true,
+    );
+    expect(resolveDocumentColorMode(null, { exportWithDarkMode: false }, true)).toBe(
+      false,
+    );
+  });
+
+  it("falls to the OS/config theme for a scene that states no mode", () => {
+    expect(resolveDocumentColorMode(null, {}, true)).toBe(true);
+    expect(resolveDocumentColorMode(null, {}, false)).toBe(false);
+    expect(resolveDocumentColorMode(null, undefined, true)).toBe(true);
+    expect(resolveDocumentColorMode(null, null, false)).toBe(false);
+  });
+
+  it("ignores a non-boolean key rather than coercing it", () => {
+    // An external hand-edit could write "true"; a truthy string must not be
+    // read as a stated mode, or the theme fallback becomes unreachable.
+    expect(resolveDocumentColorMode(null, { exportWithDarkMode: "true" }, false)).toBe(
+      false,
+    );
+    expect(resolveDocumentColorMode(null, { exportWithDarkMode: 1 }, true)).toBe(true);
+  });
+
+  // The end-to-end shape of review-1 finding 1, asserted on the chain itself:
+  // dark scene JSON in a file named `.excalidraw.svg`, opened under a light
+  // OS theme, must resolve dark.
+  it("resolves dark for dark scene JSON misdeclared as SVG under a light theme", () => {
+    const sceneJson = JSON.stringify({
+      type: "excalidraw",
+      version: 2,
+      elements: [],
+      appState: { exportWithDarkMode: true },
+      files: {},
+    });
+    const baked = svgBytesColorMode(encode(sceneJson)); // declared image/svg+xml
+    const reattached = reattachRawColorMode(
+      { appState: {} } as ExcalidrawInitialDataState,
+      encode(sceneJson),
+    );
+    expect(resolveDocumentColorMode(baked, reattached.appState, false)).toBe(true);
+  });
+
+  it("resolves light for the same file saved light, under a dark theme", () => {
+    const sceneJson = JSON.stringify({
+      type: "excalidraw",
+      version: 2,
+      elements: [],
+      appState: { exportWithDarkMode: false },
+      files: {},
+    });
+    const reattached = reattachRawColorMode(
+      { appState: {} } as ExcalidrawInitialDataState,
+      encode(sceneJson),
+    );
+    expect(
+      resolveDocumentColorMode(svgBytesColorMode(encode(sceneJson)), reattached.appState, true),
+    ).toBe(false);
+  });
+
+  it("leaves a keyless file on the theme, whatever its declared type", () => {
+    const keyless = JSON.stringify({
+      type: "excalidraw",
+      version: 2,
+      elements: [],
+      appState: {},
+      files: {},
+    });
+    const reattached = reattachRawColorMode(
+      { appState: {} } as ExcalidrawInitialDataState,
+      encode(keyless),
+    );
+    expect(
+      resolveDocumentColorMode(svgBytesColorMode(encode(keyless)), reattached.appState, true),
+    ).toBe(true);
+  });
+
+  it("keeps a real dark SVG export winning over the scene it embeds", () => {
+    // The `.svg`/`.png` recovery path is unchanged by the fix: a genuine SVG
+    // payload still answers a boolean, so the baked rendering stays first.
+    const darkSvg = `<svg version="1.1" filter="${EXCALIDRAW_DARK_SVG_FILTER}"><!-- svg-source:excalidraw --></svg>`;
+    expect(
+      resolveDocumentColorMode(svgBytesColorMode(encode(darkSvg)), { exportWithDarkMode: false }, false),
+    ).toBe(true);
   });
 });
 
