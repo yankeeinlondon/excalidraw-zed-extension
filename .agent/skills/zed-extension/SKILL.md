@@ -32,7 +32,7 @@ Extract:
 | Type | Convention | Example |
 |---|---|---|
 | Language / tool | bare name | `gleam`, `biome` |
-| Theme | `-theme` suffix | `catppuccin-theme` |
+| Theme | `-theme` suffix | `catppuccin-theme` |ex
 | Snippets | `-snippets` suffix | `rust-snippets` |
 | MCP server | `-server` suffix | `github-server` |
 | Icon theme | `-icons` suffix | `material-icons` |
