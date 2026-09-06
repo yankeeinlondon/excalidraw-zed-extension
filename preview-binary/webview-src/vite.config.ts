@@ -2,8 +2,11 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 // Production build: just React + the output paths.
-// Dev server: adds a mock API (GET /config, GET+POST /data, GET /events)
-// so you can run `vite dev` without the Rust binary.
+// Dev server: adds a mock API (GET/POST /config /data, GET /events,
+// POST /editor-closed) so you can run `vite dev` without the Rust binary.
+// The /data handlers implement the same conditional-write contract as the
+// Rust server (ETag on GET, If-Match with 428/412/200 on POST) via the
+// shared, unit-tested primitives in src/mock-server-core.ts.
 //
 // In dev, open any excalidraw file by passing a ?file= query param:
 //   http://localhost:5173?file=/absolute/path/to/diagram.excalidraw
@@ -97,6 +100,21 @@ function mockApiPlugin() {
   const path = require("path") as typeof import("path");
   const url = require("url") as typeof import("url");
   const { execSync } = require("child_process") as typeof import("child_process");
+  // Shared with the unit tests: the revision/If-Match primitives mirroring the
+  // Rust server's conditional-write contract. Typed inline (rather than
+  // `typeof import(...)`) so this composite project stays self-contained.
+  const {
+    computeMockRevision,
+    mockIfMatchAllows,
+    MOCK_ABSENT_REVISION,
+  } = require("./src/mock-server-core") as {
+    computeMockRevision: (bytes: Uint8Array) => string;
+    mockIfMatchAllows: (
+      header: string | undefined | null,
+      currentRevision: string,
+    ) => boolean;
+    MOCK_ABSENT_REVISION: string;
+  };
 
   // Default file when no ?file= param is given.
   const DEFAULT_FILE: string = process.env.DEV_FILE
@@ -166,10 +184,15 @@ function mockApiPlugin() {
   }
 
   function broadcastReload(filePath: string) {
+    broadcastSse(filePath, "reload");
+  }
+
+  /** Sends one SSE frame to every client watching `filePath`. */
+  function broadcastSse(filePath: string, event: string) {
     const clients = sseClientMap.get(filePath);
     if (!clients) return;
     for (const res of clients) {
-      try { res.write("data: reload\n\n"); }
+      try { res.write(`data: ${event}\n\n`); }
       catch { clients.delete(res); }
     }
   }
@@ -210,30 +233,76 @@ function mockApiPlugin() {
       server.middlewares.use("/data", (req: import("http").IncomingMessage, res: import("http").ServerResponse) => {
         const filePath = resolveFile(req.url);
         if (req.method === "POST") {
+          const ifMatch = req.headers["if-match"];
+          const ifMatchHeader = Array.isArray(ifMatch) ? ifMatch[0] : ifMatch;
           const chunks: Buffer[] = [];
           req.on("data", (chunk: Buffer) => chunks.push(chunk));
           req.on("end", () => {
-            fs.writeFile(filePath, Buffer.concat(chunks), (err) => {
-              res.writeHead(err ? 500 : 200);
-              res.end(err ? "write failed" : "ok");
+            // Conditional write, mirroring the Rust server: re-read disk,
+            // compare the If-Match precondition against the current revision
+            // (absent files are their own revision), and only then write.
+            let currentRevision: string;
+            let currentBytes: Buffer | null;
+            try {
+              currentBytes = fs.readFileSync(filePath);
+              currentRevision = computeMockRevision(currentBytes);
+            } catch {
+              currentBytes = null;
+              currentRevision = MOCK_ABSENT_REVISION;
+            }
+            if (!ifMatchHeader) {
+              res.writeHead(428);
+              res.end("If-Match header required: POST the revision you accepted from GET /data");
+              return;
+            }
+            if (!mockIfMatchAllows(ifMatchHeader, currentRevision)) {
+              res.writeHead(412, { ETag: currentRevision });
+              res.end("file changed on disk: If-Match did not match the current revision");
+              return;
+            }
+            const body = Buffer.concat(chunks);
+            fs.writeFile(filePath, body, (err) => {
+              if (err) {
+                res.writeHead(500);
+                res.end("write failed");
+                return;
+              }
+              res.writeHead(200, { ETag: computeMockRevision(body) });
+              res.end("ok");
             });
           });
           return;
         }
-        // GET
-        if (!fs.existsSync(filePath)) {
-          res.writeHead(404);
-          res.end(`File not found: ${filePath}`);
-          return;
-        }
+        // GET — bytes + revision (ETag) together, never cached.
         ensureWatched(filePath);
         try {
+          const bytes = fs.readFileSync(filePath);
           res.setHeader("Content-Type", contentTypeFor(filePath));
-          res.end(fs.readFileSync(filePath));
+          res.setHeader("ETag", computeMockRevision(bytes));
+          res.setHeader("Cache-Control", "no-store");
+          res.end(bytes);
         } catch (e) {
-          res.writeHead(500);
-          res.end(`read failed: ${e}`);
+          if ((e as { code?: string }).code === "ENOENT") {
+            res.writeHead(404, { ETag: MOCK_ABSENT_REVISION });
+            res.end(`File not found: ${filePath}`);
+          } else {
+            res.writeHead(500);
+            res.end(`read failed: ${e}`);
+          }
         }
+      });
+
+      // The LSP's `didClose` attention signal: acknowledge (204) and broadcast
+      // `editor-closed` to this file's SSE clients, exactly like the Rust
+      // server. No spawn/focus/teardown semantics exist here.
+      server.middlewares.use("/editor-closed", (req: import("http").IncomingMessage, res: import("http").ServerResponse) => {
+        const filePath = resolveFile(req.url);
+        req.on("data", () => {});
+        req.on("end", () => {
+          broadcastSse(filePath, "editor-closed");
+          res.writeHead(204);
+          res.end();
+        });
       });
 
       // Narrow WebView↔Rust bridge routes. The dev mock just acknowledges them

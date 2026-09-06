@@ -1,8 +1,9 @@
 import ReactDOM from "react-dom/client";
 import { loadFromBlob } from "@excalidraw/excalidraw";
 import type { ExcalidrawInitialDataState } from "@excalidraw/excalidraw/types";
-import App from "./App";
+import App, { type SyncHooks } from "./App";
 import { svgBytesAreDarkMode } from "./color-mode";
+import { createAppSseHandler, createReadonlySseHandler } from "./sse-events";
 
 interface Config {
   contentType: string;
@@ -45,9 +46,33 @@ function apiUrl(path: string): string {
 }
 
 /**
+ * Parses disk bytes into scene data: the declared format first, then the other
+ * two as fallbacks (extension is authoritative; the chain handles mismatches).
+ * Rejects when every fallback fails. Shared by the initial load and every
+ * disk reconciliation so both speak the same parsing rules.
+ */
+async function parseDiskBytesWithFallbacks(
+  bytes: ArrayBuffer,
+  contentType: string,
+): Promise<ExcalidrawInitialDataState> {
+  let lastError: unknown = new Error("no fallback attempted");
+  for (const type of reorderFallbacks(contentType)) {
+    try {
+      return await loadFromBlob(new Blob([bytes], { type }), null, null);
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError;
+}
+
+/**
  * Read-only preview for an SVG/PNG that has no embedded Excalidraw scene.
  * Renders the raw image centered in the window with a small banner, and live-
  * reloads the image when the file changes on disk (via the same SSE stream).
+ * The SSE handler responds to `reload` only — every other event name
+ * (including `editor-closed`) is ignored; a read-only preview has no scene to
+ * conflict and never shows a conflict dialog.
  */
 function renderReadonlyImage(
   bytes: ArrayBuffer,
@@ -79,19 +104,22 @@ function renderReadonlyImage(
 
   // Live-reload the image on external file changes.
   const es = new EventSource(eventsUrl);
-  es.onmessage = debounce(async () => {
-    try {
-      const res = await fetch(dataUrl);
-      if (!res.ok) return;
-      const next = await res.arrayBuffer();
-      const nextUrl = URL.createObjectURL(new Blob([next], { type }));
-      img.src = nextUrl;
-      URL.revokeObjectURL(currentUrl);
-      currentUrl = nextUrl;
-    } catch {
-      // transient fetch failure; keep showing the last good image
-    }
-  }, 150);
+  const readonlyHandler = createReadonlySseHandler({
+    onReload: debounce(async () => {
+      try {
+        const res = await fetch(dataUrl);
+        if (!res.ok) return;
+        const next = await res.arrayBuffer();
+        const nextUrl = URL.createObjectURL(new Blob([next], { type }));
+        img.src = nextUrl;
+        URL.revokeObjectURL(currentUrl);
+        currentUrl = nextUrl;
+      } catch {
+        // transient fetch failure; keep showing the last good image
+      }
+    }, 150),
+  });
+  es.onmessage = (event: MessageEvent<string>) => readonlyHandler(event.data);
 }
 
 /** Loads an object-URL into an HTMLImageElement, resolving once decoded. */
@@ -174,8 +202,13 @@ async function main() {
         : "light";
     }
 
-    const dataRes = await fetch(apiUrl("/data"));
+    const dataUrl = apiUrl("/data");
+    const dataRes = await fetch(dataUrl);
     if (!dataRes.ok) throw new Error(`Failed to fetch data: ${dataRes.status}`);
+    // The accepted disk revision this viewer starts from — including for an
+    // empty file. Every conditional save sends it (or a later acknowledged
+    // revision) as `If-Match`; it is opaque and echoed byte-for-byte.
+    const initialRevision = dataRes.headers.get("ETag") ?? "";
     const bytes = await dataRes.arrayBuffer();
 
     // Shared shape library — failure is non-fatal (e.g. dev-mode mock has no /library).
@@ -190,6 +223,9 @@ async function main() {
       // library persistence unavailable; start with an empty panel
     }
 
+    const parseDiskBytes = (diskBytes: ArrayBuffer) =>
+      parseDiskBytesWithFallbacks(diskBytes, config.contentType);
+
     let initialData: ExcalidrawInitialDataState | null = null;
     // Empty file (new .excalidraw.svg/.excalidraw.png drawing): start with a blank
     // scene and let App write the proper format to disk on its bootstrap save.
@@ -199,18 +235,7 @@ async function main() {
     if (isEmptyFile) {
       initialData = { elements: [], appState: {}, files: {} };
     } else {
-      for (const type of reorderFallbacks(config.contentType)) {
-        try {
-          initialData = await loadFromBlob(
-            new Blob([bytes], { type }),
-            null,
-            null,
-          );
-          break;
-        } catch {
-          // try next format
-        }
-      }
+      initialData = await parseDiskBytes(bytes).catch(() => null);
     }
 
     if (!initialData) {
@@ -219,7 +244,7 @@ async function main() {
       // the raw image so the user still sees something. Editing is unavailable
       // because there is no scene to reconstruct.
       if (config.contentType === "image/svg+xml" || config.contentType === "image/png") {
-        renderReadonlyImage(bytes, config.contentType, config.theme, apiUrl("/data"), apiUrl("/events"));
+        renderReadonlyImage(bytes, config.contentType, config.theme, dataUrl, apiUrl("/events"));
         return;
       }
       showError("Failed to load file: all format fallbacks failed");
@@ -244,11 +269,9 @@ async function main() {
       appState: { ...initialData.appState, exportWithDarkMode: documentDark },
     };
 
-    // Shared mutable state between App callbacks and the SSE handler.
-    // Timestamp after which SSE reload events are no longer suppressed.
-    let ignoreSseUntil = 0;
-    // Stable reload function provided by App once it mounts.
-    let reloadScene: ((data: ExcalidrawInitialDataState) => void) | null = null;
+    // The disk-sync hooks App's controller exposes: reconciliation on SSE
+    // events and (re)connection, plus the `editor-closed` attention signal.
+    let syncHooks: SyncHooks | null = null;
 
     const root = document.getElementById("root");
     if (!root) return;
@@ -260,47 +283,40 @@ async function main() {
         contentType={config.contentType}
         autoSave={config.autoSave}
         bootstrapSave={isEmptyFile}
+        initialRevision={initialRevision}
+        dataUrl={dataUrl}
+        parseDiskBytes={parseDiskBytes}
         onApiReady={() => {}}
-        onSaved={(until) => {
-          ignoreSseUntil = until;
-        }}
-        onReloadReady={(fn) => {
-          reloadScene = fn;
+        onSyncReady={(hooks) => {
+          syncHooks = hooks;
         }}
       />,
     );
 
-    // SSE live-reload: triggered by external file changes (e.g. edits in Zed).
-    // Suppressed for 2 s after the WebView itself POSTs a save to avoid echo.
-    // Viewport + theme preservation and mid-edit skipping are handled inside
-    // the reloadScene function provided by App.
+    // SSE live reload. Events are dispatched explicitly by name — unknown
+    // names are ignored, `library` never touches the scene, `reload` triggers
+    // a reconciliation (bytes + revision fetched together), and
+    // `editor-closed` reconciles first and then escalates any pending
+    // conflict. Echoes of the viewer's own writes are suppressed by revision
+    // (the controller recognizes the acknowledged revision), never by a clock.
+    // The browser reconnects the EventSource automatically; every (re)open
+    // reconciles, so a missed event can't leave the view silently stale.
     const es = new EventSource(apiUrl("/events"));
-    const reloadSceneFromDisk = debounce(async () => {
-      if (Date.now() < ignoreSseUntil) return;
-      try {
-        const res = await fetch(apiUrl("/data"));
-        if (!res.ok) return;
-        const newBytes = await res.arrayBuffer();
-        const newData = await loadFromBlob(
-          new Blob([newBytes], { type: config.contentType }),
-          null,
-          null,
-        );
-        reloadScene?.(newData);
-      } catch (e) {
-        console.error("Failed to reload:", e);
-      }
-    }, 150);
-    es.onmessage = (event: MessageEvent<string>) => {
-      // A "Browse libraries" install merged items server-side: reload only the
-      // library panel, never the scene. Handled inline (not via the scene
-      // debounce) so a library + scene event can't collapse into one.
-      if (event.data === "library") {
-        void window.__excalidrawApplyPendingLibraries?.();
-        return;
-      }
-      reloadSceneFromDisk();
+    es.onopen = () => {
+      syncHooks?.reconcile("watcher");
     };
+    const appHandler = createAppSseHandler({
+      onReload: () => {
+        syncHooks?.reconcile("watcher");
+      },
+      onLibrary: () => {
+        void window.__excalidrawApplyPendingLibraries?.();
+      },
+      onEditorClosed: () => {
+        syncHooks?.editorClosed();
+      },
+    });
+    es.onmessage = (event: MessageEvent<string>) => appHandler(event.data);
   } catch (e) {
     showError(`Error: ${e instanceof Error ? e.message : String(e)}`);
   }

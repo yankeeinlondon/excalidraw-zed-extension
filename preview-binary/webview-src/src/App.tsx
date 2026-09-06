@@ -19,20 +19,34 @@ import { postExport, type ExportKind } from "./export";
 import { computeSceneHash } from "./scene-fingerprint";
 import {
   applyExternalReload,
-  decideAutoSaveSchedule,
   decideSaveOutcome,
   flushPendingLibrary,
-  flushPendingSave,
   initialLibraryItems,
   persistLibraryItems,
   seedHashFromInitialData,
-  type AutoSaveState,
+  AutoSaveScheduler,
+  SaveQueue,
 } from "./dirty-state";
+import {
+  SyncController,
+  type ConflictReason,
+  type SnapshotResult,
+  type SyncUiState,
+} from "./sync-controller";
+import { ConflictBanner, ConflictModal } from "./conflict-ui";
 import type {
   NativeLibraryOptions,
   NativeSaveOptions,
   NativeSaveResult,
 } from "./native-bridge";
+
+/** The disk-sync surface main.tsx drives from the SSE stream. */
+export interface SyncHooks {
+  /** Reconcile disk now (SSE `reload`, (re)connection, broadcast lag). */
+  reconcile(reason: ConflictReason): void;
+  /** The `editor-closed` attention signal: reconcile first, then escalate. */
+  editorClosed(): void;
+}
 
 interface AppProps {
   initialData: ExcalidrawInitialDataState;
@@ -42,17 +56,24 @@ interface AppProps {
   autoSave: boolean;
   /** When true (empty file on disk), write the blank scene in the declared format once on mount. */
   bootstrapSave: boolean;
-  onApiReady: (api: ExcalidrawImperativeAPI) => void;
-  /** Called after a successful save so the SSE listener can suppress the echo. */
-  onSaved: (suppressUntil: number) => void;
   /**
-   * Called once with a stable `reloadScene` function that the SSE handler can
-   * call when an external file change arrives.  The function skips the update
-   * when the user is actively editing a text element (prevents mid-edit
-   * disruption) and only passes elements + files to updateScene so the
-   * current viewport position and theme are never reset.
+   * The ETag of the initial `GET /data` response — the accepted disk revision
+   * the viewer starts from (empty files included).
    */
-  onReloadReady: (reload: (data: ExcalidrawInitialDataState) => void) => void;
+  initialRevision: string;
+  /**
+   * The URL of the canonical file endpoint (`/data`, plus the dev-mode `?file=`
+   * param). Every canonical GET/POST of scene data goes through it.
+   */
+  dataUrl: string;
+  /**
+   * Parses disk bytes into scene data using the declared format first and the
+   * other two as fallbacks. Shared with main.tsx's initial load.
+   */
+  parseDiskBytes(bytes: ArrayBuffer): Promise<ExcalidrawInitialDataState>;
+  onApiReady: (api: ExcalidrawImperativeAPI) => void;
+  /** Called once with the SSE-facing sync hooks once the controller exists. */
+  onSyncReady: (hooks: SyncHooks) => void;
 }
 
 const SAVE_DEBOUNCE_MS = 300;
@@ -100,9 +121,11 @@ export default function App({
   contentType,
   autoSave,
   bootstrapSave,
+  initialRevision,
+  dataUrl,
+  parseDiskBytes,
   onApiReady,
-  onSaved,
-  onReloadReady,
+  onSyncReady,
 }: AppProps) {
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   // The document's color mode: a single flag that drives the editor canvas
@@ -117,10 +140,9 @@ export default function App({
         ?.exportWithDarkMode,
     ),
   );
-  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const libraryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Fingerprint of the last-observed scene (elements + files + meaningful
   // appState). Used to ignore viewport-only / selection-only onChange events.
+  // Strictly a *scene* concept — never a disk revision (see SyncController).
   //
   // Seeded synchronously from the initial scene during the first render — before
   // any onChange can fire — so the initial onChange Excalidraw emits with the
@@ -135,21 +157,21 @@ export default function App({
   }
   // Whether the scene has unsaved edits relative to disk. Mirrored to Rust via
   // POST /dirty on every transition so native code can decide on close/save.
+  // /dirty reports are advisory only — never load-bearing for protecting
+  // edits or gating writes.
   const dirtyRef = useRef<boolean>(false);
-  // Max-wait / in-flight bookkeeping for the auto-save scheduler. `firstDirtyAt`
-  // is the timestamp (ms) of the edit that first made the scene dirty since the
-  // last save; `maxWaitSaveInFlight` suppresses overlapping max-wait flushes
-  // during a long continuous gesture (review 6, finding 2).
-  const autoSaveState = useRef<AutoSaveState>({
-    firstDirtyAt: null,
-    maxWaitSaveInFlight: false,
-  });
+  // Number of serialized save operations currently executing (queue → export →
+  // conditional POST). The sync controller reads it as its live `isSaving`.
+  const savingCountRef = useRef<number>(0);
   // Monotonic id assigned to each save when it starts, and the highest id that
   // has already *completed*. Together they let an out-of-order save response
   // recognise it was superseded by a newer save and leave dirty state alone
   // (finding 5).
   const saveSeqRef = useRef<number>(0);
   const lastCompletedSaveSeqRef = useRef<number>(0);
+  // True on the onChange after a text edit ended; drives the deferred-reload
+  // retry (a reload deferred mid-edit is re-decided, never discarded).
+  const wasEditingRef = useRef<boolean>(false);
 
   // Latest library items, mirrored from onLibraryChange so the native
   // "Export Library…" action can serialize them without a getter on the API.
@@ -163,6 +185,7 @@ export default function App({
   // is pending). Lets the close/unmount flush skip a redundant write when the
   // library is already persisted.
   const libraryDirtyRef = useRef<boolean>(false);
+  const libraryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /**
    * Reports the outcome of a native-triggered action to Rust so a waiting
@@ -185,7 +208,7 @@ export default function App({
     [],
   );
 
-  /** Reports the current dirty state to Rust. Fire-and-forget. */
+  /** Reports the current dirty state to Rust. Fire-and-forget, advisory. */
   const reportDirty = useCallback(
     (dirty: boolean, pendingSave: boolean, lastSavedAt?: number) => {
       fetch("/dirty", {
@@ -203,193 +226,358 @@ export default function App({
     [],
   );
 
-  // Stable reload function handed to the SSE handler in main.tsx. An external
-  // file change (edit in Zed, git checkout, etc.) is applied as a *clean*
-  // baseline transition, not a user edit:
-  // - Skips if the user is mid-text-edit (prevents text-editor disruption).
-  // - Applies persisted/visual appState (background, grid, export settings) from
-  //   disk, but never viewport pan/zoom or theme, so the current view is kept.
-  // - Re-baselines dirty bookkeeping to the accepted scene: sets prevHashRef so
-  //   the onChange this triggers no-ops, clears the dirty flag, cancels any
-  //   pending auto-save, and reports clean to Rust. Without this the reloaded
-  //   scene would read as a fresh edit and, under auto-save, be written straight
-  //   back to disk — overwriting the external change that was just accepted
-  //   (review 3, finding 2).
-  const reloadScene = useCallback(
-    (newData: ExcalidrawInitialDataState) => {
-      const api = apiRef.current;
-      if (!api) return;
-      applyExternalReload(api, newData, {
-        setBaselineHash: (hash) => {
-          prevHashRef.current = hash;
-        },
-        clearDirty: () => {
-          dirtyRef.current = false;
-          autoSaveState.current.firstDirtyAt = null;
-          if (saveTimer.current) {
-            clearTimeout(saveTimer.current);
-            saveTimer.current = null;
+  // doSave is referenced by the scheduler before its declaration completes;
+  // indirection through a ref keeps the wiring acyclic.
+  const doSaveRef = useRef<
+    (opts?: NativeSaveOptions) => Promise<NativeSaveResult>
+  >(() => Promise.resolve({ ok: false, error: "save not ready" }));
+
+  // The pause-aware auto-save scheduler. Paused while a conflict is pending or
+  // a "Keep my changes" acknowledgment awaits its explicit save — no debounce,
+  // max-wait, pointer-up or blur flush fires while paused.
+  const schedulerRef = useRef<AutoSaveScheduler | null>(null);
+  if (schedulerRef.current === null) {
+    schedulerRef.current = new AutoSaveScheduler({
+      debounceMs: SAVE_DEBOUNCE_MS,
+      maxWaitMs: SAVE_MAX_WAIT_MS,
+      save: (reason) => {
+        void doSaveRef.current({ reason });
+      },
+    });
+  }
+
+  // The disk-sync controller: revision tracking, reconciliation, conditional
+  // writes and the conflict lifecycle. All I/O injected; see sync-controller.ts.
+  const controllerRef = useRef<SyncController | null>(null);
+  if (controllerRef.current === null) {
+    controllerRef.current = new SyncController({
+      fetchSnapshot: async (): Promise<SnapshotResult> => {
+        try {
+          const res = await fetch(dataUrl);
+          if (!res.ok) return { ok: false, status: res.status };
+          const revision = res.headers.get("ETag");
+          if (!revision) {
+            // The contract pairs bytes with their ETag; a 200 without one is a
+            // broken server, not an empty drawing.
+            return { ok: false, status: 0 };
           }
-        },
-        // Leave lastSavedAt unset — this is an external change, not a save by
-        // this WebView, so the last-save timestamp must not move.
-        reportClean: () => reportDirty(false, false),
-      });
-    },
-    [reportDirty],
+          return { ok: true, revision, bytes: await res.arrayBuffer() };
+        } catch {
+          return { ok: false, status: 0 };
+        }
+      },
+      parseSnapshot: (bytes) => parseDiskBytes(bytes),
+      isDirty: () => dirtyRef.current,
+      isEditing: () =>
+        Boolean(apiRef.current?.getAppState().editingTextElement),
+      isSaving: () => savingCountRef.current > 0,
+      applyExternalScene: (data) => {
+        const api = apiRef.current;
+        if (!api) return "skipped-editing";
+        return applyExternalReload(api, data, {
+          setBaselineHash: (hash) => {
+            prevHashRef.current = hash;
+          },
+          clearDirty: () => {
+            dirtyRef.current = false;
+            schedulerRef.current?.noteClean();
+            schedulerRef.current?.cancelPending();
+          },
+          // Leave lastSavedAt unset — this is an external change, not a save by
+          // this WebView, so the last-save timestamp must not move.
+          reportClean: () => reportDirty(false, false),
+        });
+      },
+    });
+    controllerRef.current.seedAccepted(initialRevision);
+  }
+
+  // UI-facing mirror of the controller state (banner / modal / error).
+  const [syncUi, setSyncUi] = useState<SyncUiState>(() =>
+    controllerRef.current!.snapshot(),
   );
+  useEffect(() => controllerRef.current!.subscribe(setSyncUi), []);
+
+  // Serialize saves through one queue so the async export + conditional POST
+  // of one save can never land after a newer save's.
+  const saveQueueRef = useRef<SaveQueue | null>(null);
+  if (saveQueueRef.current === null) {
+    saveQueueRef.current = new SaveQueue();
+  }
+
+  // Pause every automatic write while a conflict is pending or a "Keep my
+  // changes" acknowledgment is active; resume (and re-arm a follow-up if edits
+  // landed while paused) once neither applies.
+  useEffect(() => {
+    const scheduler = schedulerRef.current;
+    if (!scheduler) return;
+    if (syncUi.conflict !== null || syncUi.keepNotice) {
+      scheduler.pause();
+    } else if (scheduler.isPaused()) {
+      scheduler.resume();
+      if (autoSave && dirtyRef.current) scheduler.armFollowUp();
+    }
+  }, [syncUi.conflict, syncUi.keepNotice, autoSave]);
 
   useEffect(() => {
-    onReloadReady(reloadScene);
-  }, [onReloadReady, reloadScene]);
+    onSyncReady({
+      reconcile: (reason: ConflictReason) => {
+        void controllerRef.current?.reconcile(reason);
+      },
+      editorClosed: () => {
+        void controllerRef.current?.editorClosed();
+      },
+    });
+  }, [onSyncReady]);
 
   /**
-   * Serializes the current scene and POSTs it to /data.
-   * Returns the outcome so native callers (menu Save, close-confirm) can react.
-   * On success, clears the dirty flag and reports it to Rust.
+   * Serializes the current scene and conditionally POSTs it to /data through
+   * the save queue. Every canonical write carries `If-Match` with the accepted
+   * (or Keep-authorized) revision, read at write time — after export — so a
+   * queued follow-up save always speaks the revision its predecessor
+   * acknowledged. Returns the outcome so native callers (menu Save,
+   * close-confirm) can react; on success the dirty flag clears and Rust is
+   * told. On a 412 the controller raises the pending conflict, dirty state is
+   * left untouched, and the failure is reported (a close flow keeps the
+   * window open instead of overwriting the newer disk version).
    */
   const doSave = useCallback(
     async (opts?: NativeSaveOptions): Promise<NativeSaveResult> => {
       const api = apiRef.current;
       if (!api) return { ok: false, error: "Editor not ready" };
+      const controller = controllerRef.current!;
 
       // Tag this save so an out-of-order response can tell whether a newer save
       // has completed in the meantime (finding 5).
       const mySeq = ++saveSeqRef.current;
-
       // Compact, non-modal save indicator. Skipped for the one-time bootstrap
-      // write so opening a fresh file doesn't flash a toast.
+      // write and for automatic writes paused by a pending decision.
       const showIndicator = opts?.reason !== "bootstrap";
-      if (showIndicator) {
-        api.setToast({ message: "Saving…", duration: 60000, closable: false });
-      }
-
-      const elements = api.getSceneElements();
-      const appState = api.getAppState();
-      const files = api.getFiles();
-      // Fingerprint of exactly what we're about to persist. Compared against the
-      // latest observed hash when the POST resolves so a save that finishes
-      // *after* newer edits arrived can't mark the scene clean and drop them.
-      const savedHash = computeSceneHash(elements, appState, files);
 
       try {
-        let body: BodyInit;
-        let contentTypeHeader: string;
+        return await saveQueueRef.current!.enqueue(
+          async (): Promise<NativeSaveResult> => {
+            savingCountRef.current += 1;
+            try {
+              if (showIndicator) {
+                api.setToast({
+                  message: "Saving…",
+                  duration: 60000,
+                  closable: false,
+                });
+              }
 
-        if (contentType === "image/svg+xml") {
-          const nonDeleted = elements.filter((e) => !e.isDeleted);
-          // exportEmbedScene: true writes the scene JSON into the file so it can
-          // be re-opened and edited. Without it, saving an .excalidraw.svg strips
-          // the scene and the file becomes an unloadable plain image.
-          const svg = await exportToSvg({
-            elements: nonDeleted,
-            appState: { ...appState, exportEmbedScene: true },
-            files,
-          });
-          body = svg.outerHTML;
-          contentTypeHeader = "image/svg+xml";
-        } else if (contentType === "image/png") {
-          const nonDeleted = elements.filter((e) => !e.isDeleted);
-          const blob = await exportToBlob({
-            elements: nonDeleted,
-            // Embed the scene so the .excalidraw.png round-trips back into the editor.
-            appState: { ...appState, exportEmbedScene: true },
-            files,
-            getDimensions(width: number, height: number) {
-              const scale =
-                (appState as { exportScale?: number }).exportScale ?? 2;
-              return { width: width * scale, height: height * scale, scale };
-            },
-          });
-          if (!blob) return { ok: false, error: "PNG export produced no data" };
-          body = await blob.arrayBuffer();
-          contentTypeHeader = "image/png";
-        } else {
-          body = serializeAsJSON(elements, appState, files, "local");
-          contentTypeHeader = "application/json";
-        }
+              const elements = api.getSceneElements();
+              const appState = api.getAppState();
+              const files = api.getFiles();
+              // Fingerprint of exactly what we're about to persist. Compared
+              // against the latest observed hash when the POST resolves so a
+              // save that finishes *after* newer edits arrived can't mark the
+              // scene clean and drop them.
+              const savedHash = computeSceneHash(elements, appState, files);
 
-        const res = await fetch("/data", {
-          method: "POST",
-          headers: { "Content-Type": contentTypeHeader },
-          body,
-        });
-        if (res.ok) {
-          onSaved(Date.now() + 2000);
+              let body: BodyInit;
+              let contentTypeHeader: string;
 
-          // Decide dirty bookkeeping *before* the toast: the write succeeded,
-          // but if newer edits landed mid-flight the latest scene is still
-          // dirty, so a "Saved" status would mislead about a stale snapshot
-          // (review 6, finding 3). Only report "Saved" when this response leaves
-          // the scene actually clean.
-          const decision = decideSaveOutcome({
-            savedHash,
-            currentHash: prevHashRef.current,
-            autoSave,
-            mySeq,
-            lastCompletedSeq: lastCompletedSaveSeqRef.current,
-          });
+              if (contentType === "image/svg+xml") {
+                const nonDeleted = elements.filter((e) => !e.isDeleted);
+                // exportEmbedScene: true writes the scene JSON into the file so
+                // it can be re-opened and edited. Without it, saving an
+                // .excalidraw.svg strips the scene and the file becomes an
+                // unloadable plain image.
+                const svg = await exportToSvg({
+                  elements: nonDeleted,
+                  appState: { ...appState, exportEmbedScene: true },
+                  files,
+                });
+                body = svg.outerHTML;
+                contentTypeHeader = "image/svg+xml";
+              } else if (contentType === "image/png") {
+                const nonDeleted = elements.filter((e) => !e.isDeleted);
+                const blob = await exportToBlob({
+                  elements: nonDeleted,
+                  // Embed the scene so the .excalidraw.png round-trips back
+                  // into the editor.
+                  appState: { ...appState, exportEmbedScene: true },
+                  files,
+                  getDimensions(width: number, height: number) {
+                    const scale =
+                      (appState as { exportScale?: number }).exportScale ?? 2;
+                    return { width: width * scale, height: height * scale, scale };
+                  },
+                });
+                if (!blob) {
+                  return { ok: false, error: "PNG export produced no data" };
+                }
+                body = await blob.arrayBuffer();
+                contentTypeHeader = "image/png";
+              } else {
+                body = serializeAsJSON(elements, appState, files, "local");
+                contentTypeHeader = "application/json";
+              }
 
-          if (decision.superseded) {
-            // A newer save already resolved and owns the dirty state — don't
-            // touch it. Report cleanliness from the live flag so a waiting close
-            // flow still gets an accurate answer.
-            if (showIndicator) {
-              api.setToast(
-                dirtyRef.current
-                  ? { message: "Unsaved changes", duration: 1500 }
-                  : { message: "Saved", duration: 1200 },
-              );
+              const write = await controller.attemptViewerWrite({
+                body,
+                contentType: contentTypeHeader,
+                reason: opts?.reason ?? "manual",
+                send: async ({ ifMatch, body: outgoing, contentType: ct }) => {
+                  try {
+                    const res = await fetch(dataUrl, {
+                      method: "POST",
+                      headers: { "Content-Type": ct, "If-Match": ifMatch },
+                      body: outgoing,
+                    });
+                    if (res.ok) {
+                      const etag = res.headers.get("ETag");
+                      return etag
+                        ? { kind: "ok", etag }
+                        : {
+                            kind: "error",
+                            message:
+                              "Save succeeded but the server sent no revision — not advancing the accepted baseline",
+                          };
+                    }
+                    if (res.status === 412) {
+                      return {
+                        kind: "conflict",
+                        etag: res.headers.get("ETag") ?? "",
+                      };
+                    }
+                    if (res.status === 428) {
+                      return {
+                        kind: "error",
+                        message: "Save failed (HTTP 428: missing If-Match)",
+                        preconditionRequired: true,
+                      };
+                    }
+                    return {
+                      kind: "error",
+                      message: `Save failed: HTTP ${res.status}`,
+                    };
+                  } catch (e) {
+                    return {
+                      kind: "error",
+                      message: e instanceof Error ? e.message : String(e),
+                    };
+                  }
+                },
+              });
+
+              if (write.kind !== "ok") {
+                if (write.kind === "blocked") {
+                  if (write.reason === "conflict-pending") {
+                    // Nothing writes while a conflict is pending — the user
+                    // must resolve it first. Report failure so a close flow
+                    // keeps the window open and the conflict stays surfaced.
+                    if (showIndicator) {
+                      api.setToast({
+                        message: "Resolve the file conflict before saving",
+                        duration: 4000,
+                      });
+                    }
+                    return { ok: false, error: "file conflict pending" };
+                  }
+                  if (write.reason === "automatic-paused") {
+                    // Automatic flush while a Keep acknowledgment is active:
+                    // expected — stay quiet unless an indicator is showing.
+                    if (showIndicator) {
+                      api.setToast({ message: "Save paused — next save replaces the disk version", duration: 3000 });
+                    }
+                    return { ok: false, error: "automatic saves paused" };
+                  }
+                  return { ok: false, error: write.reason };
+                }
+                if (write.kind === "conflict") {
+                  if (showIndicator) {
+                    api.setToast({
+                      message:
+                        "File changed on disk — Reload it or keep your changes",
+                      duration: 5000,
+                    });
+                  }
+                  return { ok: false, error: write.error };
+                }
+                if (showIndicator) {
+                  api.setToast({ message: write.error, duration: 5000 });
+                }
+                return { ok: false, error: write.error };
+              }
+
+              // Decide dirty bookkeeping *before* the toast: the write
+              // succeeded, but if newer edits landed mid-flight the latest
+              // scene is still dirty, so a "Saved" status would mislead about
+              // a stale snapshot (review 6, finding 3). Only report "Saved"
+              // when this response leaves the scene actually clean.
+              const decision = decideSaveOutcome({
+                savedHash,
+                currentHash: prevHashRef.current,
+                autoSave,
+                mySeq,
+                lastCompletedSeq: lastCompletedSaveSeqRef.current,
+              });
+
+              if (decision.superseded) {
+                // A newer save already resolved and owns the dirty state —
+                // don't touch it. Report cleanliness from the live flag so a
+                // waiting close flow still gets an accurate answer.
+                if (showIndicator) {
+                  api.setToast(
+                    dirtyRef.current
+                      ? { message: "Unsaved changes", duration: 1500 }
+                      : { message: "Saved", duration: 1200 },
+                  );
+                }
+                return { ok: !dirtyRef.current };
+              }
+
+              lastCompletedSaveSeqRef.current = mySeq;
+
+              if (decision.clearDirty) {
+                dirtyRef.current = false;
+                schedulerRef.current?.noteClean();
+                reportDirty(false, false, Date.now());
+                if (showIndicator) {
+                  api.setToast({ message: "Saved", duration: 1200 });
+                }
+                return { ok: true };
+              }
+
+              // Newer edits landed mid-flight — stay dirty so close-confirm
+              // still fires, and restart the max-wait window from now.
+              schedulerRef.current?.markDirtyNow();
+              reportDirty(true, decision.rescheduleSave, Date.now());
+              if (decision.rescheduleSave) {
+                schedulerRef.current?.armFollowUp();
+              }
+              // The snapshot reached disk, but the live scene has moved on —
+              // keep the indicator honest rather than flashing "Saved" for a
+              // stale write. The follow-up auto-save (or close retry) reports
+              // the final success.
+              if (showIndicator) {
+                api.setToast({ message: "Unsaved changes", duration: 1500 });
+              }
+              // Not safe to close: the latest scene is not yet on disk.
+              // Reported as a non-fatal "pending" so a close-and-save flow
+              // retries rather than closing over the unsaved edit (findings
+              // 1 + 2).
+              return {
+                ok: false,
+                error: "newer edits pending",
+                pendingNewerEdits: true,
+              };
+            } finally {
+              savingCountRef.current -= 1;
+              // Retry a reload deferred while this save was in flight.
+              controllerRef.current?.saveSettled();
+              if (opts?.reason === "maxwait") {
+                schedulerRef.current?.clearMaxWaitInFlight();
+              }
             }
-            return { ok: !dirtyRef.current };
-          }
-
-          lastCompletedSaveSeqRef.current = mySeq;
-
-          if (decision.clearDirty) {
-            dirtyRef.current = false;
-            autoSaveState.current.firstDirtyAt = null;
-            reportDirty(false, false, Date.now());
-            if (showIndicator) api.setToast({ message: "Saved", duration: 1200 });
-            return { ok: true };
-          }
-
-          // Newer edits landed mid-flight — stay dirty so close-confirm still
-          // fires, and restart the max-wait window from now.
-          autoSaveState.current.firstDirtyAt = Date.now();
-          reportDirty(true, decision.rescheduleSave, Date.now());
-          if (decision.rescheduleSave) {
-            if (saveTimer.current) clearTimeout(saveTimer.current);
-            saveTimer.current = setTimeout(
-              () => void doSave({ reason: "autosave" }),
-              SAVE_DEBOUNCE_MS,
-            );
-          }
-          // The snapshot reached disk, but the live scene has moved on — keep the
-          // indicator honest rather than flashing "Saved" for a stale write. The
-          // follow-up auto-save (or close retry) reports the final success.
-          if (showIndicator) {
-            api.setToast({ message: "Unsaved changes", duration: 1500 });
-          }
-          // Not safe to close: the latest scene is not yet on disk. Reported as
-          // a non-fatal "pending" so a close-and-save flow retries rather than
-          // closing over the unsaved edit (findings 1 + 2).
-          return {
-            ok: false,
-            error: "newer edits pending",
-            pendingNewerEdits: true,
-          };
-        }
-        if (showIndicator) {
-          api.setToast({
-            message: `Save failed (HTTP ${res.status})`,
-            duration: 5000,
-          });
-        }
-        return { ok: false, error: `Save failed: HTTP ${res.status}` };
+          },
+        );
       } catch (e) {
-        // Network errors (preview server may have shut down) surface to the
-        // caller; the scene stays dirty so the edit isn't silently lost.
+        // Export/serialization threw, or the queue op rejected outside the
+        // handled paths. The scene stays dirty so the edit isn't silently lost.
         const error = e instanceof Error ? e.message : String(e);
         if (showIndicator) {
           apiRef.current?.setToast({ message: "Save failed", duration: 5000 });
@@ -397,11 +585,17 @@ export default function App({
         return { ok: false, error };
       }
     },
-    [autoSave, contentType, onSaved, reportDirty],
+    [autoSave, contentType, dataUrl, reportDirty],
   );
 
-  // New empty file: persist a valid blank scene in the declared format (JSON files are
-  // already bootstrapped server-side; this covers .excalidraw.svg / .excalidraw.png).
+  useEffect(() => {
+    doSaveRef.current = doSave;
+  }, [doSave]);
+
+  // New empty file: persist a valid blank scene in the declared format (JSON
+  // files are already bootstrapped server-side; this covers .excalidraw.svg /
+  // .excalidraw.png). The conditional write matches the empty-file revision
+  // the initial GET accepted.
   useEffect(() => {
     if (bootstrapSave) {
       void doSave({ reason: "bootstrap" });
@@ -419,9 +613,9 @@ export default function App({
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "s") {
         e.preventDefault();
-        // Flush here too so the doSave fallback (bridge not yet registered) still
-        // cancels the debounce; the bridge flushes itself otherwise.
-        flushPendingSave(saveTimer);
+        // Flush here too so the doSave fallback (bridge not yet registered)
+        // still cancels the debounce; the bridge flushes itself otherwise.
+        schedulerRef.current?.cancelPending();
         void (window.__excalidrawSave ?? doSave)({ reason: "keyboard" });
       }
     };
@@ -431,8 +625,10 @@ export default function App({
 
   /**
    * onChange — tracks dirty state across elements, appState, and files, and
-   * (when autoSave is enabled) debounces a save. No-ops on viewport /
-   * selection-only events because those don't alter the scene hash.
+   * (when auto-save is enabled) debounces a save through the pause-aware
+   * scheduler. No-ops on viewport / selection-only events because those don't
+   * alter the scene hash. Also detects the end of a text edit so a reload
+   * deferred mid-edit is retried.
    */
   const handleChange = useCallback(
     (
@@ -444,9 +640,10 @@ export default function App({
       if (hash === prevHashRef.current) return;
       prevHashRef.current = hash;
 
-      // Keep the menu toggle's label in step with the live export-dark-mode flag
-      // (it's part of the persisted appState, so it only changes on a real edit —
-      // here, past the no-op hash guard). setState bails out when unchanged.
+      // Keep the menu toggle's label in step with the live export-dark-mode
+      // flag (it's part of the persisted appState, so it only changes on a
+      // real edit — here, past the no-op hash guard). setState bails out when
+      // unchanged.
       const liveExportDark = Boolean(
         (appState as { exportWithDarkMode?: boolean }).exportWithDarkMode,
       );
@@ -457,42 +654,33 @@ export default function App({
         reportDirty(true, autoSave);
       }
 
-      if (!autoSave) return;
-      const schedule = decideAutoSaveSchedule(
-        Date.now(),
-        SAVE_MAX_WAIT_MS,
-        autoSaveState.current,
-      );
-      if (saveTimer.current) clearTimeout(saveTimer.current);
-      if (schedule === "flush-maxwait") {
-        // Debounce starvation guard: edits have been streaming in past the max
-        // wait, so flush now instead of resetting the timer yet again. The
-        // scheduler restarted the window and set the in-flight guard; clear that
-        // guard once the save settles so the *next* checkpoint can fire (review
-        // 6, finding 2).
-        saveTimer.current = null;
-        void doSave({ reason: "maxwait" }).finally(() => {
-          autoSaveState.current.maxWaitSaveInFlight = false;
-        });
-      } else {
-        saveTimer.current = setTimeout(
-          () => void doSave({ reason: "autosave" }),
-          SAVE_DEBOUNCE_MS,
-        );
+      // A reload deferred while the user was mid-text-edit is re-decided now
+      // (never discarded).
+      const editing = Boolean(appState.editingTextElement);
+      if (wasEditingRef.current && !editing) {
+        controllerRef.current?.editingEnded();
       }
+      wasEditingRef.current = editing;
+
+      if (!autoSave) return;
+      schedulerRef.current?.noteEdit();
     },
-    [autoSave, doSave, reportDirty],
+    [autoSave, reportDirty],
   );
 
   // Auto-save flush triggers: end of a draw stroke (pointerup) and the user
   // switching away (window blur). Both clear any pending debounce and save
   // immediately when the scene is dirty, so edits aren't left unsaved at a
-  // natural stopping point. No-op when auto-save is off.
+  // natural stopping point. Blocked while the scheduler is paused (a conflict
+  // is pending or a Keep acknowledgment is active). No-op when auto-save is
+  // off.
   useEffect(() => {
     if (!autoSave) return;
     const flush = () => {
+      const scheduler = schedulerRef.current;
+      if (!scheduler || !scheduler.shouldFlush()) return;
       if (!dirtyRef.current) return;
-      flushPendingSave(saveTimer);
+      scheduler.cancelPending();
       void doSave({ reason: "flush" });
     };
     window.addEventListener("pointerup", flush);
@@ -528,8 +716,8 @@ export default function App({
    * Flips the document's color mode (appState.exportWithDarkMode) — the single
    * flag driving the editor canvas theme, the baked rendering of the saved
    * .excalidraw.svg/.png, every image/SVG export, and the right-click "Copy as
-   * SVG". Applied via updateScene (a real appState edit), so it persists with the
-   * scene, re-themes the canvas, and saves like any other edit.
+   * SVG". Applied via updateScene (a real appState edit), so it persists with
+   * the scene, re-themes the canvas, and saves like any other edit.
    */
   const toggleExportDarkMode = useCallback(() => {
     const api = apiRef.current;
@@ -581,10 +769,10 @@ export default function App({
 
   /**
    * Writes the given library items to the shared library file and resolves to
-   * whether the write durably succeeded. The dirty flag is cleared **only** on a
-   * confirmed `2xx`; a `500` or rejected fetch leaves it set so the edit is
-   * retried rather than acknowledged and lost (review 6, finding 1). Never
-   * rejects — a dead server resolves to `false`.
+   * whether the write durably succeeded. The dirty flag is cleared **only** on
+   * a confirmed `2xx` — a `500` or rejected fetch leaves it set so the edit is
+   * retried by a later flush rather than acknowledged and lost (review 6,
+   * finding 1).
    */
   const persistLibrary = useCallback(
     (items: LibraryItems): Promise<boolean> =>
@@ -633,32 +821,49 @@ export default function App({
       // keyboard, and the close flow — gets identical semantics: cancel any
       // pending auto-save and tell Rust the scheduled save is gone before
       // performing the immediate, authoritative save (review 5, finding 2).
-      if (flushPendingSave(saveTimer)) reportDirty(dirtyRef.current, false);
+      if (schedulerRef.current?.cancelPending()) {
+        reportDirty(dirtyRef.current, false);
+      }
 
-      let result = await doSave(opts);
-      // Close-and-save must not report success while the scene is still dirty
-      // from edits that landed mid-save. Re-save (bounded) so the very latest
-      // scene reaches disk before the window is allowed to close (findings 1+2).
-      if (opts?.reason === "close") {
-        let attempts = 0;
-        while (
-          !result.ok &&
-          result.pendingNewerEdits &&
-          attempts < CLOSE_SAVE_MAX_RETRIES
-        ) {
-          attempts++;
-          // Drop any debounced auto-save so the retry is the authoritative save.
-          flushPendingSave(saveTimer);
-          result = await doSave(opts);
+      // The close flow is a native confirmation flow: while it runs, the sync
+      // controller defers any conflict-modal escalation so two prompts never
+      // fight for the keyboard. The save itself is conditional; on a 412 it
+      // reports failure (window stays open) with the conflict surfaced.
+      const isClose = opts?.reason === "close";
+      if (isClose) controllerRef.current?.notifyNativeCloseFlow(true);
+      let result: NativeSaveResult;
+      try {
+        result = await doSave(opts);
+        if (isClose) {
+          let attempts = 0;
+          let current = result;
+          // Close-and-save must not report success while the scene is still
+          // dirty from edits that landed mid-save. Re-save (bounded) so the
+          // very latest scene reaches disk before the window is allowed to
+          // close (findings 1+2). A 412 conflict is NOT retried — it is a hard
+          // failure that leaves the window open for the user to resolve.
+          while (
+            !current.ok &&
+            current.pendingNewerEdits &&
+            attempts < CLOSE_SAVE_MAX_RETRIES
+          ) {
+            attempts++;
+            // Drop any debounced auto-save so the retry is the authoritative save.
+            schedulerRef.current?.cancelPending();
+            current = await doSave(opts);
+          }
+          // Make any pending library edit/import durable before the window
+          // exits. A failed library write must block a clean close just like
+          // an unsaved scene would, so the user isn't told "saved" over a lost
+          // library (review 6, finding 1).
+          const libraryPersisted = await flushLibrary();
+          if (current.ok && !libraryPersisted) {
+            current = { ok: false, error: "Library write failed" };
+          }
+          result = current;
         }
-        // Make any pending library edit/import durable before the window exits.
-        // A failed library write must block a clean close just like an unsaved
-        // scene would, so the user isn't told "saved" over a lost library
-        // (review 6, finding 1).
-        const libraryPersisted = await flushLibrary();
-        if (result.ok && !libraryPersisted) {
-          result = { ok: false, error: "Library write failed" };
-        }
+      } finally {
+        if (isClose) controllerRef.current?.notifyNativeCloseFlow(false);
       }
       await reportActionResult(
         opts?.requestId ?? generateRequestId(),
@@ -702,18 +907,25 @@ export default function App({
     // Live dirty-state query for the native close flow. Reports the *current*
     // dirtyRef (ok:true ⇒ no unsaved changes ⇒ safe to close) so native code
     // decides from truth rather than a possibly-stale POST /dirty (finding 2).
+    // Runs while the native close-confirmation flow is active.
     window.__excalidrawPrepareClose = async (
       opts?: NativeSaveOptions,
     ): Promise<NativeSaveResult> => {
-      // Flush any pending library edit/import before the window is allowed to
-      // close, even when the scene itself is clean (review 5, finding 1). A
-      // failed library write keeps the window open — report not-clean so the
-      // edit isn't silently dropped (review 6, finding 1).
-      const libraryPersisted = await flushLibrary();
-      const result: NativeSaveResult = {
-        ok: !dirtyRef.current && libraryPersisted,
-        ...(libraryPersisted ? {} : { error: "Library write failed" }),
-      };
+      controllerRef.current?.notifyNativeCloseFlow(true);
+      let result: NativeSaveResult;
+      try {
+        // Flush any pending library edit/import before the window is allowed
+        // to close, even when the scene itself is clean (review 5, finding 1).
+        // A failed library write keeps the window open — report not-clean so
+        // the edit isn't silently dropped (review 6, finding 1).
+        const libraryPersisted = await flushLibrary();
+        result = {
+          ok: !dirtyRef.current && libraryPersisted,
+          ...(libraryPersisted ? {} : { error: "Library write failed" }),
+        };
+      } finally {
+        controllerRef.current?.notifyNativeCloseFlow(false);
+      }
       await reportActionResult(
         opts?.requestId ?? generateRequestId(),
         "prepareClose",
@@ -763,9 +975,9 @@ export default function App({
             });
             libraryItemsRef.current = merged;
             // Only acknowledge the import once the write is durable. A failed
-            // `/library` write must report `ok: false` (and keep the merged items
-            // dirty for a later flush) rather than claim success over a lost
-            // write (review 6, finding 1).
+            // `/library` write must report `ok: false` (and keep the merged
+            // items dirty for a later flush) rather than claim success over a
+            // lost write (review 6, finding 1).
             const persisted = await persistLibrary(merged);
             if (persisted) {
               const count = (lib.libraryItems as LibraryItems).length;
@@ -859,6 +1071,18 @@ export default function App({
 
   return (
     <div style={{ height: "100%" }}>
+      <ConflictBanner
+        state={syncUi}
+        onReloadFromDisk={() => void controllerRef.current?.resolveReload()}
+        onKeepMyChanges={() => controllerRef.current?.resolveKeep()}
+        onRetryError={() => controllerRef.current?.retryError()}
+      />
+      <ConflictModal
+        open={syncUi.modalRevision !== null}
+        onKeep={() => controllerRef.current?.resolveKeep()}
+        onReload={() => void controllerRef.current?.resolveReload()}
+        onDismiss={() => controllerRef.current?.dismissModal()}
+      />
       <Excalidraw
         excalidrawAPI={(api) => {
           apiRef.current = api;
@@ -870,8 +1094,8 @@ export default function App({
         theme={exportDarkMode ? "dark" : "light"}
         name={name}
         // Point the built-in "Browse libraries" round-trip at our server's
-        // landing page instead of excalidraw.com. The libraries site opens in the
-        // system browser and its "Add to Excalidraw" button returns here as
+        // landing page instead of excalidraw.com. The libraries site opens in
+        // the system browser and its "Add to Excalidraw" button returns here as
         // `…/library-install#addLibrary=<url>`; that page hands the URL to the
         // server, which fetches it and pushes it back over SSE (the `library`
         // event runs __excalidrawApplyPendingLibraries below).

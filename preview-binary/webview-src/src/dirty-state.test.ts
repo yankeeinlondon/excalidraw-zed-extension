@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // hashElementsVersion is pulled in transitively via seedHashFromInitialData →
 // computeSceneHash; stub it with a deterministic length-based hash so the
@@ -12,12 +12,15 @@ vi.mock("@excalidraw/excalidraw", () => ({
 
 import {
   applyExternalReload,
+  AutoSaveScheduler,
   decideAutoSaveSchedule,
   decideSaveOutcome,
   flushPendingLibrary,
   flushPendingSave,
   initialLibraryItems,
   persistLibraryItems,
+  RevisionTracker,
+  SaveQueue,
   seedHashFromInitialData,
   type AutoSaveState,
   type ReloadSceneApi,
@@ -512,5 +515,202 @@ describe("initialLibraryItems", () => {
     expect(
       initialLibraryItems({ libraryItems: undefined } as ExcalidrawInitialDataState),
     ).toEqual([]);
+  });
+});
+
+describe("RevisionTracker", () => {
+  const R0 = '"sha256-r0"';
+  const R1 = '"sha256-r1"';
+  const R2 = '"sha256-r2"';
+
+  it("seeds from the initial GET and uses it as the write header (empty files included)", () => {
+    const tracker = new RevisionTracker();
+    expect(tracker.writeHeader()).toBeNull();
+    tracker.seed(R0);
+    expect(tracker.acceptedRevision()).toBe(R0);
+    expect(tracker.writeHeader()).toBe(R0);
+    expect(tracker.isKnown(R0)).toBe(true);
+  });
+
+  it("a successful write advances the accepted revision", () => {
+    const tracker = new RevisionTracker();
+    tracker.seed(R0);
+    tracker.writeAccepted(R1);
+    expect(tracker.acceptedRevision()).toBe(R1);
+    expect(tracker.writeHeader()).toBe(R1);
+    expect(tracker.isKnown(R1)).toBe(true);
+    // The previous revision is no longer known: seeing it again would mean
+    // disk went backwards — a fresh decision.
+    expect(tracker.isKnown(R0)).toBe(false);
+  });
+
+  it("Keep-my-changes authorizes exactly one overwrite without moving the baseline", () => {
+    const tracker = new RevisionTracker();
+    tracker.seed(R0);
+    tracker.authorizeOverwrite(R1);
+    // Baseline unchanged; the next write speaks the authorized revision.
+    expect(tracker.acceptedRevision()).toBe(R0);
+    expect(tracker.writeHeader()).toBe(R1);
+    expect(tracker.isKnown(R1)).toBe(true);
+    // The authorized write consumes the authorization.
+    tracker.writeAccepted(R2);
+    expect(tracker.acceptedRevision()).toBe(R2);
+    expect(tracker.expectedOverwriteRevision()).toBeNull();
+    expect(tracker.writeHeader()).toBe(R2);
+  });
+
+  it("a second external revision after Keep is unknown and must conflict, not overwrite", () => {
+    const tracker = new RevisionTracker();
+    tracker.seed(R0);
+    tracker.authorizeOverwrite(R1);
+    expect(tracker.isKnown(R2)).toBe(false);
+  });
+
+  it("applying an external reload advances the baseline and drops the Keep authorization", () => {
+    const tracker = new RevisionTracker();
+    tracker.seed(R0);
+    tracker.authorizeOverwrite(R1);
+    tracker.acceptedFromReload(R2);
+    expect(tracker.acceptedRevision()).toBe(R2);
+    expect(tracker.expectedOverwriteRevision()).toBeNull();
+    expect(tracker.writeHeader()).toBe(R2);
+  });
+});
+
+describe("SaveQueue", () => {
+  it("runs operations strictly in enqueue order (an older scene can never land after a newer one)", async () => {
+    const queue = new SaveQueue();
+    const events: string[] = [];
+    const slow = queue.enqueue(async () => {
+      events.push("a-start");
+      await new Promise((r) => setTimeout(r, 20));
+      events.push("a-end");
+      return "a";
+    });
+    const fast = queue.enqueue(async () => {
+      events.push("b-start");
+      events.push("b-end");
+      return "b";
+    });
+    expect(await slow).toBe("a");
+    expect(await fast).toBe("b");
+    expect(events).toEqual(["a-start", "a-end", "b-start", "b-end"]);
+  });
+
+  it("a rejected operation does not poison the queue behind it", async () => {
+    const queue = new SaveQueue();
+    const failure = queue.enqueue(async () => {
+      throw new Error("boom");
+    });
+    const after = queue.enqueue(async () => "ok");
+    await expect(failure).rejects.toThrow("boom");
+    await expect(after).resolves.toBe("ok");
+  });
+
+  it("a queued follow-up write uses the revision acknowledged by the preceding write", async () => {
+    // Mirrors the App wiring: each queued op reads the tracker at write time
+    // (after its async export), never a revision captured before it.
+    const queue = new SaveQueue();
+    const tracker = new RevisionTracker();
+    tracker.seed('"sha256-seed"');
+    const seenHeaders: string[] = [];
+
+    const exportStep = () => new Promise((r) => setTimeout(r, 10));
+
+    const first = queue.enqueue(async () => {
+      await exportStep();
+      const ifMatch = tracker.writeHeader()!;
+      seenHeaders.push(ifMatch);
+      tracker.writeAccepted('"sha256-w1"');
+    });
+    const second = queue.enqueue(async () => {
+      await exportStep();
+      // Reads the revision acknowledged by the *first* write.
+      seenHeaders.push(tracker.writeHeader()!);
+    });
+    await Promise.all([first, second]);
+
+    expect(seenHeaders[0]).toBe('"sha256-seed"');
+    expect(seenHeaders[1]).toBe('"sha256-w1"');
+  });
+});
+
+describe("AutoSaveScheduler", () => {
+  function makeScheduler() {
+    const saves: Array<"autosave" | "maxwait"> = [];
+    const scheduler = new AutoSaveScheduler({
+      debounceMs: 300,
+      maxWaitMs: 2000,
+      save: (reason) => saves.push(reason),
+    });
+    return { scheduler, saves };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("debounces edits and flushes once after the debounce window", () => {
+    const { scheduler, saves } = makeScheduler();
+    scheduler.noteEdit(0);
+    scheduler.noteEdit(100);
+    scheduler.noteEdit(200);
+    expect(saves).toEqual([]);
+    vi.advanceTimersByTime(300);
+    expect(saves).toEqual(["autosave"]);
+  });
+
+  it("flushes immediately at the max-wait bound and guards overlapping flushes", () => {
+    const { scheduler, saves } = makeScheduler();
+    scheduler.noteEdit(0);
+    scheduler.noteEdit(2000);
+    expect(saves).toEqual(["maxwait"]);
+    // In-flight guard: further edits stay on the debounce path until the
+    // caller clears the guard.
+    scheduler.noteEdit(2001);
+    expect(saves).toEqual(["maxwait"]);
+    expect(scheduler.isPending()).toBe(true);
+    scheduler.clearMaxWaitInFlight();
+    scheduler.noteEdit(4001);
+    expect(saves).toEqual(["maxwait", "maxwait"]);
+  });
+
+  it("pause cancels the pending debounce and blocks new scheduling", () => {
+    const { scheduler, saves } = makeScheduler();
+    scheduler.noteEdit(0);
+    expect(scheduler.isPending()).toBe(true);
+    scheduler.pause();
+    expect(scheduler.isPending()).toBe(false);
+    vi.advanceTimersByTime(10_000);
+    expect(saves).toEqual([]);
+    // Edits while paused never schedule.
+    scheduler.noteEdit(10_001);
+    expect(scheduler.isPending()).toBe(false);
+    expect(scheduler.shouldFlush()).toBe(false);
+    vi.advanceTimersByTime(10_000);
+    expect(saves).toEqual([]);
+  });
+
+  it("armFollowUp is suppressed while paused (auto-save stays paused until resolution)", () => {
+    const { scheduler, saves } = makeScheduler();
+    scheduler.pause();
+    scheduler.armFollowUp();
+    expect(scheduler.isPending()).toBe(false);
+    vi.advanceTimersByTime(10_000);
+    expect(saves).toEqual([]);
+  });
+
+  it("resume re-enables scheduling but does not fire anything by itself", () => {
+    const { scheduler, saves } = makeScheduler();
+    scheduler.pause();
+    scheduler.resume();
+    vi.advanceTimersByTime(10_000);
+    expect(saves).toEqual([]);
+    scheduler.noteEdit(10_001);
+    vi.advanceTimersByTime(300);
+    expect(saves).toEqual(["autosave"]);
   });
 });

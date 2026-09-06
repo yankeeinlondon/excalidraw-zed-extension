@@ -298,14 +298,249 @@ export function applyExternalReload(
 /**
  * The library items to seed the panel (and the native "Export Library…" mirror)
  * with on mount. Returns the persisted items from `initialData` when present,
- * else an empty list — so exporting before any `onLibraryChange` still writes
- * the saved library rather than an empty one.
+ * else an empty list — so exporting before any `onLibraryChange` still writes the
+ * saved library rather than an empty one.
  */
 export function initialLibraryItems(
   initialData: ExcalidrawInitialDataState | null | undefined,
 ): LibraryItems {
   const items = initialData?.libraryItems;
   return Array.isArray(items) ? (items as LibraryItems) : [];
+}
+
+// ── Disk revision tracking (conditional-save contract) ───────────────────────
+//
+// The disk file is the persisted interchange between this viewer and every
+// external editor (Zed, git, CLI tools). The viewer speaks about disk in
+// *revisions* — opaque strong ETag strings it echoes byte-for-byte in
+// `If-Match` and never parses or computes locally.
+
+/**
+ * Tracks the two disk revisions the conditional-save contract needs:
+ *
+ * - `accepted` — the revision of the snapshot the viewer last *accepted* (the
+ *   initial `GET /data`, including an empty file, or the revision produced by a
+ *   successful reload application or viewer write). This is the viewer's
+ *   baseline; it advances only on confirmed success, never speculatively.
+ * - `expectedOverwrite` — set only by an explicit "Keep my changes" decision,
+ *   authorizing exactly one subsequent write to replace that disk revision.
+ *   It is consumed by the write it authorizes and never outlives it.
+ *
+ * This is strictly disk bookkeeping; the scene fingerprint (`prevHashRef`)
+ * remains a separate concept and must never be conflated with a revision.
+ */
+export class RevisionTracker {
+  private acceptedRevisionValue: string | null = null;
+  private expectedOverwriteValue: string | null = null;
+
+  /** Seeds the accepted revision from the initial `GET /data` ETag. */
+  seed(revision: string): void {
+    this.acceptedRevisionValue = revision;
+  }
+
+  /** The revision of the last snapshot the viewer accepted, if any yet. */
+  acceptedRevision(): string | null {
+    return this.acceptedRevisionValue;
+  }
+
+  /** The revision a "Keep my changes" decision authorized overwriting, if any. */
+  expectedOverwriteRevision(): string | null {
+    return this.expectedOverwriteValue;
+  }
+
+  /**
+   * The `If-Match` header value for the next canonical write: the authorized
+   * overwrite revision when one is pending, else the accepted revision. Read at
+   * write time (after export) so a queued follow-up write always carries the
+   * revision acknowledged by the write that preceded it.
+   */
+  writeHeader(): string | null {
+    return this.expectedOverwriteValue ?? this.acceptedRevisionValue;
+  }
+
+  /**
+   * Whether `revision` is one this viewer has already accepted or explicitly
+   * authorized — i.e. observing it on disk demands no fresh decision. This is
+   * what replaces time-based echo suppression: a viewer write's own revision is
+   * *proven* known the moment it is acknowledged.
+   */
+  isKnown(revision: string): boolean {
+    return (
+      revision === this.acceptedRevisionValue ||
+      revision === this.expectedOverwriteValue
+    );
+  }
+
+  /**
+   * A viewer write succeeded and the server returned the written revision:
+   * adopt it as the new accepted revision. The authorized overwrite (if this
+   * write was the one "Keep my changes" authorized) is consumed.
+   */
+  writeAccepted(revision: string): void {
+    this.acceptedRevisionValue = revision;
+    this.expectedOverwriteValue = null;
+  }
+
+  /**
+   * An external snapshot was successfully applied through the guarded reload
+   * path: its revision becomes the accepted baseline. Any pending "Keep my
+   * changes" authorization is invalidated — it spoke about a disk version that
+   * no longer exists.
+   */
+  acceptedFromReload(revision: string): void {
+    this.acceptedRevisionValue = revision;
+    this.expectedOverwriteValue = null;
+  }
+
+  /**
+   * "Keep my changes": authorize exactly one future write to replace
+   * `revision`. The accepted baseline deliberately does **not** move — the
+   * viewer still holds unsaved work against the older baseline, and a *second*
+   * external revision landing afterwards must produce a fresh conflict rather
+   * than be overwritten.
+   */
+  authorizeOverwrite(revision: string): void {
+    this.expectedOverwriteValue = revision;
+  }
+}
+
+/**
+ * Serializes viewer saves through a single promise chain so the async
+ * export + conditional POST of one save can never interleave with (or land
+ * after) a newer save's. Operations run strictly in enqueue order; a rejected
+ * operation never poisons the queue for the ones behind it.
+ */
+export class SaveQueue {
+  private tail: Promise<unknown> = Promise.resolve();
+
+  enqueue<T>(op: () => Promise<T>): Promise<T> {
+    // `then(op, op)`: run after the predecessor settles, success or failure.
+    const run = this.tail.then(op, op);
+    // Swallow the outcome for chaining purposes only; `run` still rejects for
+    // the actual caller.
+    this.tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+}
+
+/**
+ * Pause-aware wrapper around the auto-save scheduling rules. While paused
+ * (a conflict is pending, or "Keep my changes" is awaiting an explicit save)
+ * no automatic flush of any kind fires: the debounce is cancelled, new edits
+ * do not schedule, and interactive flushes (pointer-up / blur) are told not
+ * to proceed. Resuming does not fire a save by itself — the next edit or the
+ * follow-up logic after a successful explicit save drives that.
+ */
+export class AutoSaveScheduler {
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private readonly state: AutoSaveState = {
+    firstDirtyAt: null,
+    maxWaitSaveInFlight: false,
+  };
+  private pausedValue = false;
+
+  constructor(
+    private readonly opts: {
+      debounceMs: number;
+      maxWaitMs: number;
+      save: (reason: "autosave" | "maxwait") => void;
+    },
+  ) {}
+
+  /** Pause every automatic flush and cancel any pending debounce timer. */
+  pause(): void {
+    this.pausedValue = true;
+    this.cancelPendingTimer();
+    this.state.firstDirtyAt = null;
+  }
+
+  /** Resume automatic flushes after the pause reason cleared. */
+  resume(): void {
+    this.pausedValue = false;
+  }
+
+  isPaused(): boolean {
+    return this.pausedValue;
+  }
+
+  /** Whether an interactive flush (pointer-up / blur / close) should run now. */
+  shouldFlush(): boolean {
+    return !this.pausedValue;
+  }
+
+  /**
+   * A dirtying edit arrived. Applies the debounce / bounded max-wait rules
+   * ({@link decideAutoSaveSchedule}); a no-op while paused.
+   */
+  noteEdit(now: number = Date.now()): void {
+    if (this.pausedValue) return;
+    const schedule = decideAutoSaveSchedule(now, this.opts.maxWaitMs, this.state);
+    this.cancelPendingTimer();
+    if (schedule === "flush-maxwait") {
+      this.opts.save("maxwait");
+    } else {
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        this.opts.save("autosave");
+      }, this.opts.debounceMs);
+    }
+  }
+
+  /**
+   * Arms a one-shot follow-up debounce (used after a save that finished with
+   * newer edits already pending). Replaces any pending timer.
+   */
+  armFollowUp(): void {
+    if (this.pausedValue) return;
+    this.cancelPendingTimer();
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.opts.save("autosave");
+    }, this.opts.debounceMs);
+  }
+
+  /** Cancels the pending debounce timer; returns whether one was pending. */
+  cancelPending(): boolean {
+    if (this.timer === null) return false;
+    this.cancelPendingTimer();
+    return true;
+  }
+
+  /** Clears the max-wait in-flight guard once a dispatched flush settles. */
+  clearMaxWaitInFlight(): void {
+    this.state.maxWaitSaveInFlight = false;
+  }
+
+  /**
+   * The scene became clean (a save matched the latest edits, or an external
+   * reload was applied): reset the max-wait clock. Does not touch the pause.
+   */
+  noteClean(): void {
+    this.state.firstDirtyAt = null;
+  }
+
+  /**
+   * The scene is dirty as of `now` (e.g. newer edits landed while a save was
+   * in flight): restart the max-wait window from this moment.
+   */
+  markDirtyNow(now: number = Date.now()): void {
+    this.state.firstDirtyAt = now;
+  }
+
+  /** Whether a debounce timer is currently armed. */
+  isPending(): boolean {
+    return this.timer !== null;
+  }
+
+  private cancelPendingTimer(): void {
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
 }
 
 /**
