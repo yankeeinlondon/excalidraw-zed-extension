@@ -1,0 +1,35 @@
+{
+  "case": "without-key",
+  "steps": [
+    "dropped onto <DIV>"
+  ],
+  "pageErrors": [],
+  "undoDisabledBefore": true,
+  "titleBefore": "Excalidraw Whiteboard",
+  "undoDisabledAfter": false,
+  "titleAfter": "Excalidraw Whiteboard",
+  "exportDialogControls": {
+    "Background": {
+      "checked": true,
+      "type": "checkbox"
+    },
+    "Dark mode": {
+      "checked": false,
+      "type": "checkbox"
+    },
+    "Embed scene": {
+      "checked": false,
+      "type": "checkbox"
+    },
+    "Scale": {
+      "checked": true,
+      "type": "radio"
+    }
+  },
+  "assetUrls": [
+    "https://excalidraw.com/assets/mermaid-to-excalidraw-D-aVQaad.js",
+    "https://excalidraw.com/assets/index-Dr31Xwxz.js",
+    "https://excalidraw.com/assets/workbox-window.prod.es5-B9K5rw8f.js",
+    "https://excalidraw.com/assets/roundRect-0PYZxl1G.js"
+  ]
+}
