@@ -1763,6 +1763,38 @@ fn version_flag_prints_the_crate_version_and_exits_zero() {
     );
 }
 
+/// The acceptance guard compares `--version` against the extension's
+/// `BINARY_VERSION` (the tag installed users download the binary from), so that
+/// comparison is only meaningful while the two agree. `just bump` moves all four
+/// version sites together; this fails the build if one is left behind. Kept on
+/// this side of the workspace because this entry makes no `extension/` changes.
+#[test]
+fn version_flag_matches_the_extension_binary_version_constant() {
+    let lib_rs = include_str!("../../extension/src/lib.rs");
+    let declared = lib_rs
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("const BINARY_VERSION: &str = "))
+        .map(|rest| rest.trim().trim_end_matches(';').trim_matches('"'))
+        .expect("extension/src/lib.rs must declare BINARY_VERSION");
+
+    let out = std::process::Command::new(binary())
+        .arg("--version")
+        .output()
+        .expect("failed to spawn preview binary with --version");
+    let printed = String::from_utf8_lossy(&out.stdout);
+    let printed = printed
+        .trim()
+        .strip_prefix("excalidraw-preview ")
+        .expect("--version must print `excalidraw-preview X.Y.Z`");
+
+    assert_eq!(
+        printed, declared,
+        "the binary reports {printed} but the extension downloads \
+         v{declared} — use `just bump` to move every version site together, or \
+         the acceptance build-identity check compares two unrelated numbers"
+    );
+}
+
 /// `-V` is clap's short form; acceptance runs and scripts may use either.
 #[test]
 fn version_short_flag_matches_the_long_form() {
@@ -1794,5 +1826,69 @@ fn version_flag_needs_no_file_argument_and_opens_nothing() {
         String::from_utf8_lossy(&out.stderr).is_empty(),
         "--version must not warn or error: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ── Read-only preview: a save gesture is never silent ────────────────────────
+
+/// A scene-less SVG: the file the read-only preview path exists for (an image
+/// exported without "Embed scene"), and the state in which no React app mounts.
+const SCENE_LESS_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="#eeeeee"/></svg>"##;
+
+/// End-to-end over the real binary and the real embedded bundle: a read-only
+/// image preview must serve a page that can *answer* a save gesture.
+///
+/// The native File → Save script (`SAVE_MENU_SCRIPT`) calls
+/// `window.__excalidrawSaveUnavailable` whenever `__excalidrawSave` is absent,
+/// which is always the case here — no scene means no editor. If the served
+/// bundle did not register that global, menu Save would be the silent no-op of
+/// spec §2.2 candidate 3 again (fixes/2026-09-05-fix-me-up, D2).
+///
+/// Skips when the build embedded no webview bundle (`assets/` is gitignored and
+/// built by `just ui`; `just test` alone does not build it).
+#[test]
+fn readonly_image_preview_serves_a_page_that_can_answer_a_save_gesture() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("readonly.excalidraw.svg");
+    std::fs::write(&file, SCENE_LESS_SVG).unwrap();
+
+    let preview = Preview::spawn(&file, &[]);
+
+    // The server classifies it as an image, and hands back bytes with no
+    // embedded scene — the two facts that send the client down the read-only
+    // branch (`main.tsx` renderReadonlyImage).
+    let (status, config) = http_get(&preview.url("/config"));
+    assert_eq!(status, 200);
+    assert!(
+        config.contains(r#""contentType":"image/svg+xml""#),
+        "config was: {config}"
+    );
+    let (status, body) = http_get(&preview.url("/data"));
+    assert_eq!(status, 200);
+    assert_eq!(body, SCENE_LESS_SVG);
+    assert!(
+        !body.contains("excalidraw"),
+        "fixture must carry no embedded scene"
+    );
+
+    let (status, index) = http_get(&preview.url("/"));
+    if status == 404 {
+        eprintln!("skipping: no webview bundle embedded in this build (run `just ui`)");
+        return;
+    }
+    assert_eq!(status, 200);
+
+    // Follow the page's own module script, exactly as the WebView would.
+    let script = index
+        .split("src=\"")
+        .find(|s| s.starts_with("/assets/") && s.contains(".js"))
+        .and_then(|s| s.split('"').next())
+        .unwrap_or_else(|| panic!("no module script in served index.html: {index}"));
+    let (status, bundle) = http_get(&preview.url(script));
+    assert_eq!(status, 200, "module script {script} must be served");
+    assert!(
+        bundle.contains("__excalidrawSaveUnavailable"),
+        "the served bundle ({script}) registers no save fallback, so a native \
+         Save in this read-only preview would be silent"
     );
 }
