@@ -92,15 +92,37 @@ https://github.com/user-attachments/assets/af3cd686-56b8-413c-9012-0f1c75e5f6c9
 
 
 
-1. Open any `.excalidraw`, `.excalidraw.svg`, or `.excalidraw.png` file in Zed.
+1. Open a `.excalidraw` or `.excalidraw.svg` file in Zed.
 2. A native window opens automatically with the rendered diagram — the extension's
    language server launches the preview when the file opens (`didOpen`). No command
    to run.
 3. Save the file in Zed — the preview live-reloads. Edit in the preview and press
    Ctrl/Cmd+S — it writes back to the file on disk.
 
+`.excalidraw.png` files open in Zed's built-in image viewer instead (a read-only
+render) — Zed's image pane claims PNGs before the extension can see them. For the
+editable preview of a `.excalidraw.png`, use the CLI:
+
+```bash
+excalidraw-preview ./path/to/diagram.excalidraw.png
+```
+
 Opening the same file again focuses the existing window instead of opening a new one.
 If you close the preview, saving the file in Zed reopens it.
+
+### Language registration notes
+
+The extension registers two languages with Zed — **Excalidraw**
+(`.excalidraw` files) and a grammar-less **SVG** (`.svg` files, so that
+`.excalidraw.svg` gets the preview; plain `.svg` files show "SVG" in the
+status bar and start an idle language server — no preview, no error).
+
+- Selecting a different language for a file (via the status bar or a
+  `file_types` override) detaches the preview's language server, which may
+  disable the automatic preview for that file. The CLI
+  (`excalidraw-preview <file>`) always works regardless of language selection.
+- The extension never rewrites your `file_types` settings or any other user
+  configuration.
 
 ### Auto-save
 
@@ -156,8 +178,17 @@ then run it via `task: spawn` in the command palette.
   Library items you add locally persist in
   `<config-dir>/excalidraw-zed/library.excalidrawlib` and are shared across all diagrams;
   use **Library → Import/Export Library…** for native `.excalidrawlib` round-trips.
-- **`.excalidraw.png` is a fully editable format**, not just a viewer target. Opening
-  one (automatically when you open it in Zed, or via the CLI) decodes the scene
-  embedded in the PNG, lets you edit it, and re-embeds the
-  scene on save so the file stays a valid Excalidraw PNG. The same applies to
+- **`.excalidraw.png` opens in Zed's image viewer, not the editable preview.**
+  Zed's built-in image pane claims `*.png` before any extension can observe
+  the open, so clicking a `.excalidraw.png` renders it read-only. The file
+  format itself is still fully editable — launch the viewer with
+  `excalidraw-preview <file>.excalidraw.png` and it decodes the embedded
+  scene, lets you edit it, and re-embeds the scene on save so the file stays a
+  valid Excalidraw PNG. The same embedded-scene round-trip applies to
   `.excalidraw.svg`.
+- **Plain `.svg` files show "SVG" in the status bar** and start an idle
+  language server (part of how `.excalidraw.svg` gets its preview — Zed only
+  delivers file-open events for single-segment suffixes). It's a no-op: no
+  preview spawns, nothing errors. Selecting a different language for a file
+  may disable its automatic preview — the CLI remains available. User
+  `file_types` settings are never rewritten by the extension.

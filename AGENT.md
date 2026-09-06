@@ -28,6 +28,9 @@ excalidraw-zed-extension/
 │   ├── Cargo.toml
 │   ├── src/
 │   │   └── lib.rs                  ← language server: download + spawn binary (--lsp)
+│   ├── languages/
+│   │   ├── excalidraw/config.toml  ← "Excalidraw" language (path_suffixes: ["excalidraw"])
+│   │   └── svg/config.toml         ← grammar-less "SVG" language (path_suffixes: ["svg"])
 │   └── extension.toml              ← Zed extension manifest
 │
 ├── preview-binary/                 ← companion native binary
@@ -90,23 +93,32 @@ resolver = "2"
 ```toml
 id = "excalidraw-preview"
 name = "Excalidraw Preview"
-version = "0.1.0"
+version = "0.6.0"
 schema_version = 1
-authors = ["you"]
+authors = ["Ken Snyder <ken@ken.net>"]
 description = "Preview .excalidraw files in a native window"
-repository = "https://github.com/you/excalidraw-zed-extension"
+repository = "https://github.com/yankeeinlondon/excalidraw-zed-extension"
 
 [language_servers.excalidraw-preview]
 name = "Excalidraw Preview"
-language = "Excalidraw"
-languages = []
+# The server→language mapping is declared here explicitly (not just via each
+# language config's `language_servers` key). JSON is deliberately NOT listed:
+# that would spawn our server for every JSON file the user opens.
+languages = ["Excalidraw", "SVG"]
+
+[[capabilities]]
+kind = "process:exec"
+command = "excalidraw-preview"
+args = ["*"]
 ```
 
 The extension does **not** register slash commands. An earlier version exposed
 `/preview-excalidraw` and `/new-excalidraw`, but Zed reserves the slash-command API
 for agent use and won't accept extension-provided commands into the registry yet
 (see PR zed-industries/extensions#6468). The preview is driven entirely through the
-language server instead — opening a `.excalidraw*` file auto-spawns the preview.
+language server instead — opening a `.excalidraw` or `.excalidraw.svg` file
+auto-spawns the preview (`.excalidraw.png` is CLI-only; see the registration
+section below).
 
 ### extension/src/lib.rs — responsibilities
 
@@ -122,13 +134,31 @@ language server instead — opening a `.excalidraw*` file auto-spawns the previe
 **Key constraint:** WASM extensions cannot open sockets or use `std::process`.
 Use `zed_extension_api::process::Command` and `zed::http_client_get` only.
 
-### Language registration (`extension/languages/excalidraw/config.toml`)
+### Language registration (`extension/languages/`)
 
-Registers the "Excalidraw" language (grammar `json`, language server `excalidraw-preview`)
-with `path_suffixes = ["excalidraw", "excalidraw.svg", "excalidraw.png"]`. Zed matches path
-*endings*, so all three Excalidraw variants get the language server (and its `didOpen`
-auto-preview) while plain `.svg`/`.png` files are unaffected. Trade-off: `.excalidraw.svg`
-opens in Zed's text buffer with the JSON grammar rather than XML.
+Two languages, both grammar-less, both mapping to the `excalidraw-preview` server:
+
+| Language | Config | `path_suffixes` | Effect |
+|---|---|---|---|
+| `Excalidraw` | `languages/excalidraw/config.toml` | `["excalidraw"]` | bare `.excalidraw` buffers attach the server → `didOpen` auto-preview |
+| `SVG` | `languages/svg/config.toml` | `["svg"]` | every `.svg` buffer attaches the server; the in-LSP `is_excalidraw_path` guard makes plain SVGs an idle no-op — only `*.excalidraw.svg` gets a viewer |
+
+Only **single-segment** suffixes are claimed. Zed 1.18 attaches a language
+registered with a *compound* suffix (`excalidraw.svg`, `excalidraw.png`) to
+the buffer, but never routes `textDocument/didOpen` to its language server (see
+`fixes/2026-09-05-lsp-strategy/spec.md`, findings 3/4 — the single-segment
+exact-match path delivers `didOpen`, the compound filename-match path does
+not). Compound suffixes are therefore handled by the `SVG` language claiming
+`svg` plus the filename filter inside the LSP. Trade-offs: `.excalidraw.svg`
+opens in Zed's text buffer as plain text (the `SVG` language ships
+grammar-less), and plain `.svg` files show "SVG" in the status bar with an
+idle language server attached.
+
+No PNG language is registered: Zed's built-in image pane claims `*.png` before
+any buffer exists, so a language could never attach — the `.excalidraw.png`
+viewer is reachable via the CLI only. The built-in JSON language is
+deliberately not attached either (it would spawn our server for every JSON
+file the user opens).
 
 ---
 
@@ -156,7 +186,7 @@ Additional flags:
 | `--foreground` | Internal: run in the foreground without self-detaching. Set automatically on re-spawn (hidden). |
 | `--headless` | Run the HTTP server without opening a WebView window (tests / headless environments). Also enabled by `EXCALIDRAW_PREVIEW_HEADLESS=true`, which propagates to LSP-spawned previews so `didOpen`/`didSave` can be integration-tested windowless. |
 | `--export-dir <dir>` | Write exports directly into `<dir>` instead of showing a native save dialog. Intended for tests and headless use. |
-| `--smoke` | Open a real WebView and run an automated self-test: drive the native→JS bridge (save, close-interception query) and external-link classification, print a PASS/FAIL report, then exit (0 = all passed, 1 = any failed). Implies `--foreground`, overrides `--headless` (needs a window). Run via `just smoke`. See `features/2026-06-13-rough-edges/manual-checklist.md`. |
+| `--smoke` | Open a real WebView and run an automated self-test: drive the native→JS bridge (save, close-interception query, and save-and-close under conflict — an external disk edit forces the conditional save to 412 and the bridge must report failure so the window stays open) and external-link classification, print a PASS/FAIL report, then exit (0 = all passed, 1 = any failed). Implies `--foreground`, overrides `--headless` (needs a window). Run via `just smoke`. See `features/2026-06-13-rough-edges/manual-checklist.md`. |
 
 ### Startup sequence
 
@@ -169,7 +199,16 @@ Additional flags:
    - If stale → remove and continue.
 6. Bind axum server on ephemeral port (or `--port`).
 7. Write port to lock file.
-8. Spawn file watcher thread (notify v6, 80 ms debounce → broadcast channel).
+8. Spawn file watcher thread (notify v8). The watch is on the file's **parent
+   directory** (non-recursive) with events filtered to the canonical target
+   path — this is what makes atomic replacement (temp file + rename) and
+   delete/recreate observable. Events coalesce with **trailing reconciliation**:
+   ~80 ms of quiet restarts on each matching event, with a ~500 ms forced
+   reconcile from the burst's first event, so the final event of a write burst
+   is never dropped. On reconcile, the disk revision is compared against
+   `last_written_revision` (our own echo → suppressed) and anything else
+   broadcasts `Reload`; transient read errors retry with bounded backoff
+   (25/50/100 ms) and never blank the scene; deletion broadcasts immediately.
 9. Open WebView window at `http://localhost:{port}` (the server binds `127.0.0.1`;
    the WebView uses the `localhost` *hostname* deliberately — WebKit only treats
    `localhost` as a secure context, and a bare loopback IP leaves
@@ -202,8 +241,8 @@ Title bars are plain text on every platform (no styling). Dev mode (`--dev`) use
 |---|---|
 | `GET /` | Serve embedded `index.html` |
 | `GET /config` | JSON: `{ contentType, name, theme, autoSave }` |
-| `GET /data` | Read file from disk, return bytes with correct `Content-Type` |
-| `POST /data` | Write request body back to disk (save from WebView) |
+| `GET /data` | Read file from disk → 200 with bytes, `Content-Type`, strong `ETag` (content revision) and `Cache-Control: no-store`; **404** with `ETag: "absent"` when the file is missing (deletion is an unavailable state, not an empty drawing); 500 for other read errors |
+| `POST /data` | **Conditional save**: `If-Match` header required (see the revision contract below). 428 without it; 412 (+ current `ETag`) on revision mismatch; 200 + the written `ETag` on success |
 | `GET /library` | Read the shared library file; return its `.excalidrawlib` JSON |
 | `POST /library` | Persist library items to the shared library file |
 | `GET /library-install` | Landing page for the "Browse libraries" round-trip (`libraryReturnUrl`); reads `#addLibrary=<url>` and POSTs it to `/install-library` |
@@ -211,11 +250,54 @@ Title bars are plain text on every platform (no styling). Dev mode (`--dev`) use
 | `GET /pending-library` | Drain queued installs as `{ libraries: [rawDoc, …] }` for the WebView to feed to `updateLibrary` |
 | `POST /copy-clipboard` | Write the request body to the OS clipboard (via `arboard`); backs "Copy SVG to clipboard" since WKWebView blocks the page's async clipboard write |
 | `POST /export` | Receive exported bytes; write via native save dialog (or `--export-dir`) |
-| `GET /events` | SSE stream; emit `data: reload` on file change, `data: library` after a "Browse libraries" install |
+| `GET /events` | SSE stream — see the event table below |
 | `GET /focus` | Signal WebView window to call `window.set_focus()` |
+| `POST /editor-closed` | **204 No Content**; broadcast `editor-closed` on `/events`. The LSP's `didClose` attention signal — never spawns, focuses, shuts down, or discards the preview. Any request body is ignored |
+| `POST /dirty` | Advisory dirty-state report from the WebView (backs the window-title `*` marker and the native close flow); never gates disk writes |
+| `POST /native-action-result` | Resolves a pending native-action correlation (e.g. save-and-close `ok: false` keeps the window open) |
+| `POST /native-library-request` | Ask the UI thread to open the native `.excalidrawlib` open dialog |
 | `GET /ping` | 200 OK liveness probe |
 | `GET /shutdown` | Graceful shutdown (window close, or test teardown) |
 | `GET /assets/*` | Serve embedded assets (rust-embed, MIME via mime_guess) |
+
+### SSE events (`GET /events`)
+
+| `data:` payload | Meaning |
+|---|---|
+| `reload` | The scene file changed on disk (external edit, deletion, or recreation). An invalidation *hint* — the client re-fetches bytes + revision together and reconciles |
+| `library` | A "Browse libraries" install landed; the WebView drains `GET /pending-library` |
+| `editor-closed` | The LSP forwarded a `didClose`: the editor that opened this preview closed its buffer. The viewer reconciles disk first, then surfaces a pending conflict if any — never tears anything down |
+
+Clients dispatch explicitly on these three names and ignore unknown ones
+(`sse-events.ts`); the server pins the wire names with a unit test.
+
+### Revision & conditional-save contract (`GET`/`POST /data`)
+
+Disk is the persisted interchange between the viewer and external editors
+(Zed, git, CLI tools). The contract is optimistic protection, **not** an
+atomic compare-and-swap: an uncooperative writer can still land a write in the
+narrow window between the server's locked re-read and its write. That race is
+accepted by design (`fixes/2026-09-05-lsp-strategy/decision-log.md`, D1).
+
+- **Revision.** `content_revision(bytes)` → strong ETag `"sha256-<hex>"`.
+  Opaque to clients — the frontend must echo it byte-for-byte, never parse or
+  construct it. A missing file has the distinct ETag-shaped `ABSENT_REVISION`
+  (`"absent"`), published by the 404 so a client can deliberately acknowledge
+  deletion when recreating the file.
+- **`POST /data` semantics.** Missing `If-Match` → **428**, nothing written.
+  The per-file `save_mutex` is acquired, disk is re-read *inside* the lock, and
+  its current revision computed (missing file = `"absent"`). If none of the
+  comma-separated `If-Match` candidates match → **412** with the current
+  `ETag`, nothing written (the wildcard `*` and weak `W/"…"` forms never
+  match; multiple candidates support the "Keep my changes" flow, which sends
+  the acknowledged overwrite revision alongside the accepted one). On a match:
+  write, record the written revision in `last_written_revision` **before**
+  releasing the mutex (so the watcher can prove the resulting disk change is
+  our own echo), and respond **200** with the new `ETag`. Any I/O error → 500,
+  and neither baseline advances.
+- **Echo suppression.** The watcher suppresses a disk change whose revision
+  equals `last_written_revision` — suppression is by revision, never by
+  elapsed time.
 
 ### AppState fields
 
@@ -226,13 +308,18 @@ struct AppState {
     content_type: String,   // MIME string
     file_name: String,
     auto_save: bool,        // forwarded to /config → frontend
-    broadcast_tx: broadcast::Sender<PreviewEvent>,      // SSE: Reload (file) / Library (install)
+    broadcast_tx: broadcast::Sender<PreviewEvent>,      // SSE: Reload (file) / Library (install) / EditorClosed (LSP didClose)
     focus_tx: Arc<watch::Sender<bool>>,
     export_tx: std::sync::mpsc::Sender<ExportRequest>, // POST /export → UI-thread dialog
     export_dir: Option<PathBuf>,                        // --export-dir: bypass dialog
     pending_libraries: Arc<Mutex<Vec<String>>>,         // queued "Browse libraries" installs
+    save_mutex: Arc<tokio::sync::Mutex<()>>,            // serializes POST /data read-compare-write
+    last_written_revision: Arc<RwLock<Option<String>>>, // revision proof for watcher echo suppression
 }
 ```
+
+(`dirty`, `pending_actions`, and `library_open_tx` also live here for the
+native close flow and library dialog — see the routes table.)
 
 Library browse/install flow (offline-friendly, since the click lands in the system
 browser, not the WebView):
@@ -263,16 +350,25 @@ Implements a minimal JSON-RPC LSP so Zed can invoke the binary as a language ser
 - `textDocument/didOpen` → spawns `excalidraw-preview <path>` as a detached process,
   **but only if `is_excalidraw_path` matches** (`.excalidraw`, `.excalidraw.svg`, or
   `.excalidraw.png`). Zed's `path_suffixes` matching also attaches this server to plain
-  `.svg`/`.png` files; spawning a preview for those only fails (no embedded scene, wrong
-  MIME → "all format fallbacks failed"), so the guard skips them. Same guard on `didSave`.
-- `textDocument/didClose` → **no-op.** The preview persists until the user closes its
-  window. Zed reuses one "preview tab" for single-clicked files and sends `didClose`
+  `.svg` buffers (via the `SVG` language); spawning a preview for those only fails (no
+  embedded scene, wrong MIME → "all format fallbacks failed"), so the guard skips them.
+  Plain `.png` never reaches the LSP at all (Zed's image pane claims it before a buffer
+  exists). Same guard on `didSave`.
+- `textDocument/didClose` → **attention signal, not teardown.** The guarded path is
+  forwarded — off the stdio dispatch loop, through a bounded coalescing worker thread
+  (dedup by canonical path, cap 16, ≤500 ms per request) — to the live preview's
+  `POST /editor-closed`, which broadcasts `editor-closed` so the viewer can reconcile
+  disk and surface a pending conflict. It never spawns, focuses, shuts down, or discards
+  the preview: Zed reuses one "preview tab" for single-clicked files and sends `didClose`
   whenever you browse to another file, so tearing the window down here made previews
   flicker shut while navigating. The window owns its own teardown (close button → lock
-  cleanup + server shutdown).
+  cleanup + server shutdown). A missing/stale lock or a refused connection is a silent
+  no-op; LSP `shutdown`/`exit` does not drain the queue.
 - `textDocument/didSave` → reopens a preview the user closed (spawns only if no live
   instance). This is the way to bring back a preview after closing its window, since
   Zed does not re-send `didOpen` for an already-open buffer.
+- `textDocument/didChange` → deliberately unhandled: typing in Zed must never open or
+  resurrect a viewer. Viewer updates flow from the file on disk.
 - `initialize` / `shutdown` / `exit` handled normally
 
 ---
@@ -320,12 +416,16 @@ for (const type of reorderFallbacks(config.contentType)) { ... }
 // renderReadonlyImage() then shows the raw image read-only with a banner instead
 // of erroring, so the user still gets a preview (editing is disabled).
 
-// SSE live reload — calls reloadScene() provided by App.
-const es = new EventSource(apiUrl('/events'));
-es.onmessage = debounce(async () => {
-  const newData = await loadFromBlob(...);
-  reloadScene?.(newData);   // skips if editingElement is active; never resets viewport/theme
-}, 150);
+// SSE live reload — dispatch explicitly by event name; unknown names are ignored
+// (sse-events.ts). "reload" and every (re)connect of the EventSource run the
+// SyncController's reconcileFromDisk(): fetch bytes + ETag together, parse, and
+// then — re-checking live dirty/editing state AFTER the awaits — apply, defer,
+// or raise the pending-conflict state. "editor-closed" reconciles disk first,
+// then escalates a pending conflict to a modal (at most one per unresolved
+// revision). The read-only image preview handles "reload" only and never shows
+// a conflict dialog. There is no time-based echo suppression: the server
+// suppresses proven echoes by revision, and the client recognizes its own
+// acknowledged revision.
 ```
 
 ### App.tsx — save modes
@@ -372,10 +472,33 @@ transient user-activation), so the reliable path goes through Rust.
 
 **Auto-save:** when `autoSave` prop is `true` (set from `config.autoSave`), `onChange` is wired to a debounced save (600 ms). Only fires when element hash changes (not on viewport/selection events).
 
-**SSE reload (`reloadScene`):**
-- Passed to `main.tsx` via `onReloadReady` callback.
-- Skips update if `api.getAppState().editingElement` is non-null (user is typing).
-- Calls `api.updateScene({ elements, files })` only — never passes `appState`, so viewport position and theme are never reset.
+**Conditional saves & the save queue (`sync-controller.ts` / `dirty-state.ts`).**
+Every canonical `POST /data` — bootstrap, auto-save, keyboard save, native menu
+save, save-and-close — sends `If-Match` with the accepted revision (or the
+overwrite revision authorized by "Keep my changes"). All saves run through one
+`SaveQueue` (a single promise chain wrapping export + POST), so an older
+serialized scene can never land after a newer one; a queued follow-up save uses
+the revision acknowledged by its predecessor. On 200 the accepted revision
+advances from the response `ETag`; on **412** nothing advances, the scene stays
+dirty, and a pending conflict is raised (rendered by `conflict-ui.tsx` as a
+non-modal "File changed on disk — Reload from disk / Keep my changes" banner,
+plus an accessible modal for `editor-closed` escalations). While a conflict is
+pending, *all* writes are paused; after "Keep my changes" only automatic writes
+stay paused until an explicit Save succeeds, and a *second* external revision
+must 412 rather than overwrite.
+
+**SSE reload handling (`SyncController.reconcileFromDisk`):**
+- Fetches bytes + ETag together; a 404 is a retryable *unavailable* error that
+  keeps the scene, dirty flag, and accepted revision intact.
+- Clean and idle → parse, then apply via `applyExternalReload` (preserving
+  viewport/theme; never passes `appState`), advancing the accepted revision
+  only after application succeeds.
+- Dirty / saving / mid-text-edit → defer the newest pending revision (retried
+  when editing ends or the save settles, never discarded). Dirty with a
+  different revision → conflict state instead.
+- Invalid data or parse failure → scene, dirty state, and accepted revision
+  all preserved; retryable error shown. Never switches a dirty editor into
+  read-only image mode.
 
 ### window.EXCALIDRAW_ASSET_PATH
 
@@ -540,6 +663,8 @@ After UI changes are done: `just ui && just build` to bake them into the release
 
 ## Constraints & Gotchas
 
+- **Zed 1.18 compound-suffix `didOpen` bug**: a language registered with a compound `path_suffixes` entry (e.g. `excalidraw.svg`) *attaches* to the buffer (status bar shows the language name) but Zed never routes `textDocument/didOpen` to its language server — only single-segment suffixes go through the exact-match path that delivers buffer events. Never reintroduce compound suffixes; the workaround is claiming the single-segment base (`svg`) plus the in-LSP `is_excalidraw_path` filename filter. Evidence and repro: `fixes/2026-09-05-lsp-strategy/zed-compound-suffix-repro.md` (an upstream Zed issue is intended to be filed with it).
+- **`.excalidraw.png` is CLI-only inside Zed**: Zed's built-in image pane claims `*.png` before any buffer exists, so no language — compound suffix or not — can ever observe a PNG open. The editable viewer for `.excalidraw.png` is reachable via `excalidraw-preview <file>` only; clicking the file in Zed renders it in the image pane (a read-only preview).
 - **WASM sandbox**: extension runs in `wasm32-wasip1`; use `zed_extension_api::process::Command` (not `std::process`) and `zed::http_client_get` (not raw sockets).
 - **`window.EXCALIDRAW_ASSET_PATH`**: must be set in a `<script>` block *before* the module script loads, or Excalidraw will fail to fetch fonts/wasm.
 - **assets/ directory**: Vite outputs `assets/assets/main-[hash].js` (nested). The outer `assets/` is the root served at `/`; the inner `assets/` is the JS/CSS/font dir served at `/assets/`. Ensure `assets.rs` handles both `index.html` (at root) and everything under `assets/`.

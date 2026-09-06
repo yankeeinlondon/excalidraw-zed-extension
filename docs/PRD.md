@@ -28,9 +28,22 @@ Reference implementation: `refs/excalidraw-vscode/` (git submodule) — the VS C
 ## 3) Non-Goals
 
 * Embedding preview inside Zed panes.
-* Editing Excalidraw from the preview window (view-only v1).
 * Multi-file session management (single file per window v1).
 * Library item management (v1 loads drawing only, no sidebar library).
+* **SVG syntax highlighting**: the registered `SVG` language ships grammar-less
+  (plain text — identical to Zed's prior rendering of `.svg` files). Bundling an
+  XML grammar is deferred: the Zed registry packager rejects referencing another
+  extension's grammar, so one would have to be bundled with this extension first.
+* **`.excalidraw.png` click-to-viewer**: unreachable through any extension hook —
+  Zed's built-in image pane claims `*.png` before a buffer exists. The image pane
+  is the click experience; the editable viewer is reachable via the CLI.
+* **Fixing Zed upstream**: the compound-suffix `didOpen` bug (a language
+  registered with a compound `path_suffixes` entry attaches to the buffer but
+  never routes `didOpen` to its language server) is worked around here by
+  claiming only single-segment suffixes and filtering by filename inside the
+  LSP; an upstream issue with a minimal repro is intended to be filed. Longer
+  term, a real extension event API for file opens would let the fake-LSP
+  transport retire.
 
 ---
 
@@ -62,10 +75,10 @@ Reference implementation: `refs/excalidraw-vscode/` (git submodule) — the VS C
 
 | ID   | Requirement |
 | ---- | ----------- |
-| FR1  | Opening a `.excalidraw` file in Zed auto-opens a preview (extension language server, `didOpen`) |
+| FR1  | Opening a `.excalidraw` or `.excalidraw.svg` file in Zed auto-opens a preview (extension language server, `didOpen`) |
 | FR2  | Extension reads active file path and spawns companion binary |
 | FR3  | Companion starts local HTTP server on ephemeral port |
-| FR4  | WebView window opens pointing to `http://127.0.0.1:{port}` |
+| FR4  | WebView window opens pointing to `http://localhost:{port}` |
 | FR5  | File watcher detects changes and pushes reload event to UI via SSE |
 | FR6  | If window exists for file, focus instead of spawning new |
 | FR7  | Clean shutdown when window closes |
@@ -73,6 +86,29 @@ Reference implementation: `refs/excalidraw-vscode/` (git submodule) — the VS C
 | FR9  | Supports all three Excalidraw file formats: `.excalidraw` (JSON), `.excalidraw.svg`, `.excalidraw.png` |
 | FR10 | Auto-fits diagram to window on initial load (`scrollToContent: true`) |
 | FR11 | Theme follows OS dark/light mode preference (`prefers-color-scheme`) |
+| FR12 | `GET /data` publishes a strong `ETag` content revision; every viewer save is conditional (`If-Match`) — a stale viewer write fails with 412 instead of silently overwriting a newer disk version (428 when the precondition is missing) |
+| FR13 | An external change to a file with unsaved viewer edits surfaces a "File changed on disk — Reload from disk / Keep my changes" conflict; all automatic writes pause until it is resolved |
+| FR14 | `didClose` is an attention signal (`POST /editor-closed` → `editor-closed` SSE): the viewer reconciles disk and may escalate a pending conflict, but is never spawned, focused, shut down, or discarded by it |
+
+### Conflict model — disk is the persisted interchange
+
+Disk is the shared persisted version; a dirty viewer and a dirty Zed buffer each
+retain independent unsaved work. The server computes an opaque content revision
+(SHA-256 of exact bytes) for every disk snapshot and publishes it as a strong
+`ETag` (`GET /data`, including a distinct `"absent"` revision for a missing
+file). Every canonical viewer save supplies `If-Match` with its accepted
+revision; the server re-reads disk inside a per-file save mutex and refuses the
+write (412, nothing written) on a mismatch. Viewer saves are serialized through
+one queue so an older scene can never overwrite a newer one. Watcher echoes of
+the viewer's own writes are suppressed by revision, never by elapsed time.
+
+This is **optimistic protection, not an atomic compare-and-swap**: an
+uncooperative external writer can still land a write in the narrow window
+between the server's locked re-read and its write. That residual race is
+accepted by design (decision D1 in
+`fixes/2026-09-05-lsp-strategy/decision-log.md`) — "preserve every competing
+write" is explicitly not an acceptance requirement, because arbitrary external
+writers (Zed, git, CLI tools) cannot be made to cooperate with a lock protocol.
 
 ---
 
@@ -103,12 +139,21 @@ excalidraw-preview (Rust binary)
 
 Responsibilities:
 
-* Register the `excalidraw-preview` language server (for the "Excalidraw" language)
+* Register the `excalidraw-preview` language server for **two grammar-less
+  languages**: `Excalidraw` (`path_suffixes = ["excalidraw"]`) and `SVG`
+  (`path_suffixes = ["svg"]`). Only single-segment suffixes are claimed —
+  Zed 1.18 attaches a compound-suffix language to the buffer but never routes
+  `didOpen` for it, so `.excalidraw.svg` is reached via the `svg` suffix plus a
+  filename filter inside the LSP (`is_excalidraw_path`); plain `.svg` buffers
+  make that server an idle no-op. No PNG language is registered (Zed's image
+  pane claims `*.png` before a buffer exists), and the built-in JSON language
+  is deliberately not attached.
 * Resolve the companion binary (`PATH` → cached → download from GitHub Releases)
 * Spawn it as the language server with `--lsp` via `zed_extension_api::process::Command`
 
 The `--lsp` server inside the binary handles the rest: it spawns the detached preview
-on `didOpen`/`didSave`, and the preview self-daemonizes and dedups via its lock file
+on `didOpen`/`didSave`, forwards `didClose` as an attention signal to the live
+preview, and the preview self-daemonizes and dedups via its lock file
 (focusing an existing window instead of opening a duplicate). The extension keeps no
 per-file state and issues no HTTP pings.
 
@@ -126,12 +171,26 @@ Responsibilities:
 * Expose routes:
   * `GET /` → serve `index.html`
   * `GET /config` → serve JSON config object (see §8C)
-  * `GET /data` → serve raw file bytes with correct `Content-Type`
-  * `GET /events` → SSE stream; emit `data: reload\n\n` on file change
+  * `GET /data` → serve raw file bytes with correct `Content-Type`, plus a
+    strong `ETag` content revision and `Cache-Control: no-store` (404 with
+    `ETag: "absent"` when the file is missing)
+  * `POST /data` → conditional save: requires `If-Match` with the client's
+    accepted revision (428 missing / 412 mismatch + current `ETag` /
+    200 + written `ETag`); serialized by a per-file save mutex with the disk
+    re-read inside the lock (see §6 conflict model)
+  * `GET /events` → SSE stream; emits `data: reload` on external file change,
+    `data: library` after a library install, `data: editor-closed` when the
+    LSP forwards a `didClose`
+  * `POST /editor-closed` → 204; broadcasts `editor-closed` (the LSP's
+    `didClose` attention signal — never tears down the preview)
   * `GET /focus` → signal the window to come to the front
   * `GET /assets/*` → serve embedded React bundle + Excalidraw runtime assets (fonts, wasm, etc.)
 * Write port to lock file: `$TMPDIR/excalidraw-{sha256(canonical_path)}.lock`
-* Watch file with `notify` crate (80 ms debounce)
+* Watch the file's **parent directory** with the `notify` crate (events
+  filtered to the target path), coalescing bursts with trailing
+  reconciliation (~80 ms quiet, ~500 ms max wait) so atomic replacement
+  (temp file + rename), delete/recreate, and the final event of a write burst
+  are all observed; viewer-write echoes are suppressed by revision
 * On file change: broadcast on `tokio::sync::broadcast` channel → SSE clients
 * Open WebView window via `wry` pointing to `http://127.0.0.1:{port}`
 * On window close: remove lock file, shut down server
@@ -212,11 +271,16 @@ A single-page React app served by the companion binary. Adapted from `refs/excal
      />
    )
 5. new EventSource('/events')
-6. on message { data: 'reload' }:
-     fetch('/data') → loadFromBlob(...)
-     → excalidrawAPI.updateScene(newData)   [150 ms debounce]
+6. on message — dispatch explicitly by name; unknown names ignored:
+     { data: 'reload' | reconnect }: reconcileFromDisk() → fetch bytes+ETag
+       together → apply (clean/idle), defer (dirty/saving/editing), or raise
+       the pending conflict (dirty + different revision)
+     { data: 'editor-closed' }: reconcile disk first, then escalate a pending
+       conflict to a modal (never tears down the preview)
+     { data: 'library' }: drain /pending-library → updateLibrary
 7. on fetch/parse error:
-     show #error overlay with message
+      show #error overlay with message; keep scene, dirty flag, and accepted
+      revision (retryable — never blank the canvas)
 ```
 
 #### `App.tsx` — Excalidraw component
@@ -347,24 +411,45 @@ Returns `{ elements, appState, files }` — passed directly as `initialData` to 
 
 ## 9) Data Flow
 
+External save (Zed / git / other tools):
+
 ```
-save file in Zed
+save file on disk
       ↓
-file watcher triggers (notify crate, 80 ms debounce)
+file watcher reconciles (notify crate; parent-directory watch,
+trailing ~80 ms quiet / ~500 ms max-wait burst coalescing;
+viewer-echo suppression by revision)
       ↓
 broadcast channel → SSE handler emits "data: reload\n\n"
       ↓
-EventSource('/events') fires in webview JS
+EventSource('/events') fires in webview JS (explicit dispatch
+by name: reload / library / editor-closed; unknown names ignored)
       ↓
-fetch('/data') → ArrayBuffer of raw file bytes
-      ↓
-new Blob([bytes], { type: contentType })
-      ↓
-loadFromBlob(blob, null, null) → ExcalidrawInitialDataState
-      ↓ (150 ms debounce)
-excalidrawAPI.updateScene({ elements, appState, files })
+reconcileFromDisk(): fetch('/data') → bytes + ETag together
+      ↓ (clean & idle)
+loadFromBlob(...) → applyExternalReload (viewport/theme preserved;
+accepted revision advances only after a successful apply)
+      ↓ (dirty / saving / mid-edit)
+defer the pending revision — or raise the "File changed on disk"
+conflict when the revision differs from the accepted one
       ↓
 <Excalidraw> component re-renders canvas
+```
+
+Viewer save (the other direction):
+
+```
+Ctrl/Cmd+S (or debounced auto-save)
+      ↓
+SaveQueue serializes export + POST /data with If-Match: <accepted revision>
+      ↓
+server re-reads disk under the save mutex →
+  200 + new ETag (accepted revision advances) |
+  412 (nothing written; conflict raised) |
+  428 (missing precondition — treated as a programming error)
+      ↓
+the watcher sees the write but suppresses it as a proven echo
+(revision == last_written_revision), so no reload loop occurs
 ```
 
 ---
@@ -406,8 +491,12 @@ excalidrawAPI.updateScene({ elements, appState, files })
 
 | Case | Handling |
 | --- | --- |
-| File deleted while open | SSE sends `reload`; `/data` returns 404; JS shows error overlay |
-| Invalid / truncated JSON | `loadFromBlob` throws; JS shows error overlay with message |
+| File deleted while open | SSE sends `reload`; `/data` returns 404 with `ETag: "absent"`; JS keeps the scene, dirty flag, and accepted revision, and shows a retryable unavailable state. Never auto-recreated. |
+| External edit, clean viewer | SSE `reload` → bytes+ETag fetched together → applied via the guarded reload path (viewport/theme preserved) |
+| External edit, dirty viewer | "File changed on disk — Reload from disk / Keep my changes" banner; all automatic writes paused until resolved. "Keep my changes" authorizes exactly one overwrite revision; a second external revision must 412 rather than overwrite |
+| Save racing an external write | `POST /data` re-reads disk inside the save mutex: 412 + current `ETag`, nothing written. (An uncooperative writer landing in the final read→write window is the accepted narrow race — decision D1.) |
+| Editor buffer closed while viewer live | `didClose` → `POST /editor-closed` → `editor-closed` SSE → viewer reconciles disk, escalates a pending conflict to a modal (at most one per revision); preview never torn down |
+| Invalid / truncated JSON | `loadFromBlob` throws; scene, dirty state, and accepted revision preserved; retryable error shown |
 | Malformed SVG/PNG | Format fallback chain tries other types; shows error if all fail |
 | Multiple invocations same file | Lock file found + `/ping` succeeds → send `/focus`, exit |
 | Port collision on bind | Auto-retry with next available port (up to 10 attempts) |
