@@ -3,7 +3,11 @@ import { describe, it, expect, vi } from "vitest";
 vi.mock("@excalidraw/excalidraw", () => ({
   exportToSvg: vi.fn(async () => ({ outerHTML: "<svg>mock</svg>" })),
   exportToBlob: vi.fn(async () => new Blob([new Uint8Array([1, 2, 3])], { type: "image/png" })),
-  serializeAsJSON: vi.fn(() => '{"type":"excalidraw"}'),
+  serializeAsJSON: vi.fn(
+    () =>
+      '{"type":"excalidraw","version":2,"source":"excalidraw-zed-preview",' +
+      '"elements":[],"appState":{"gridSize":null,"viewBackgroundColor":"#ffffff"},"files":{}}',
+  ),
 }));
 
 import { exportFilename, postExport, type ExportKind } from "./export";
@@ -14,6 +18,14 @@ const fakeApi = {
   getAppState: () => ({}),
   getFiles: () => ({}),
 } as unknown as ExcalidrawImperativeAPI;
+
+const apiWithColorMode = (mode: boolean | undefined) =>
+  ({
+    getSceneElements: () => [],
+    getAppState: () =>
+      mode === undefined ? {} : { exportWithDarkMode: mode },
+    getFiles: () => ({}),
+  }) as unknown as ExcalidrawImperativeAPI;
 
 function fetchStub(status: number, text = "") {
   return vi.fn(async () => ({
@@ -72,5 +84,35 @@ describe("postExport", () => {
     await expect(postExport(fakeApi, "diagram", "scene", fetchStub(500))).rejects.toThrow(
       /Export failed: 500/,
     );
+  });
+});
+
+describe("postExport scene payload carries the document color mode (D1)", () => {
+  async function postedBody(mode: boolean | undefined): Promise<string> {
+    const fetchFn = fetchStub(200, "/home/user/diagram.excalidraw");
+    await postExport(apiWithColorMode(mode), "diagram", "scene", fetchFn);
+    const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    expect((init.headers as Record<string, string>)["Content-Type"]).toBe(
+      "application/json",
+    );
+    return init.body as string;
+  }
+
+  it("POSTs appState.exportWithDarkMode true when the editor is dark", async () => {
+    const appState = JSON.parse(await postedBody(true)).appState;
+    expect(appState.exportWithDarkMode).toBe(true);
+    // Upstream-stripped keys the serializer did emit survive alongside.
+    expect(appState.gridSize).toBeNull();
+  });
+
+  it("POSTs appState.exportWithDarkMode false when the editor is light", async () => {
+    expect(JSON.parse(await postedBody(false)).appState.exportWithDarkMode).toBe(false);
+  });
+
+  it("POSTs false when the editor appState carries no mode", async () => {
+    expect(JSON.parse(await postedBody(undefined)).appState.exportWithDarkMode).toBe(false);
   });
 });
