@@ -548,3 +548,98 @@ open exactly as `acceptance-checklist.md` records it.
    --all-targets -- -D warnings` and `cargo fmt --check` clean. Nothing
    committed (commit remains a separate step); finding 1 still gates
    `ready: true`.
+
+## D15 — Bundle grammars: SVG/JSON highlighting, reversing the §8 deferral
+
+**Decision: ship a tree-sitter grammar with each registered language —
+`grammar = "json"` for `Excalidraw`, `grammar = "xml"` for `SVG`.**
+
+Spec §3 registered the `SVG` language as grammar-less ("none initially") and §8
+listed SVG syntax highlighting as a deferred non-goal. That deferral is now
+reversed. Recording it here because review-2 finding 2 correctly flagged that the
+change had been made with no record and that the grammar-less corpus assertions
+were rewritten in place, leaving the git history showing an assertion vanishing
+rather than a decision changing.
+
+What prompted it: the user asked for it directly, twice — a `.excalidraw` buffer
+showed no JSON styling to sanity-check a hand-edit, and a `.excalidraw.svg` buffer
+rendered as plain text. The grammar-less packaging risk that §8 was hedging
+against **was never hit** — the interactive install has still not been run
+(finding 1). The deferral was therefore reversed on product grounds, not because
+the risk resolved.
+
+Why bundling is legitimate under the original constraint: §8's stated blocker was
+that "the registry packager rejects referencing another extension's grammar". It
+does — so the grammars are *bundled by this extension* (`[grammars.json]` /
+`[grammars.xml]` in `extension.toml`, pinned by rev, with query files vendored
+beside each language config), not referenced from the installed XML extension.
+The constraint is satisfied rather than circumvented.
+
+Scope and blast radius: **highlighting only.** No grammar influences suffix
+matching, language→server association, `is_excalidraw_path`, or whether a preview
+spawns. The `SVG` language already claimed every `.svg` buffer before this change;
+those buffers now render as XML instead of plain text, which is the same treatment
+Zed's XML extension gives `.xml`.
+
+Rollback: delete the `grammar =` line from the affected `languages/*/config.toml`
+(and its `[grammars.*]` block). That restores the previously shipped grammar-less
+behaviour with no other change, which is why the packaging risk is recoverable
+rather than blocking.
+
+Verification performed: the five vendored query files compile against both
+grammars at their pinned revs (`tree-sitter query`, run against a real
+`.excalidraw` and the real `docs/examples/architecture.excalidraw.svg`, which
+parses with zero `ERROR` nodes); the `Excalidraw` object-key rule is confirmed to
+win over the generic string rule by pattern order. The corpus test
+`every_language_grammar_is_bundled_and_has_queries` pins that every declared
+grammar is bundled with `repository`/`rev`/subpath and ships a `highlights.scm` —
+the failure mode it guards is the registry's "grammar not found" rejection, which
+only a GUI install can actually exercise. The acceptance checklist's packaging
+item was rewritten to gate the grammar-ful artifact (review-2 finding 4).
+
+Not covered by this decision: JSON *schema* validation of scenes. That needs a
+JSON language server, which would mean claiming the built-in JSON language and
+spawning this server for every JSON file — forbidden by the §3 registration
+decision, and unchanged.
+
+Decided: 2026-09-06 (after Phase 9 automated gates, before the interactive run).
+
+## D16 — `.excalidraw.png` in Zed is unreachable, not deferred
+
+**Decision: stop treating "open a `.excalidraw.png` from Zed" as future work.
+It cannot be built from an extension, and the record now says so.**
+
+Spec finding 6 established that Zed's image pane claims `*.png`. That is a
+statement about one function, and it left the door open to readings like "maybe a
+`png` language would attach anyway", "maybe a `file_types` override wins", or
+"maybe a task can pass the path". After the user reported the PNG file still not
+opening, each of those was checked in Zed's source rather than reasoned about, and
+all are closed. The result is spec **finding 8**: four independent gates —
+extension-only matching in `is_image_file`; a project-item registry that resolves
+last-registered-first with the image viewer registered after the editor, so no
+buffer is created at all; `register_project_item` being absent from
+`zed_extension_api`; and `ZED_FILE` being populated only from an active `Editor`
+item, which an image item is not.
+
+The load-bearing correction is gate 2: **no buffer is created**, so there is no
+`didOpen` that we filter out — there is no `didOpen`. Any future attempt to "fix
+the filtering" is therefore misdirected.
+
+Consequences recorded elsewhere: the acceptance checklist's PNG item is marked
+not-applicable (a GUI run cannot change a Zed-side outcome, though the interactive
+run should still confirm the LSP stays silent); §8 now carries two concrete
+upstream asks — an extension-registrable project item, *or* `is_image_file`
+honouring a `file_types` override — either of which alone would unblock it; and
+`AGENT.md` marks this as not to be re-litigated without an upstream change.
+
+The supported routes are unchanged and now documented in `README.md` and
+`docs/handling-excalidraw-files.md`: launch from a terminal
+(`excalidraw-preview <file>`, `excalidraw-preview --new <file>` for a new one),
+or — if what you want is an image format that opens from a Zed click — use
+`.excalidraw.svg`, which is explicitly exempted from `is_image_file` and embeds
+the scene identically.
+
+Verified against `zed-industries/zed` `main` as fetched 2026-09-06; the installed
+build is 1.18.1, so the cited line numbers are locators, not pins.
+
+Decided: 2026-09-06.

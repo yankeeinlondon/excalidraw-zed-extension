@@ -7,6 +7,7 @@ spec: "2026-09-05-lsp-strategy/spec.md"
 implemented: true
 description: "A **fix** review of `2026-09-05-lsp-strategy/spec.md`"
 fix: "2026-09-05-lsp-strategy/review-1.md"
+next: "2026-09-05-lsp-strategy/review-2.md"
 review_iterations: 1
 ---
 

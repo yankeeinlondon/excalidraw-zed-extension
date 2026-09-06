@@ -26,12 +26,28 @@ synthetic tests — a synthetic `didOpen` test does not satisfy this gate
 
 ## Packaging / registration
 
-- [ ] **not performed (GUI install required).** The grammar-less `SVG` language
-      loads and packages without a "grammar not found" rejection (upstream docs
-      describe a grammar as required — risk item; **if this fails, Stream A is
-      blocked — report before anything else**). Mitigating precedent: the
-      existing grammar-less `Excalidraw` language installs and runs, and
-      `just build-ext` compiles the WASM with both languages declared.
+- [ ] **not performed (GUI install required).** *(Rewritten 2026-09-06 — the
+      grammar-less premise no longer describes the shippable artifact; see
+      review-2 finding 4. The original item read: "The grammar-less `SVG`
+      language loads and packages without a 'grammar not found' rejection.")*
+      Both bundled grammars compile and load at their pinned revs on dev-extension
+      install — `[grammars.json]` (tree-sitter-json `ee35a6e`) and
+      `[grammars.xml]` (tree-sitter-xml `5000ae8`, **subpath `path = "xml"`**) —
+      and neither language is rejected with "grammar not found". Confirm the
+      vendored query files are accepted (`languages/excalidraw/`:
+      highlights/brackets/indents; `languages/svg/`: highlights/indents) and that
+      no grammar is *referenced from another installed extension*, which the
+      registry packager forbids. **Risk item: if a grammar fails to build or load,
+      report before anything else** — the fallback is to drop `grammar =` from the
+      affected language config, which restores the previously shipped
+      grammar-less behaviour without touching routing. First install needs
+      network access, since Zed clones and builds each grammar.
+- [ ] **not performed (GUI required).** Highlighting is actually applied, not
+      merely loaded: a `.excalidraw` buffer renders as JSON (object keys distinct
+      from string values) and a `.excalidraw.svg` buffer renders as XML (tags and
+      attributes distinct). Automated proxy: the queries were validated against
+      both grammars at their pinned revs with the `tree-sitter` CLI, and the real
+      `docs/examples/architecture.excalidraw.svg` parses with zero `ERROR` nodes.
 - [ ] **not performed (GUI required).** Both manifest language mappings are
       active (status bar shows Excalidraw / SVG where appropriate).
 
@@ -64,8 +80,18 @@ synthetic tests — a synthetic `didOpen` test does not satisfy this gate
       `lsp_did_save_while_live_spawns_no_second_instance`.)
 - [ ] **not performed (GUI required).** Plain `.svg` file → no viewer spawns,
       no error. (Automated proxy: `lsp_ignores_plain_svg_and_malformed_uris`.)
-- [ ] **not performed (GUI required).** `.excalidraw.png` → Zed's image pane
-      renders it (expected limitation; viewer via CLI only).
+- [x] **not applicable — proven unreachable, no GUI run can change the outcome
+      (2026-09-06).** `.excalidraw.png` → Zed's image pane renders it and no
+      `didOpen` is ever sent. Spec finding 8 establishes this from Zed's source
+      as four independent gates: `is_image_file` matches on extension alone;
+      `ProjectItemRegistry::open_path` resolves last-registered-first with the
+      image viewer registered after the editor, so no buffer is created;
+      `register_project_item` is absent from `zed_extension_api`; and `ZED_FILE`
+      is populated only from an active `Editor`, so a task cannot substitute.
+      Ticking this box would verify a Zed behaviour, not ours. **Still worth
+      eyeballing during the interactive run:** that the image pane renders the
+      file without error and that no stray preview window appears — i.e. the LSP
+      really is silent for PNGs.
 
 ## Conflict model (clean and dirty external saves)
 

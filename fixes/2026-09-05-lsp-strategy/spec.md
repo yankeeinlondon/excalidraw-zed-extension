@@ -2,7 +2,7 @@
 reviewed: true
 reviewed_by: "codex/default"
 reviewed_on: "2026-09-05"
-review_iterations: 1
+review_iterations: 2
 ---
 
 # Spec: LSP event strategy & language restructure
@@ -57,9 +57,51 @@ single-suffix workaround still require the real-Zed acceptance test in §7.
    `is_image_file` (`crates/project/src/image_store.rs`, at our build's
    commit): `Img::extensions().contains(&ext) && !ext.contains("svg")` —
    PNGs open as image items (no buffer, no language, no LSP events); SVG is
-   explicitly excluded, so SVG always gets a text buffer.
+   explicitly excluded, so SVG always gets a text buffer. **Re-verified and
+   hardened 2026-09-06** (see finding 8: this is not a priority question, it is
+   an unreachability proof).
 7. No installed extension or Zed built-in claims a plain `svg` or `png`
    language suffix (audited all installed language configs + Zed built-ins).
+8. **`.excalidraw.png` is unreachable from *any* extension hook — four
+   independent gates, each verified in Zed's source on 2026-09-06.** Finding 6
+   alone only shows the image pane *can* claim the file; these show nothing an
+   extension may do can outrank it, and that the obvious escape hatches are
+   closed too. Paths and line numbers are from `zed-industries/zed` `main` as
+   fetched on that date, not from the 1.18.1 bundle, so treat the line numbers
+   as locators rather than as pins.
+   1. **The claim.** `ImageItem::try_open` returns `Some` whenever
+      `is_image_file` does (finding 6), which keys on `Path::extension()`
+      alone — `png` for `architecture.excalidraw.png`. It never consults
+      language registration or the user's `file_types`, so no registration and
+      no user setting can steer around it.
+   2. **The priority.** `ProjectItemRegistry::open_path`
+      (`crates/workspace/src/workspace.rs:1132`) iterates
+      `build_project_item_for_path_fns` **`.iter().rev()`** and takes the first
+      `Some` — *last registered wins*. `image_viewer::init`
+      (`crates/image_viewer/src/image_viewer.rs:1082`, which calls
+      `workspace::register_project_item::<ImageView>`) runs at
+      `crates/zed/src/zed.rs:6181`, after editor setup. So the image pane wins
+      and **no buffer is ever created** — which is why there is no language
+      match and no `didOpen`, rather than a `didOpen` we merely fail to filter.
+   3. **No extension entry point.** `register_project_item`
+      (`crates/workspace/src/workspace.rs:1173`) is a Rust API in the
+      `workspace` crate. `zed_extension_api` exposes languages, language
+      servers, themes, context servers, and debuggers — nothing that registers
+      a workspace/project item type. A WASM extension cannot participate in
+      that registry at all.
+   4. **Tasks cannot substitute.** A keybinding→task route was evaluated as a
+      fallback and is also closed: in `task_contexts`
+      (`crates/tasks_ui/src/tasks_ui.rs:358`) `ZED_FILE` and the rest of the
+      file-scoped variables come only from
+      `active_item.act_as::<Editor>(cx)`. An image item is not an `Editor`, so
+      `active_item_context` stays `None` and a task fired over a
+      `.excalidraw.png` receives worktree-level variables only — it never
+      learns the file name.
+
+   There is also no setting that disables the image viewer (the `"image_viewer"`
+   string in `zed.rs` is an action namespace, not a toggle). The consequence for
+   this spec is stated in §3 and §8: the limitation is structural, and the only
+   routes forward are upstream changes in Zed.
 
 ### Upstream bug
 
@@ -99,9 +141,9 @@ the exact-match path that works, and filter by filename inside the LSP.
 
 | Language | `path_suffixes` | Grammar | Attach server | Effect |
 |---|---|---|---|---|
-| `Excalidraw` (existing) | `["excalidraw"]` only — drop the two compound entries | none (as today) | `excalidraw-preview` | bare `.excalidraw`: buffer + didOpen → viewer |
-| `SVG` (**new**) | `["svg"]` | none initially (see §8) | `excalidraw-preview` | every `.svg` buffer attaches our server; guard passes only `*.excalidraw.svg` |
-| PNG | — none — | — | — | Zed's image pane owns `*.png` clicks before buffers exist (finding 6); a PNG language could never attach. Not registered. |
+| `Excalidraw` (existing) | `["excalidraw"]` only — drop the two compound entries | none (as today); `json` bundled 2026-09-06 (see §8) | `excalidraw-preview` | bare `.excalidraw`: buffer + didOpen → viewer |
+| `SVG` (**new**) | `["svg"]` | none initially; `xml` bundled 2026-09-06 (see §8) | `excalidraw-preview` | every `.svg` buffer attaches our server; guard passes only `*.excalidraw.svg` |
+| PNG | — none — | — | — | Zed's image pane owns `*.png` clicks before buffers exist and outranks every extension-reachable mechanism (findings 6 and 8); no buffer is created, so a PNG language could never attach. Not registered. |
 
 The manifest must also map the server to both languages. In
 `extension/extension.toml`, replace `language = "Excalidraw"` plus `languages = []`
@@ -122,14 +164,21 @@ Notes:
   Document that selecting another language may disable automatic preview and that
   CLI remains available. Grammar-less registration works in the existing repo;
   verify packaging/loading for the new language as well (current upstream language
-  documentation describes a grammar as required).
+  documentation describes a grammar as required). *(Superseded 2026-09-06: both
+  languages now bundle a grammar of their own — see §8 and decision-log D15 — so
+  the packaging question to verify is that the two bundled grammars build and load
+  at their pinned revs, not that a grammar-less language is accepted.)*
 - We do **not** attach to the built-in JSON language for bare `.excalidraw`
   (would spawn our server for every JSON file in the user's life). The
   dedicated `Excalidraw` language already works (7/7 delivery).
 - `.excalidraw.png`: the click lands in Zed's image pane, which renders the
-  PNG — a desirable read-only preview. The Excalidraw viewer for these files
-  remains reachable via CLI (`excalidraw-preview <file>`). Documented as a
-  Zed limitation; revisit if Zed ever exposes item-open events to extensions.
+  PNG — a desirable read-only preview, but a dead end for the editor. Finding 8
+  establishes that this is *unreachable*, not merely unimplemented: no buffer is
+  created, extensions cannot enter the project-item registry, and a task cannot
+  learn the file name either. The Excalidraw viewer for these files remains
+  reachable from a terminal (`excalidraw-preview <file>`, or
+  `excalidraw-preview --new <file>` to start one). Documented as a structural
+  Zed limitation; revisit only if Zed lands one of the two upstream asks in §8.
 
 ## 4. Event semantics
 
@@ -254,7 +303,9 @@ Existing explicit “Don't Save” still closes and discards viewer edits.
    ["excalidraw"]` only; update the explanatory comment.
 2. `extension/languages/svg/config.toml` — new: `name = "SVG"`,
    `path_suffixes = ["svg"]`, `language_servers = ["excalidraw-preview"]`,
-   no grammar.
+   no grammar. *(Amended 2026-09-06: `grammar = "xml"`, with `[grammars.xml]`
+   declared in `extension.toml` and query files vendored beside this config;
+   `languages/excalidraw/config.toml` likewise gains `grammar = "json"`. D15.)*
 3. `extension/extension.toml` — associate the server with both languages as in §3.
 4. `preview-binary/src/main.rs` — `didClose` handler: forward to the live
    preview server (no-op when none). Add `/editor-closed` route +
@@ -296,27 +347,41 @@ Existing explicit “Don't Save” still closes and discards viewer edits.
   existing native bridge smoke/manual checks for Save-and-close on macOS and Linux
   when a display is available; record any platform checks not performed.
 - Real-Zed acceptance (append results/build identity to a checklist in this directory):
-  load the packaged extension, verify grammar-less SVG loads and both manifest
+  load the packaged extension, verify both bundled grammars build and load at their
+  pinned revs (grammar-less as of this spec; amended by D15) and that both manifest
   language mappings work; fresh `.excalidraw.svg` and `.excalidraw` buffer → viewer;
   close/reopen the Zed buffer with viewer live → focus, one instance; re-click an
   already-open tab → no promised event/focus; close viewer then save → reopen.
   Test dirty/clean viewer external saves, both resolutions, Zed auto-save, preview-tab
-  replacement, LSP teardown/restart, plain SVG no viewer, PNG image pane, and coexistence
-  with XML/SVG extensions/user file associations. Measure ordinary SVG startup overhead.
+  replacement, LSP teardown/restart, plain SVG no viewer, and coexistence
+  with XML/SVG extensions/user file associations. (The PNG image-pane item is
+  *not applicable* as of finding 8 — a GUI run cannot change a Zed-side outcome;
+  confirm only that the LSP stays silent for PNGs.) Measure ordinary SVG startup overhead.
   A synthetic didOpen test cannot validate Zed suffix matching or prove the workaround.
 
 ## 8. Non-goals / deferred
 
-- **SVG syntax highlighting**: the SVG language ships grammar-less (plain
-  text — identical to today's rendering of both plain `.svg` and
-  `.excalidraw.svg`). Highlighting requires bundling an XML grammar in the
-  extension (the registry packager rejects referencing another extension's
-  grammar). Deferred.
+- **SVG syntax highlighting**: ~~deferred~~ — **implemented 2026-09-06, after
+  this spec was written.** Both languages now bundle a grammar of their own
+  (`json` for `Excalidraw`, `xml` for `SVG`, declared in `extension.toml` at
+  pinned revs with queries vendored beside each language config), because the
+  constraint recorded here — that the registry packager rejects *referencing
+  another extension's* grammar — is satisfied by bundling rather than by
+  shipping none. This reverses the deferral above, not a "must not reverse"
+  decision; the grammars are highlighting only and change no routing behaviour.
+  See review-2 finding 2 for the outstanding record-keeping requirement.
 - **`.excalidraw.png` click-to-viewer**: unreachable through any extension
-  hook (finding 6). Zed's image pane is the click experience; viewer via CLI.
-- **Upstream Zed fixes**: file the compound-suffix didOpen bug (with the
-  wrapper-capture repro) and, longer-term, request a real extension event
-  API for file opens so the fake-LSP transport can retire.
+  hook — findings 6 and 8, where finding 8 is a four-gate proof rather than an
+  observation. Zed's image pane is the click experience; the editor is
+  terminal-launched. **Not deferred: cannot be built here at all.**
+- **Upstream Zed fixes**: three asks, in descending order of value to this
+  extension.
+  1. The compound-suffix `didOpen` bug (filed, with the wrapper-capture repro).
+  2. For `.excalidraw.png`, either an extension-registrable project item, or
+     having `is_image_file` respect a user `file_types` override so a file can
+     be forced to open as a buffer. Either one alone unblocks finding 8.
+  3. Longer-term, a real extension event API for file opens, so the fake-LSP
+     transport can retire.
 
 ## 9. Cleanup from the investigation
 
@@ -363,9 +428,10 @@ Repository contracts checked: `extension/extension.toml`, language config,
 Earlier feature specs are historical context, not declared dependencies of this spec.
 
 [Zed language extension documentation](https://zed.dev/docs/extensions/languages)
-describes suffix configuration and grammar packaging. Its grammar requirement differs
-from the repository's existing grammar-less configuration; packaging acceptance must
-resolve that difference for the targeted build rather than assuming portability.
+describes suffix configuration and grammar packaging. Its grammar requirement differed
+from the repository's grammar-less configuration at the time of writing; as of D15 both
+languages bundle a grammar, so packaging acceptance now verifies the documented path
+rather than an undocumented one.
 [LSP 3.17 specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/)
 is the protocol reference for synchronization notifications and lifecycle handling.
 The supplied upstream regression diagnosis remains a hypothesis until reproduced.
