@@ -126,5 +126,35 @@ answers, and the data-layer branch is confirmed by direct inspection.
 - The panel-tile duplication is user-visible today; the remedy should also
   clear the visible twins on next load/persist.
 
+## 7. Postscript (Phase 7, 2026-09-06) — the inspected file has self-healed
+
+§1's measurements are a snapshot at mtime 13:00 and **no longer describe the
+live file**. Re-measured during Phase 7 at mtime 15:39:
+
+| Measurement | §1 (13:00) | Phase 7 (15:39) |
+|---|---|---|
+| Total items | 216 | **187** |
+| Distinct ids | 187 | **187** |
+| Ids appearing twice | 29 | **0** |
+| Bytes | 1,828,840 | **1,406,057** |
+
+All 29 duplicate *entries* are gone and all 187 *ids* survive — no unique item
+was lost. The survivors sit at positions **114–142**, §1's first-occurrence
+positions, and every one of their elements carries `updated` =
+2026-06-16T23:18:42 — the **newer** of §1's two stamps. That is exactly D3's
+survivor rule (newest element `updated`, first-occurrence position), so the heal
+is this entry's remedy running on real data: a preview opened during the Phase
+5/6 window seeded through `sanitizePersistedLibrary` and the seeding
+`onLibraryChange` echo persisted the deduped result — the self-heal path §6's
+last bullet asked for.
+
+Two consequences: the appendix's numbers must be read as historical, and the
+Phase 4-added §3.6 GUI criterion (panel shows one tile per item *from load*
+against a still-corrupted file) has lost its precondition. Restoring it is a
+scripted step at the acceptance sitting —
+[`evidence/phase7-library-precondition/twin-library.py`](./evidence/phase7-library-precondition/twin-library.py)
+re-appends the 29-item block with §1's older second-copy stamps, reproducing the
+216 / 187 / 29 signature, and restores byte-identically afterwards.
+
 *Inspection scripts: ad-hoc `python3 json` analyses run 2026-09-06 against
 the file above; key numbers reproducible with any JSON parser (counts in §1).*
