@@ -8,3 +8,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 zed_extension_api = "0.7"
+
+[dev-dependencies]
+toml = "0.8"

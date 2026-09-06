@@ -158,4 +158,199 @@ mod tests {
              before release so installed users fetch the matching preview binary"
         );
     }
+
+    // ── Language-registration corpus tests (spec §3) ──────────────────────────
+    //
+    // These parse the *shipped* TOML artifacts (never copies) so the registration
+    // strategy cannot silently regress: single-segment `path_suffixes` only, a
+    // grammar-less SVG language, and the server mapped to both languages in the
+    // manifest. Real-Zed verification of suffix routing is deliberately deferred
+    // to Phase 9 (plan.md Checkpoint 2) — a synthetic test cannot validate Zed's
+    // suffix matcher, but it can prove we ship the manifest we decided on.
+
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    /// Path of the shipped artifact `rel`, anchored at the crate root so the
+    /// tests pass regardless of the test runner's working directory.
+    fn shipped_artifact(rel: &str) -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(rel)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// Parses a shipped TOML artifact, panicking with its path on any failure.
+    fn parse_shipped_toml(rel: &str) -> toml::Value {
+        let path = shipped_artifact(rel);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read shipped artifact {path}: {e}"));
+        text.parse::<toml::Value>()
+            .unwrap_or_else(|e| panic!("failed to parse shipped artifact {path} as TOML: {e}"))
+    }
+
+    /// The parsed `languages/<dir>/config.toml` for a registered language.
+    fn language_config(dir: &str) -> toml::Value {
+        parse_shipped_toml(&format!("languages/{dir}/config.toml"))
+    }
+
+    /// The declared `path_suffixes` of a language config (must be present).
+    fn path_suffixes(config: &toml::Value) -> Vec<String> {
+        config
+            .get("path_suffixes")
+            .unwrap_or_else(|| panic!("language config must declare path_suffixes"))
+            .as_array()
+            .expect("path_suffixes must be an array")
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .expect("path_suffixes entries must be strings")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The declared `language_servers` of a language config (must be present).
+    fn language_servers(config: &toml::Value) -> Vec<String> {
+        config
+            .get("language_servers")
+            .unwrap_or_else(|| panic!("language config must declare language_servers"))
+            .as_array()
+            .expect("language_servers must be an array")
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .expect("language_servers entries must be strings")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn manifest_maps_server_to_exactly_both_languages() {
+        let manifest = parse_shipped_toml("extension.toml");
+        let server = manifest
+            .get("language_servers")
+            .and_then(|v| v.get("excalidraw-preview"))
+            .expect("extension.toml must declare [language_servers.excalidraw-preview]");
+
+        // The pre-restructure form was `language = "Excalidraw"` + `languages = []`;
+        // a surviving singular key (or an empty list) would associate the server
+        // with only one language or none.
+        assert!(
+            server.get("language").is_none(),
+            "the singular `language` key must be replaced by the `languages` list"
+        );
+        let empty: Vec<&str> = Vec::new();
+        let languages = server
+            .get("languages")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().expect("languages entries must be strings"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or(empty);
+        assert_eq!(
+            languages,
+            vec!["Excalidraw", "SVG"],
+            "the server must be associated with exactly the Excalidraw and SVG languages"
+        );
+        assert!(
+            server.get("name").and_then(|v| v.as_str()).is_some(),
+            "the language server entry must keep a human-readable `name`"
+        );
+    }
+
+    #[test]
+    fn excalidraw_language_claims_only_the_single_segment_suffix() {
+        let config = language_config("excalidraw");
+        assert_eq!(
+            config.get("name").and_then(|v| v.as_str()),
+            Some("Excalidraw")
+        );
+        // The regression this guards: the compound entries ("excalidraw.svg",
+        // "excalidraw.png") attach the language in Zed 1.18 but never receive
+        // didOpen, which broke click-to-preview for .excalidraw.svg. They are now
+        // covered by the SVG language + the in-LSP is_excalidraw_path filter.
+        assert_eq!(
+            path_suffixes(&config),
+            vec!["excalidraw"],
+            "Excalidraw must claim exactly the single-segment `excalidraw` suffix"
+        );
+        assert_eq!(
+            language_servers(&config),
+            vec!["excalidraw-preview"],
+            "the Excalidraw language must attach the excalidraw-preview server"
+        );
+        assert!(
+            config.get("grammar").is_none(),
+            "the Excalidraw language is grammar-less by design (see its config comment)"
+        );
+    }
+
+    #[test]
+    fn svg_language_is_registered_grammarless() {
+        let config = language_config("svg");
+        assert_eq!(config.get("name").and_then(|v| v.as_str()), Some("SVG"));
+        assert_eq!(
+            path_suffixes(&config),
+            vec!["svg"],
+            "SVG must claim exactly the single-segment `svg` suffix"
+        );
+        assert_eq!(
+            language_servers(&config),
+            vec!["excalidraw-preview"],
+            "every .svg buffer attaches the server; the LSP guard makes plain SVGs an idle no-op"
+        );
+        assert!(
+            config.get("grammar").is_none(),
+            "SVG ships grammar-less (XML grammar bundling is a deferred non-goal, spec §8)"
+        );
+    }
+
+    #[test]
+    fn language_corpus_all_suffixes_single_segment_and_uncontested() {
+        // Passive corpus over every shipped language artifact: whatever lands in
+        // extension/languages/ must keep the strategy. Compound suffixes
+        // (containing '.') are the Zed 1.18 didOpen bug trigger; "png" can never
+        // attach because Zed's image pane claims *.png before a buffer exists
+        // (finding 6); "json" must stay unclaimed so the server is not spawned
+        // for every JSON file the user opens.
+        let languages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("languages");
+        let entries = std::fs::read_dir(&languages_dir).expect("extension/languages/ must exist");
+
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for entry in entries {
+            let entry = entry.expect("readable languages/ entry");
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            let config = language_config(&dir_name);
+            seen.insert(dir_name.clone());
+            for suffix in path_suffixes(&config) {
+                assert!(
+                    !suffix.contains('.'),
+                    "compound path_suffix {suffix:?} in languages/{dir_name}: Zed 1.18 \
+                     attaches the language but never routes didOpen for it"
+                );
+                assert_ne!(
+                    suffix, "png",
+                    "languages/{dir_name} claims `png`: Zed's image pane owns *.png, so it \
+                     could never attach (finding 6)"
+                );
+                assert_ne!(
+                    suffix, "json",
+                    "languages/{dir_name} claims `json`: would spawn the server for every \
+                     JSON file"
+                );
+            }
+        }
+        assert_eq!(
+            seen,
+            BTreeSet::from(["excalidraw".to_string(), "svg".to_string()]),
+            "languages/ must ship exactly the Excalidraw and SVG languages"
+        );
+    }
 }

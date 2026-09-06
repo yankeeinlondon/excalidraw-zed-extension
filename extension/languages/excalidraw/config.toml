@@ -3,5 +3,15 @@ name = "Excalidraw"
 # exists to claim path_suffixes + attach the excalidraw-preview language server for
 # click-to-preview. A declared grammar must be bundled in extension.toml, and the
 # Zed registry packager rejects an undeclared one ("grammar not found").
-path_suffixes = ["excalidraw", "excalidraw.svg", "excalidraw.png"]
+#
+# Single-segment suffix ONLY: Zed 1.18 attaches a compound-suffix language to the
+# buffer (the status bar shows "Excalidraw") but never routes textDocument/didOpen
+# to the language server for it (spec findings 3/4,
+# fixes/2026-09-05-lsp-strategy/spec.md). The single-segment `excalidraw` suffix
+# goes through Zed's exact-match path, which demonstrably delivers didOpen. The
+# compound variants are instead reached via the `SVG` language (which claims `svg`)
+# plus the in-LSP `is_excalidraw_path` filename filter in preview-binary; see
+# languages/svg/config.toml. `.excalidraw.png` stays CLI-only because Zed's image
+# pane claims *.png before a buffer exists.
+path_suffixes = ["excalidraw"]
 language_servers = ["excalidraw-preview"]

@@ -8,8 +8,13 @@ repository = "https://github.com/yankeeinlondon/excalidraw-zed-extension"
 
 [language_servers.excalidraw-preview]
 name = "Excalidraw Preview"
-language = "Excalidraw"
-languages = []
+# Both associations are declared here explicitly (not just via each language
+# config's `language_servers` key): Zed resolves the server→language mapping from
+# this manifest list. `Excalidraw` covers bare .excalidraw buffers; `SVG` covers
+# .excalidraw.svg via the single-segment `svg` suffix (Zed 1.18 never routes
+# didOpen for compound suffixes — see languages/svg/config.toml). JSON is
+# deliberately NOT listed: that would spawn our server for every JSON file.
+languages = ["Excalidraw", "SVG"]
 
 [[capabilities]]
 kind = "process:exec"

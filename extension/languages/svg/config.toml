@@ -1,0 +1,15 @@
+name = "SVG"
+# No grammar: shipped grammar-less (plain text — the same rendering Zed gave .svg
+# files before this language existed). Bundling an XML grammar is a deferred non-goal
+# (spec §8): the registry packager rejects referencing another extension's grammar,
+# so one would have to be bundled with this extension first.
+#
+# Trade-off (spec §3): claiming `svg` attaches the excalidraw-preview language
+# server to EVERY .svg buffer. The LSP's `is_excalidraw_path` filename filter makes
+# that an idle no-op for plain SVGs (no spawn, no preview); only *.excalidraw.svg
+# files pass the guard and get a viewer. This language exists because Zed 1.18 never
+# routes didOpen for compound path_suffixes, so .excalidraw.svg is only reachable by
+# claiming the single-segment `svg` suffix and filtering by filename inside the LSP
+# (fixes/2026-09-05-lsp-strategy/spec.md findings 3/4).
+path_suffixes = ["svg"]
+language_servers = ["excalidraw-preview"]
